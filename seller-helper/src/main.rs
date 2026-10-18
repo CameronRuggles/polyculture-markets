@@ -19,10 +19,13 @@ seller-helper — Direct Monero Payments v1 seller tool
 USAGE:
   seller-helper init [--marketplace-id ID] [--network mainnet|stagenet]
                      [--seller-id ID] [--rpc-url URL]
-                     [--rpc-user USER] [--rpc-password PASS]
-                     [--config PATH]
+                     [--rpc-user USER] [--config PATH]
   seller-helper generate --count N [--out FILE] [--config PATH]
   seller-helper check <address> [--config PATH]
+
+init prompts for the wallet RPC password interactively. It is never
+accepted as a command-line flag: command lines leak through shell
+history and process listings.
 
 The config file (default ~/.config/xmr-direct-helper/config.json) holds
 the marketplace values copied from your seller dashboard plus the login
@@ -103,6 +106,77 @@ fn value_or_prompt(
     ))
 }
 
+/// Turns terminal echo off while a password is read (best effort via
+/// `stty`; if that is unavailable the prompt still works, just with
+/// echo) and restores it on drop — including on read errors.
+#[cfg(unix)]
+struct EchoOff;
+
+#[cfg(unix)]
+impl EchoOff {
+    fn engage() -> Self {
+        let _ = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        EchoOff
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+    }
+}
+
+/// Prompt for a secret: like `prompt`, but with terminal echo off.
+fn prompt_password(label: &str) -> Result<String, String> {
+    print!("{label}: ");
+    std::io::stdout()
+        .flush()
+        .map_err(|e| format!("prompt failed: {e}"))?;
+    let read = {
+        #[cfg(unix)]
+        let _echo = EchoOff::engage();
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        let r = stdin.lock().read_line(&mut line);
+        r.map(|_| line.trim().to_string())
+    };
+    println!();
+    read.map_err(|e| format!("reading input failed: {e}"))
+}
+
+/// The RPC password comes from an interactive prompt ONLY (audit L4).
+/// The old `--rpc-password` flag put the password into shell history
+/// and process listings, so the flag is refused outright — scripts
+/// that still pass it get a clear error, not a silent prompt.
+fn rpc_password_value(args: &Args, interactive: bool) -> Result<String, String> {
+    if args.flags.contains_key("rpc-password") {
+        return Err(
+            "--rpc-password is not accepted: a password on the command line leaks \
+             through shell history and process listings. Run `seller-helper init` \
+             in a terminal and it will prompt for the password instead."
+                .to_string(),
+        );
+    }
+    if interactive {
+        let v = prompt_password("Wallet RPC login password (your --rpc-login password)")?;
+        if !v.is_empty() {
+            return Ok(v);
+        }
+    }
+    Err(
+        "missing wallet RPC password: it is only ever read from an interactive \
+         prompt, so run init in a terminal"
+            .to_string(),
+    )
+}
+
 fn cmd_init(args: &Args) -> Result<(), String> {
     let interactive = std::io::stdin().is_terminal();
     let cfg = Config {
@@ -111,7 +185,7 @@ fn cmd_init(args: &Args) -> Result<(), String> {
         seller_id: value_or_prompt(args, "seller-id", "Seller ID (from your seller dashboard)", interactive)?,
         rpc_url: value_or_prompt(args, "rpc-url", "Wallet RPC URL (e.g. http://127.0.0.1:28088/json_rpc)", interactive)?,
         rpc_user: value_or_prompt(args, "rpc-user", "Wallet RPC login user (your --rpc-login user)", interactive)?,
-        rpc_password: value_or_prompt(args, "rpc-password", "Wallet RPC login password (your --rpc-login password)", interactive)?,
+        rpc_password: rpc_password_value(args, interactive)?,
         marketplace_account_index: None,
     };
     cfg.validate()?;

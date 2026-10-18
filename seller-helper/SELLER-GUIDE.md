@@ -106,12 +106,14 @@ seller-helper init \
   --network stagenet \
   --seller-id <your seller id> \
   --rpc-url http://127.0.0.1:28088/json_rpc \
-  --rpc-user yourname \
-  --rpc-password yourrpcpassword
+  --rpc-user yourname
 ```
 
-(With no flags, it prompts for each value instead. Use `--network
-mainnet` and port 18088 when you go live.)
+It then prompts for the RPC password (with typing hidden). The
+password is never taken as a command-line flag — command lines leak
+through shell history and process listings. With no flags at all, it
+prompts for each value instead. (Use `--network mainnet` and port
+18088 when you go live.)
 
 This saves `~/.config/xmr-direct-helper/config.json` with owner-only
 permissions (0600). It contains the RPC login for your **local** RPC —

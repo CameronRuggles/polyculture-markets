@@ -165,6 +165,17 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp)?;
+        // Files written through here include the helper config, which
+        // carries the wallet RPC login. The temp file is owner-only
+        // (0600) from the moment it exists (audit L4): the previous
+        // order — write with default permissions, rename, chmod the
+        // final path afterwards — left a window in which the secret
+        // sat on disk readable by other local users.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -186,17 +197,32 @@ pub struct GenerateOutcome {
 /// Find the dedicated marketplace account, or create and label it.
 ///
 /// Order: (1) the account index stored in the config after a previous
-/// run, if that account still exists in the open wallet; (2) a scan of
-/// accounts via `get_address` (the only listing method on the
-/// allowlist) looking for the dedicated label on the account's
-/// index-0 address; (3) `create_account` with the dedicated label.
+/// run, if that account still exists in the open wallet AND still
+/// carries the dedicated label on its index-0 address (audit L3: the
+/// stored index is only a hint from a previous run — a config reused
+/// against a different wallet could name a personal account, and
+/// marketplace addresses must never be written into an account that
+/// is not labelled as the dedicated one); (2) a scan of accounts via
+/// `get_address` (the only listing method on the allowlist) looking
+/// for the dedicated label on the account's index-0 address;
+/// (3) `create_account` with the dedicated label.
 fn find_or_create_marketplace_account(
     client: &rpc::RpcClient,
     stored: Option<u32>,
 ) -> Result<(u32, bool), Error> {
     if let Some(idx) = stored {
-        if client.get_address(idx).is_ok() {
-            return Ok((idx, false));
+        if let Ok(acct) = client.get_address(idx) {
+            let label = acct
+                .entries
+                .iter()
+                .find(|e| e.address_index == 0)
+                .map(|e| e.label.as_str())
+                .unwrap_or("");
+            if label == DEDICATED_ACCOUNT_LABEL {
+                return Ok((idx, false));
+            }
+            // Stored index names some other account: do not use it.
+            // Fall through to the label scan below.
         }
     }
     // Scan accounts until get_address reports the index out of bound
@@ -700,6 +726,221 @@ mod tests {
         assert!(
             !out.exists(),
             "no batch file may be written when self-verify fails"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- Parameterised fake wallet (audit fix-brief tests). --
+    // Like the fake above, but the `verify` result's signature_type and
+    // account 0's index-0 label are configurable, so the M2/L3 cases can
+    // be driven: a wallet reporting a VIEW-key signature, and a stored
+    // account index whose label is not the dedicated one.
+
+    struct FakeSpec {
+        verify_good: bool,
+        verify_sig_type: &'static str,
+        acct0_label: &'static str,
+    }
+
+    fn fake_response_body_v2(method: &str, request: &str, spec: &FakeSpec) -> String {
+        let result = match method {
+            "get_version" => {
+                r#"{"release":true,"version":65565}"#.to_string()
+            }
+            "get_address" => {
+                let account = extract_number(request, "\"account_index\":").unwrap_or(0);
+                if account == 0 {
+                    format!(
+                        r#"{{"address":"{STAGENET_PRIMARY}","addresses":[{{"address":"{STAGENET_PRIMARY}","address_index":0,"label":"{}","used":false}}]}}"#,
+                        spec.acct0_label
+                    )
+                } else {
+                    return r#"{"jsonrpc":"2.0","id":"0","error":{"code":-14,"message":"account index is out of bound"}}"#
+                        .to_string();
+                }
+            }
+            "create_account" => {
+                format!(r#"{{"account_index":1,"address":"{STAGENET_SUB1}"}}"#)
+            }
+            "create_address" => {
+                format!(
+                    r#"{{"address":"{STAGENET_SUB1}","address_index":1,"address_indices":[1,2],"addresses":["{STAGENET_SUB1}","{STAGENET_SUB2}"]}}"#
+                )
+            }
+            "label_address" => "{}".to_string(),
+            "sign" => {
+                format!(r#"{{"signature":"SigV2{}"}}"#, "a".repeat(88))
+            }
+            "verify" => {
+                format!(
+                    r#"{{"good":{},"old":false,"signature_type":"{}","version":2}}"#,
+                    spec.verify_good, spec.verify_sig_type
+                )
+            }
+            _ => {
+                return r#"{"jsonrpc":"2.0","id":"0","error":{"code":-32601,"message":"method not found"}}"#
+                    .to_string()
+            }
+        };
+        format!(r#"{{"jsonrpc":"2.0","id":"0","result":{result}}}"#)
+    }
+
+    fn start_fake_wallet_v2(spec: FakeSpec) -> (u16, FakeWallet) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                        let mut buf: Vec<u8> = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let body_start = loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break None,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    if let Some(pos) =
+                                        buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        break Some(pos + 4);
+                                    }
+                                }
+                                Err(_) => break None,
+                            }
+                        };
+                        if let Some(bs) = body_start {
+                            let head = String::from_utf8_lossy(&buf[..bs]).to_string();
+                            let content_len: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (n, v) = l.split_once(':')?;
+                                    if n.trim().eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            while buf.len() < bs + content_len {
+                                match stream.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                    Err(_) => break,
+                                }
+                            }
+                            let request = String::from_utf8_lossy(&buf[bs..]).to_string();
+                            let method = request
+                                .split("\"method\":\"")
+                                .nth(1)
+                                .and_then(|s| s.split('"').next())
+                                .unwrap_or("")
+                                .to_string();
+                            let body = fake_response_body_v2(&method, &request, &spec);
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(resp.as_bytes());
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (
+            port,
+            FakeWallet {
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+
+    /// Audit task 5 (M2): Monero accepts view-key signatures as "good",
+    /// but a view key is routinely copied to watch-only wallets and
+    /// bookkeeping tools, so a signature the wallet reports as made
+    /// with the VIEW key must fail the helper's self-verify and abort
+    /// the batch — even when `good` is true.
+    #[test]
+    fn generate_aborts_without_file_when_verify_reports_view_key() {
+        let spec = FakeSpec {
+            verify_good: true,
+            verify_sig_type: "view",
+            acct0_label: "Primary account",
+        };
+        let (port, _fake) = start_fake_wallet_v2(spec);
+        let client = rpc::RpcClient::new("127.0.0.1", port, "/json_rpc", "", "");
+        let dir = test_out_dir("viewkey");
+        let out = dir.join("batch.json");
+        let result = run_generate(&client, &test_config(), 2, &out);
+        assert!(
+            result.is_err(),
+            "a view-key signature must fail self-verify and abort the batch, got {result:?}"
+        );
+        assert!(
+            !out.exists(),
+            "no batch file may be written when self-verify rejects the key type"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit task 9 (L3): the account index stored in the config is
+    /// only a hint from a previous run. If that account's label is not
+    /// the dedicated marketplace label (config reused against another
+    /// wallet, account relabelled, ...), the helper must NOT write
+    /// marketplace subaddresses into it: it falls back to the label
+    /// scan (and, finding no dedicated account here, creates one).
+    #[test]
+    fn stored_account_index_with_wrong_label_falls_back_to_scan() {
+        let spec = FakeSpec {
+            verify_good: true,
+            verify_sig_type: "spend",
+            acct0_label: "Primary account",
+        };
+        let (port, _fake) = start_fake_wallet_v2(spec);
+        let client = rpc::RpcClient::new("127.0.0.1", port, "/json_rpc", "", "");
+        let mut cfg = test_config();
+        // Stored index 0 exists in this wallet, but it is the primary
+        // account — its label is not the dedicated one.
+        cfg.marketplace_account_index = Some(0);
+        let dir = test_out_dir("wronglabel");
+        let out = dir.join("batch.json");
+        let outcome = run_generate(&client, &cfg, 2, &out).unwrap();
+        assert_eq!(
+            outcome.account_index, 1,
+            "the unlabelled stored account must not be used; the scan/create path decides"
+        );
+        assert!(
+            outcome.account_created,
+            "with no dedicated account found by the scan, a new one is created and labelled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit task 9 (L4): files written by this tool include the helper
+    /// config, which carries the wallet RPC login. They must be
+    /// owner-only (0600) from the moment they exist — not written with
+    /// default permissions and chmod'ed after the rename, which left
+    /// a window with the secret readable on disk.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_out_dir("atomic-perms");
+        let path = dir.join("config.json");
+        write_atomic(&path, b"{\"rpc_password\":\"fixture\"}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "helper-written files must be owner-only from creation"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

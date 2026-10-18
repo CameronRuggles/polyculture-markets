@@ -462,15 +462,27 @@ impl RpcClient {
 
     /// verify {data, address, signature} →
     /// `{good: bool, old: bool, signature_type: "spend", version: 2}`.
-    /// Works for addresses the wallet does not own. Returns `good`.
+    /// Works for addresses the wallet does not own. Returns true ONLY
+    /// for a good signature made with the SPEND key (audit M2):
+    /// Monero's `verify` also reports view-key signatures as good, but
+    /// a view key is routinely copied to watch-only wallets and
+    /// bookkeeping tools, so a view-key signature proves far less and
+    /// must never pass this tool's self-verify. A missing
+    /// `signature_type` is not a spend signature.
     pub fn verify(&self, data: &str, address: &str, signature: &str) -> Result<bool, RpcError> {
         let r = self.call(
             "verify",
             json!({ "data": data, "address": address, "signature": signature }),
         )?;
-        r.get("good")
+        let good = r
+            .get("good")
             .and_then(Value::as_bool)
-            .ok_or_else(|| RpcError::Parse("verify: no bool \"good\"".into()))
+            .ok_or_else(|| RpcError::Parse("verify: no bool \"good\"".into()))?;
+        let sig_type = r
+            .get("signature_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        Ok(good && sig_type == "spend")
     }
 }
 
