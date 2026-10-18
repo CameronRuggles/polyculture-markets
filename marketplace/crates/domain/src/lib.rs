@@ -99,13 +99,19 @@ pub enum Actor {
     Moderator,
 }
 
-/// Payment evidence strength (spec §9/§12). Only the core raises it, and
-/// only ProofVerified / WalletObserved / SellerAttested can move an order
-/// to Paid — a buyer's report never can (invariant 11).
+/// Payment evidence strength (spec §9/§12). Only the core raises it.
+/// A buyer's bare report (BuyerReported) can never move an order to
+/// Paid (invariant 11). A buyer-submitted transaction proof
+/// (BuyerProofSubmitted) can — owner decision 2026-10-18: the proof is
+/// evidence attached to the claim, carried by the server UNVERIFIED
+/// (the server runs no wallet and never labels it verified); sellers
+/// and moderators check it in their own wallets. SellerAttested,
+/// ProofVerified, and WalletObserved retain their places above it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EvidenceLevel {
     None,
     BuyerReported,
+    BuyerProofSubmitted,
     SellerAttested,
     ProofVerified,
     WalletObserved,
@@ -129,7 +135,8 @@ pub fn order_can_transition(
             actor == Core
                 && matches!(
                     evidence,
-                    EvidenceLevel::SellerAttested
+                    EvidenceLevel::BuyerProofSubmitted
+                        | EvidenceLevel::SellerAttested
                         | EvidenceLevel::ProofVerified
                         | EvidenceLevel::WalletObserved
                 )
@@ -143,8 +150,16 @@ pub fn order_can_transition(
             // 72-hour timing is enforced at the app layer, which owns
             // the claim timestamps. (Stage 4 gate fix: the blind suite
             // showed this row ignored the evidence parameter entirely,
-            // unlike the Paid and Cancelled rows.)
-            actor == Buyer && evidence == EvidenceLevel::BuyerReported
+            // unlike the Paid and Cancelled rows.) For direct-v1 orders
+            // a submitted tx proof (BuyerProofSubmitted, owner decision
+            // 2026-10-18) stands in the same place: a report exists, so
+            // the buyer may dispute; the app layer gates on the report
+            // row itself.
+            actor == Buyer
+                && matches!(
+                    evidence,
+                    EvidenceLevel::BuyerReported | EvidenceLevel::BuyerProofSubmitted
+                )
         }
         (Paid, Fulfilled) => actor == Seller,
         (Paid, Disputed) => matches!(actor, Buyer | Seller),
@@ -245,6 +260,42 @@ mod tests {
             // Only the core performs the transition, even with good evidence.
             assert!(!order_can_transition(AwaitingPayment, Paid, Seller, ev));
         }
+    }
+
+    #[test]
+    fn buyer_proof_submission_reaches_paid_via_core_only() {
+        use Actor::*;
+        use OrderState::*;
+        // Owner decision 2026-10-18: a submitted tx proof is evidence,
+        // not a bare report — the core may mark Paid on it; no other
+        // actor may, and the level also satisfies the dispute row.
+        assert!(order_can_transition(
+            AwaitingPayment,
+            Paid,
+            Core,
+            EvidenceLevel::BuyerProofSubmitted
+        ));
+        assert!(!order_can_transition(
+            AwaitingPayment,
+            Paid,
+            Buyer,
+            EvidenceLevel::BuyerProofSubmitted
+        ));
+        assert!(!order_can_transition(
+            AwaitingPayment,
+            Paid,
+            Seller,
+            EvidenceLevel::BuyerProofSubmitted
+        ));
+        assert!(order_can_transition(
+            AwaitingPayment,
+            Disputed,
+            Buyer,
+            EvidenceLevel::BuyerProofSubmitted
+        ));
+        // The ordering keeps a proof below an attestation.
+        assert!(EvidenceLevel::BuyerReported < EvidenceLevel::BuyerProofSubmitted);
+        assert!(EvidenceLevel::BuyerProofSubmitted < EvidenceLevel::SellerAttested);
     }
 
     #[test]
