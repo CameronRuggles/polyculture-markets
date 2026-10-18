@@ -293,6 +293,89 @@ plan:
     step-up gating on every moderator action (closure included). Moderators
     have no power over funds and no conversation-browsing interface, ever.
 
+## Tx-proof buyer-evidence flow (owner decision, 2026-10-18)
+
+Adopted by the owner the same day as the payment-path audit; this is
+fix-brief task 1 expanded + task 4 (closed states), and it amends the
+Direct Payments v1 rules below where they conflict.
+
+(a) **Buyer tx-proof submission.** A buyer who paid the order's
+    assigned subaddress may submit the Monero transaction proof (txid
+    + proof string). The submission is the timestamped "I've paid"
+    report (migration 0010, `payment_proofs` + `payment_reports`); the
+    core advances Requested → AwaitingPayment → Paid on the new
+    evidence level `BuyerProofSubmitted` (domain ordering: above
+    BuyerReported, below SellerAttested). The invoice-tied 72-hour
+    dispute guard does NOT apply to direct orders: a buyer dispute is
+    allowed once a report exists. The 48 h expiry sweep skips
+    proof-submitted orders. A seller cannot cancel or decline a
+    reported order. The buyer may submit at ANY point while the order
+    is open — late submittability is deliberate (see (c)).
+
+(b) **Storage amendment.** Direct Payments v1's "server never stores
+    txids or proofs" rule is amended FOR THIS PATH ONLY: the submitted
+    txid + proof are stored (one row per order; created_at is the
+    first submission, revisions update the row). The server CARRIES
+    the proof unverified — it runs no wallet, performs no check, and
+    never labels the proof "verified". Sellers and moderators verify
+    in their own wallets. Server-side automatic verification stays
+    OFF (audit Q2 remains a separate owner decision).
+
+(c) **Visibility (owner-directed design point).** The proof, its
+    txid, and the SOURCE of a Paid state are visible ONLY to the
+    submitting buyer and to moderators (dispute view + review-flag
+    page). The seller sees only the order state: a proof-driven Paid
+    and an attestation-driven Paid are indistinguishable on every
+    seller-facing surface, including notifications (the only
+    notification is the buyer's own `order_paid`, identical for both
+    paths). Rationale: a seller who can tell which buyers submitted
+    proofs can selectively scam the unprotected ones; late
+    submittability (a) means protection status is never observable in
+    advance either.
+
+(d) **Seller confirmation is per-order and subaddress-bound (design
+    update #2.1).** The confirm-paid action applies to one specific
+    order and its assigned subaddress; the confirmation UI and the
+    attestation record name both. No bulk or account-level attestation
+    path exists. Confirming an already-Paid (proof-driven) order
+    records the seller's attestation alongside, raises the evidence
+    level to SellerAttested, and clears the flag in (f).
+
+(e) **Manual fallback (design update #2.2).** A buyer who cannot
+    produce a proof may manually confirm "I paid": that records the
+    weaker `BuyerReported` level and a manual report row. It opens
+    the dispute path but does NOT mark Paid, does NOT stop the expiry
+    sweep, and does NOT block a seller declaration (g) — the buyer UI
+    presents the proof as the primary path (with Feather / Monero GUI
+    / CLI how-to) and the manual confirm as the weaker fallback.
+
+(f) **Auto-review flags (design update #2.3).** A flag joins the
+    Stage 9 moderation queue (`payment_review_flags`) when (i) a
+    proof is submitted and the seller has not confirmed — raised at
+    submission, cleared automatically when the seller confirms; or
+    (ii) a proof exists and the seller declares not-received —
+    a direct contradiction, moderator-resolved. Moderators working a
+    flag see the proof; the seller never does.
+
+(g) **Seller not-received declaration (design update #2.4).** After
+    the unpaid-expiry horizon (48 h by default), the seller may
+    declare "not received" for one specific order + subaddress, once.
+    If a proof exists: the declaration is recorded and flag (f)(ii)
+    raised — the order does NOT close. If no proof exists: the order
+    closes as unpaid, the same end state the sweep produces (entry
+    retired, buyer notified); a manual report does not block the
+    closure, stays on the record, and the buyer's dispute against the
+    declaration REOPENS the order as Disputed. The sweep and the
+    declaration agree: both close unproofed orders as unpaid; only a
+    proof stops them.
+
+(h) **Closed-state pay page (fix-brief task 4).** For orders in
+    terminal states (Cancelled, Declined, Completed, Resolved) the
+    pay page shows "This order is closed. Do not pay." with NO
+    address/URI/QR, and the QR route 404s. Payment-expected states
+    are unchanged; Requested-state payment timing is unchanged
+    (audit Q1, still the owner's).
+
 ## Open items register
 The 12 missing questions from the decision review, with stage deadlines, live in
 `DECISIONS-LOG-2026-10-13.md` and in `marketplace/docs/threat-model.md` §Open items.
