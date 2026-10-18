@@ -258,17 +258,32 @@ pub async fn create_order_with_config(
         let _ = notify(pool, seller_id, "order_requested", &order_public_id).await;
         return Ok((order, true));
     }
-    // Drain defences — scoped to assignment-carrying orders only (their
-    // purpose is pool protection): per-buyer open-unpaid cap and
-    // per-hour creation rate. The <24h-account cap above is unchanged
-    // and applies to all orders.
+    // Drain defences + order insert + allocation in ONE transaction
+    // (audit M4). The defences — per-buyer open-unpaid cap and per-hour
+    // creation rate, scoped to assignment-carrying orders only (their
+    // purpose is pool protection) — used to be counted on the pool
+    // BEFORE this transaction began, so simultaneous requests from one
+    // buyer all read the same pre-insert counts and every one passed.
+    // Now the transaction first takes a per-buyer advisory lock (this
+    // is the codebase's only advisory lock; the key is the buyer
+    // account id), held to commit: creations by one buyer serialize,
+    // and the counts below observe every order that buyer has
+    // committed. The <24h-account cap above is unchanged and applies
+    // to all orders. On a cap error the transaction is dropped, which
+    // rolls it back — nothing was written yet at that point.
+    let mut tx = pool.begin().await.map_err(|_| OrderError::NotFound)?;
+    sqlx::query_scalar::<_, i32>("SELECT 1 FROM pg_advisory_xact_lock($1)")
+        .bind(buyer_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| OrderError::NotFound)?;
     let open_unpaid: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM orders o
           WHERE o.buyer_id = $1 AND o.state IN ('Requested', 'AwaitingPayment')
             AND EXISTS (SELECT 1 FROM payment_pool_entries p WHERE p.order_id = o.id)",
     )
     .bind(buyer_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| OrderError::NotFound)?;
     if open_unpaid >= pay_cfg.open_unpaid_cap {
@@ -280,18 +295,16 @@ pub async fn create_order_with_config(
             AND EXISTS (SELECT 1 FROM payment_pool_entries p WHERE p.order_id = o.id)",
     )
     .bind(buyer_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|_| OrderError::NotFound)?;
     if created_last_hour >= pay_cfg.order_rate_per_hour {
         return Err(OrderError::OrderRateLimited);
     }
-    // Order insert + allocation in ONE transaction. The seller's
-    // identity row is locked FOR UPDATE, serializing allocations per
-    // seller; the entry take is oldest-first with FOR UPDATE SKIP
-    // LOCKED. Two simultaneous creations therefore always take two
-    // different entries.
-    let mut tx = pool.begin().await.map_err(|_| OrderError::NotFound)?;
+    // The seller's identity row is locked FOR UPDATE, serializing
+    // allocations per seller; the entry take is oldest-first with
+    // FOR UPDATE SKIP LOCKED. Two simultaneous creations therefore
+    // always take two different entries.
     sqlx::query("SELECT 1 FROM payment_identities WHERE seller_id = $1 FOR UPDATE")
         .bind(seller_id)
         .execute(&mut *tx)

@@ -25,6 +25,32 @@ async fn main() -> anyhow::Result<()> {
     // env read.
     let marketplace_id = instance.marketplace_id.clone();
     let payments = app::payments::PaymentConfig::from_env(&marketplace_id, instance.network);
+    // Direct Payments v1 network guard (audit L2): assignment has no
+    // network filter, so if this database already holds payment
+    // identities or unused pool entries for a DIFFERENT network (the
+    // instance was flipped stagenet <-> mainnet on the same database),
+    // refuse to start rather than hand out addresses buyers' wallets
+    // would reject.
+    match app::payments::ensure_network_consistency(&pool, &payments).await {
+        Ok(()) => {}
+        Err(app::payments::PaymentError::NetworkMismatch {
+            identities,
+            unused_entries,
+        }) => {
+            eprintln!(
+                "configuration error: stored payment state does not match the instance network ({}): \
+                 {identities} payment identit(y/ies) and {unused_entries} unused pool entr(y/ies) \
+                 belong to another network. Refusing to start — align the instance network with \
+                 the database, or clear the stored payment state deliberately.",
+                app::payments::network_name(payments.network)
+            );
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("configuration error: payment network guard failed: {e:?}");
+            std::process::exit(2);
+        }
+    }
     // Stage 9: the marketplace key file lives OUTSIDE the database
     // (KEY_FILE_PATH, default ./marketplace.key, mode 0600). It keys
     // buyer tokens and encrypts TOTP secrets + disclosed evidence;

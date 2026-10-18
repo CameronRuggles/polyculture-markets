@@ -24,7 +24,7 @@
 <textarea readonly rows="3" cols="80">{{ a.signature }}</textarea>
 <ol>
 <li>Open your wallet's "verify message" or "verify signature" feature. Monero GUI, Feather, and monero-wallet-cli can all verify a signed message (monero-wallet-cli verifies from a file).</li>
-<li>Paste the message, the seller's primary address and the signature. The wallet must report a good signature.</li>
+<li>Paste the message, the seller's primary address and the signature. The wallet must report a good signature <strong>made with the spend key</strong>. A signature made with the view key also reports as good, but proves less: view keys are routinely copied to watch-only wallets and bookkeeping tools. Note that Feather shows only that a signature is valid — it does not show which key signed, so Feather cannot tell a spend-key signature from a view-key one.</li>
 <li>Check that the subaddress at the end of the message is the one you're about to pay, and that the network and seller ID are right.</li>
 <li>Check that the seller's primary address matches the one from your earlier orders or the seller's other channels.</li>
 <li>Only then pay, from your own wallet.</li>

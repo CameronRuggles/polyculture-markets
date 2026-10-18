@@ -24,10 +24,10 @@
 
 use domain::{order_can_transition, Actor, EvidenceLevel, OrderState};
 use modules_api::{
-    validate_standard_address, DestinationError, EvidenceClaim, EvidenceCx, FormInput,
-    Module, ModuleError, ModuleId, PaymentEvidenceProvider, Subaddress,
+    validate_standard_address, DestinationError, EvidenceClaim, EvidenceCx, FormInput, Module,
+    ModuleError, ModuleId, PaymentEvidenceProvider, Subaddress,
 };
-use modules_api::{DestinationProvider, AllocateCx, DestinationProposal, Capability, Network};
+use modules_api::{AllocateCx, Capability, DestinationProposal, DestinationProvider, Network};
 use sqlx::PgPool;
 
 // ---------------------------------------------------------------------------
@@ -146,7 +146,11 @@ pub fn network_name(n: Network) -> &'static str {
 /// nowhere else may construct this string.
 pub fn payment_seller_id(account_public_id: &str) -> Option<String> {
     let hex = account_public_id.strip_prefix("acct_")?;
-    if hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if hex.len() == 32
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         Some(format!("acct-{hex}"))
     } else {
         None
@@ -209,7 +213,9 @@ impl PaymentEvidenceProvider for DirectV1 {
     fn claim(&self, _cx: &EvidenceCx, _input: &FormInput) -> Result<EvidenceClaim, ModuleError> {
         // The seller's mark-paid IS the attestation. The amount is None:
         // the handoff forbids recording amounts received.
-        Ok(EvidenceClaim::SellerAttestation { amount_atomic: None })
+        Ok(EvidenceClaim::SellerAttestation {
+            amount_atomic: None,
+        })
     }
 }
 
@@ -235,6 +241,14 @@ pub enum PaymentError {
     EmptyBatch,
     /// PAYMENTS_SERVER_SIGNATURE_CHECK is on but v1 has no verifier.
     ServerCheckUnavailable,
+    /// Startup network guard (L2): stored payment state belongs to a
+    /// different network than the instance is configured for.
+    NetworkMismatch {
+        /// payment_identities rows on another network.
+        identities: i64,
+        /// Unused pool entries (via their batch) on another network.
+        unused_entries: i64,
+    },
     NotSeller,
     NotAwaitingPayment,
     NoAssignment,
@@ -274,7 +288,10 @@ fn ts_col(col: &str) -> String {
     TS.replace("%COL%", col)
 }
 
-pub async fn get_identity(pool: &PgPool, seller_id: i64) -> Result<Option<PaymentIdentity>, PaymentError> {
+pub async fn get_identity(
+    pool: &PgPool,
+    seller_id: i64,
+) -> Result<Option<PaymentIdentity>, PaymentError> {
     let row: Option<(String, String, Option<String>)> = sqlx::query_as(&format!(
         "SELECT primary_address, {}, {} FROM payment_identities WHERE seller_id = $1",
         ts_col("created_at"),
@@ -283,12 +300,14 @@ pub async fn get_identity(pool: &PgPool, seller_id: i64) -> Result<Option<Paymen
     .bind(seller_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(primary_address, created_at, changed_at)| PaymentIdentity {
-        seller_id,
-        primary_address,
-        created_at,
-        changed_at,
-    }))
+    Ok(row.map(
+        |(primary_address, created_at, changed_at)| PaymentIdentity {
+            seller_id,
+            primary_address,
+            created_at,
+            changed_at,
+        },
+    ))
 }
 
 /// Whether the identity was changed recently enough that the
@@ -331,11 +350,12 @@ pub async fn set_primary_address(
 ) -> Result<bool, PaymentError> {
     let canonical = validate_primary(primary_address, cfg)?;
     let mut tx = pool.begin().await?;
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT primary_address FROM payment_identities WHERE seller_id = $1 FOR UPDATE")
-            .bind(seller_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT primary_address FROM payment_identities WHERE seller_id = $1 FOR UPDATE",
+    )
+    .bind(seller_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     match existing {
         None => {
             sqlx::query(
@@ -379,6 +399,43 @@ pub async fn set_primary_address(
             Ok(true)
         }
     }
+}
+
+/// Startup network guard (audit L2). Address assignment takes the
+/// oldest unused pool entry with no network filter, and identities /
+/// batches record the network that was configured when they were
+/// created — so flipping an instance from stagenet to mainnet on the
+/// same database would leave the old network's entries live for
+/// assignment (buyers' wallets would refuse them: fail-safe but
+/// confusing, and the orders burn pool entries). Refuse to start
+/// instead: if any stored payment identity, or any unused pool entry
+/// (through its batch), belongs to a different network than the
+/// instance configuration, startup fails with the counts.
+pub async fn ensure_network_consistency(
+    pool: &PgPool,
+    cfg: &PaymentConfig,
+) -> Result<(), PaymentError> {
+    let want = network_name(cfg.network);
+    let identities: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM payment_identities WHERE network <> $1")
+            .bind(want)
+            .fetch_one(pool)
+            .await?;
+    let unused_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM payment_pool_entries e
+           JOIN payment_batches b ON b.id = e.batch_id
+          WHERE e.state = 'unused' AND b.network <> $1",
+    )
+    .bind(want)
+    .fetch_one(pool)
+    .await?;
+    if identities > 0 || unused_entries > 0 {
+        return Err(PaymentError::NetworkMismatch {
+            identities,
+            unused_entries,
+        });
+    }
+    Ok(())
 }
 
 pub async fn unused_count(pool: &PgPool, seller_id: i64) -> Result<i64, PaymentError> {
@@ -442,7 +499,9 @@ pub async fn upload_batch(
     if batch.seller_id != want_seller {
         return Err(PaymentError::WrongSeller);
     }
-    let identity = get_identity(pool, seller_id).await?.ok_or(PaymentError::NoIdentity)?;
+    let identity = get_identity(pool, seller_id)
+        .await?
+        .ok_or(PaymentError::NoIdentity)?;
     if batch.primary_address != identity.primary_address {
         return Err(PaymentError::WrongPrimary);
     }
@@ -489,6 +548,32 @@ pub async fn upload_batch(
     }
     // All-or-nothing insert.
     let mut tx = pool.begin().await?;
+    // Audit L1: the cap check above raced with simultaneous uploads —
+    // both could read the same unused count, both pass, and the pool
+    // overfilled. Re-check inside the transaction, serialized per
+    // seller on the identity row (the same lock order creation and
+    // address changes already take): a concurrent upload waits for
+    // this transaction to commit, then its in-transaction count sees
+    // the entries landed here.
+    let identity_row: Option<(i64,)> =
+        sqlx::query_as("SELECT seller_id FROM payment_identities WHERE seller_id = $1 FOR UPDATE")
+            .bind(seller_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if identity_row.is_none() {
+        tx.rollback().await.ok();
+        return Err(PaymentError::NoIdentity);
+    }
+    let unused_now: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM payment_pool_entries WHERE seller_id = $1 AND state = 'unused'",
+    )
+    .bind(seller_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if unused_now + batch.entries.len() as i64 > cfg.max_unused_pool {
+        tx.rollback().await.ok();
+        return Err(PaymentError::PoolFull);
+    }
     let (batch_id,): (i64,) = sqlx::query_as(
         "INSERT INTO payment_batches (seller_id, marketplace_id, network, entry_count)
          VALUES ($1, $2, $3, $4) RETURNING id",
@@ -550,12 +635,11 @@ pub struct Assignment {
 }
 
 pub async fn has_assignment(pool: &PgPool, order_id: i64) -> Result<bool, PaymentError> {
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM payment_pool_entries WHERE order_id = $1)",
-    )
-    .bind(order_id)
-    .fetch_one(pool)
-    .await?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM payment_pool_entries WHERE order_id = $1)")
+            .bind(order_id)
+            .fetch_one(pool)
+            .await?;
     Ok(exists)
 }
 
@@ -574,7 +658,9 @@ pub async fn assignment_for_order(
     let Some((entry_id, address, message, signature, seller_id)) = row else {
         return Ok(None);
     };
-    let identity = get_identity(pool, seller_id).await?.ok_or(PaymentError::NotFound)?;
+    let identity = get_identity(pool, seller_id)
+        .await?
+        .ok_or(PaymentError::NotFound)?;
     let changed = identity_changed_recently(pool, seller_id, cfg).await?;
     // The primary served with an assignment is the one bound in the
     // entry's signed message (field 5 of xmr-direct-v1|...), NOT the
@@ -603,10 +689,7 @@ pub async fn assignment_for_order(
 /// Retire an order's pool entry (cancel / decline / expiry). The entry
 /// is NEVER returned to the pool: a buyer may still pay late, and the
 /// address must never be handed to another order.
-pub async fn retire_entry_for_order(
-    pool: &PgPool,
-    order_id: i64,
-) -> Result<(), PaymentError> {
+pub async fn retire_entry_for_order(pool: &PgPool, order_id: i64) -> Result<(), PaymentError> {
     sqlx::query(
         "UPDATE payment_pool_entries SET state = 'retired', retired_at = now()
           WHERE order_id = $1 AND state = 'assigned'",
@@ -742,8 +825,14 @@ mod tests {
             Some("acct-0123456789abcdef0123456789abcdef")
         );
         assert_eq!(payment_seller_id("acct_0123"), None);
-        assert_eq!(payment_seller_id("acct_0123456789ABCDEF0123456789abcdef"), None);
-        assert_eq!(payment_seller_id("ord_0123456789abcdef0123456789abcdef"), None);
+        assert_eq!(
+            payment_seller_id("acct_0123456789ABCDEF0123456789abcdef"),
+            None
+        );
+        assert_eq!(
+            payment_seller_id("ord_0123456789abcdef0123456789abcdef"),
+            None
+        );
     }
 
     #[test]
@@ -764,7 +853,10 @@ mod tests {
 
     #[test]
     fn direct_module_claim_is_amountless_attestation() {
-        let cx = EvidenceCx { invoice_id: String::new(), order_id: "ord_x".into() };
+        let cx = EvidenceCx {
+            invoice_id: String::new(),
+            order_id: "ord_x".into(),
+        };
         match DirectV1.claim(&cx, &FormInput { fields: vec![] }).unwrap() {
             EvidenceClaim::SellerAttestation { amount_atomic } => assert_eq!(amount_atomic, None),
             _ => panic!("direct-v1 must claim seller attestation"),
