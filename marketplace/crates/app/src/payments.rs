@@ -7,7 +7,13 @@
 //!
 //! HARD RULES (handoff, non-negotiable):
 //! - Never accept or store seeds, spend/view keys, wallet passwords or
-//!   wallet files. Never store txids, received amounts, or proofs.
+//!   wallet files. Never store received amounts.
+//! - AMENDED 2026-10-18 (owner decision; migration 0010): buyer-
+//!   submitted transaction proofs for direct orders ARE stored —
+//!   txid + proof string, carried UNVERIFIED (this module never checks
+//!   them and nothing labels them "verified"), visible only to the
+//!   submitting buyer and to moderators inside a dispute. The original
+//!   rule ("never store txids or proofs") stands for every other path.
 //! - Store and serve every uploaded address, message, and signature
 //!   BYTE-EXACT as received (JSON string values are taken verbatim —
 //!   no trimming, no re-encoding anywhere in this module).
@@ -16,9 +22,10 @@
 //! - No server-side signature verification in v1: the setting exists
 //!   (`PAYMENTS_SERVER_SIGNATURE_CHECK`, default off); the buyer's own
 //!   wallet is the real check.
-//! - No escrow, no tx-proof, no fees. Address validation goes through
-//!   modules-api (the vetted `monero` crate) — no hand-rolled Monero
-//!   cryptography.
+//! - No escrow, no fees. Tx proofs exist only as buyer-submitted
+//!   evidence per the amendment above. Address validation goes
+//!   through modules-api (the vetted `monero` crate) — no hand-rolled
+//!   Monero cryptography.
 //! - UI copy for a paid direct order is "seller confirmed payment";
 //!   the word "verified" is never used as a payment claim here.
 
@@ -255,6 +262,19 @@ pub enum PaymentError {
     TransitionDenied,
     NotFound,
     Db,
+    /// Tx-proof flow (2026-10-18): the actor is not the order's buyer.
+    NotBuyer,
+    /// Submitted txid is not exactly 64 hex characters.
+    BadTxid,
+    /// Submitted proof is empty or over the storage bound.
+    BadProof,
+    /// The order's state accepts no such action (closed, or payment
+    /// already settled on the record by the seller's own attestation).
+    OrderClosed,
+    /// Not-received declaration before the unpaid-expiry horizon.
+    DeclarationTooEarly,
+    /// A not-received declaration already exists for the order.
+    AlreadyDeclared,
 }
 
 impl From<sqlx::Error> for PaymentError {
@@ -773,6 +793,640 @@ pub async fn mark_paid(
 }
 
 // ---------------------------------------------------------------------------
+// Buyer payment reports + tx proofs, seller confirmation, not-received
+// declarations, auto-review flags (owner decisions 2026-10-18 — the
+// tx-proof flow; audit fix-brief task 1 expanded + design updates #1
+// and #2; migration 0010).
+//
+// VISIBILITY (owner-directed): a proof, its txid, and the source of a
+// Paid state are visible ONLY to the submitting buyer and to
+// moderators (dispute view + flag page). Nothing in this section ever
+// notifies the seller about a submission; the one notification it
+// sends is the buyer's own `order_paid`, identical to the event an
+// attestation produces.
+
+/// A stored buyer-submitted tx proof (migration 0010). Carried
+/// unverified; the server never checks it.
+#[derive(Debug, Clone)]
+pub struct PaymentProof {
+    pub txid: String,
+    pub proof: String,
+    pub submitted_by: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A buyer's payment report row: kind 'proof' (a PaymentProof exists)
+/// or 'manual' (the "I paid" fallback, evidence BuyerReported).
+#[derive(Debug, Clone)]
+pub struct PaymentReport {
+    pub kind: String,
+    pub submitted_by: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// An auto-review flag for the Stage 9 moderation queue.
+#[derive(Debug, Clone)]
+pub struct PaymentFlag {
+    pub id: i64,
+    pub order_id: i64,
+    pub order_public_id: String,
+    pub kind: String,
+    pub state: String,
+    pub created_at: String,
+    pub closed_at: Option<String>,
+}
+
+fn stored_state(s: &str) -> OrderState {
+    match s {
+        "Requested" => OrderState::Requested,
+        "AwaitingPayment" => OrderState::AwaitingPayment,
+        "Paid" => OrderState::Paid,
+        "Fulfilled" => OrderState::Fulfilled,
+        "Completed" => OrderState::Completed,
+        "Disputed" => OrderState::Disputed,
+        "Declined" => OrderState::Declined,
+        "Cancelled" => OrderState::Cancelled,
+        "Resolved" => OrderState::Resolved,
+        _ => OrderState::Requested,
+    }
+}
+
+/// Does any buyer payment report (proof or manual) exist for the
+/// order? This is the report-existence key the dispute gate uses.
+pub async fn has_payment_report(pool: &PgPool, order_id: i64) -> Result<bool, PaymentError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM payment_reports WHERE order_id = $1)")
+            .bind(order_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(exists)
+}
+
+pub async fn payment_proof_for_order(
+    pool: &PgPool,
+    order_id: i64,
+) -> Result<Option<PaymentProof>, PaymentError> {
+    let row: Option<(String, String, i64, String, String)> = sqlx::query_as(&format!(
+        "SELECT txid, proof, submitted_by, {}, {} FROM payment_proofs WHERE order_id = $1",
+        ts_col("created_at"),
+        ts_col("updated_at")
+    ))
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(txid, proof, submitted_by, created_at, updated_at)| PaymentProof {
+        txid,
+        proof,
+        submitted_by,
+        created_at,
+        updated_at,
+    }))
+}
+
+pub async fn payment_report_for_order(
+    pool: &PgPool,
+    order_id: i64,
+) -> Result<Option<PaymentReport>, PaymentError> {
+    let row: Option<(String, i64, String, String)> = sqlx::query_as(&format!(
+        "SELECT kind, submitted_by, {}, {} FROM payment_reports WHERE order_id = $1",
+        ts_col("created_at"),
+        ts_col("updated_at")
+    ))
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(kind, submitted_by, created_at, updated_at)| PaymentReport {
+        kind,
+        submitted_by,
+        created_at,
+        updated_at,
+    }))
+}
+
+pub async fn payment_flags_for_order(
+    pool: &PgPool,
+    order_id: i64,
+) -> Result<Vec<PaymentFlag>, PaymentError> {
+    let rows: Vec<(i64, i64, String, String, String, String, Option<String>)> =
+        sqlx::query_as(&format!(
+            "SELECT f.id, f.order_id, o.public_id, f.kind, f.state, {}, {}
+               FROM payment_review_flags f JOIN orders o ON o.id = f.order_id
+              WHERE f.order_id = $1 ORDER BY f.id",
+            ts_col("f.created_at"),
+            ts_col("f.closed_at")
+        ))
+        .bind(order_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, oid, pub_id, kind, state, created_at, closed_at)| PaymentFlag {
+            id,
+            order_id: oid,
+            order_public_id: pub_id,
+            kind,
+            state,
+            created_at,
+            closed_at,
+        })
+        .collect())
+}
+
+/// All open flags, oldest first — the moderation queue's feed.
+pub async fn open_payment_flags(pool: &PgPool) -> Result<Vec<PaymentFlag>, PaymentError> {
+    let rows: Vec<(i64, i64, String, String, String, String, Option<String>)> =
+        sqlx::query_as(&format!(
+            "SELECT f.id, f.order_id, o.public_id, f.kind, f.state, {}, {}
+               FROM payment_review_flags f JOIN orders o ON o.id = f.order_id
+              WHERE f.state = 'open' ORDER BY f.created_at",
+            ts_col("f.created_at"),
+            ts_col("f.closed_at")
+        ))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, oid, pub_id, kind, state, created_at, closed_at)| PaymentFlag {
+            id,
+            order_id: oid,
+            order_public_id: pub_id,
+            kind,
+            state,
+            created_at,
+            closed_at,
+        })
+        .collect())
+}
+
+/// Raise an open flag unless one of the same kind is already open
+/// (the partial unique index backs this up).
+async fn raise_flag(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    order_id: i64,
+    kind: &str,
+) -> Result<(), PaymentError> {
+    let open: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM payment_review_flags WHERE order_id = $1 AND kind = $2 AND state = 'open')",
+    )
+    .bind(order_id)
+    .bind(kind)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !open {
+        sqlx::query("INSERT INTO payment_review_flags (order_id, kind) VALUES ($1, $2)")
+            .bind(order_id)
+            .bind(kind)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Clear open proof-unconfirmed flags for an order (the seller has
+/// confirmed; design update #2.3a). Contradiction flags are NOT
+/// auto-cleared — moderators judge those.
+async fn clear_unconfirmed_flags(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    order_id: i64,
+) -> Result<(), PaymentError> {
+    sqlx::query(
+        "UPDATE payment_review_flags SET state = 'cleared', closed_at = now()
+          WHERE order_id = $1 AND kind = 'proof-unconfirmed' AND state = 'open'",
+    )
+    .bind(order_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Buyer submits a transaction proof for a direct order (the "I've
+/// paid" report with evidence attached). The proof is stored
+/// byte-exact apart from outer-whitespace trimming and txid case
+/// normalisation, and is NEVER verified here. From Requested /
+/// AwaitingPayment the core advances the order to Paid on the
+/// BuyerProofSubmitted evidence level; in Paid / Fulfilled the proof
+/// is recorded alongside and the state is left exactly as it was
+/// (late submission is part of the design: protection status is
+/// never observable in advance, and evidence never downgrades).
+pub async fn submit_payment_proof(
+    pool: &PgPool,
+    order: &crate::orders::Order,
+    actor_id: i64,
+    txid: &str,
+    proof: &str,
+    cfg: &PaymentConfig,
+) -> Result<OrderState, PaymentError> {
+    if actor_id != order.buyer_id {
+        return Err(PaymentError::NotBuyer);
+    }
+    let txid = txid.trim().to_ascii_lowercase();
+    if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PaymentError::BadTxid);
+    }
+    let proof = proof.trim();
+    if proof.is_empty() || proof.chars().count() > 16_384 {
+        return Err(PaymentError::BadProof);
+    }
+    let assignment = assignment_for_order(pool, order.id, cfg)
+        .await?
+        .ok_or(PaymentError::NoAssignment)?;
+    let from = stored_state(&order.state);
+    let advancing = matches!(from, OrderState::Requested | OrderState::AwaitingPayment);
+    if !advancing && !matches!(from, OrderState::Paid | OrderState::Fulfilled) {
+        // Disputed and terminal orders take no new submissions (a
+        // disputed order's proof is already on file — submission is
+        // what opened the path here).
+        return Err(PaymentError::OrderClosed);
+    }
+    if advancing {
+        if from == OrderState::Requested
+            && !order_can_transition(
+                OrderState::Requested,
+                OrderState::AwaitingPayment,
+                Actor::Core,
+                EvidenceLevel::BuyerProofSubmitted,
+            )
+        {
+            return Err(PaymentError::TransitionDenied);
+        }
+        if !order_can_transition(
+            OrderState::AwaitingPayment,
+            OrderState::Paid,
+            Actor::Core,
+            EvidenceLevel::BuyerProofSubmitted,
+        ) {
+            return Err(PaymentError::TransitionDenied);
+        }
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO payment_proofs (order_id, pool_entry_id, submitted_by, txid, proof)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (order_id) DO UPDATE
+            SET txid = EXCLUDED.txid, proof = EXCLUDED.proof, updated_at = now()",
+    )
+    .bind(order.id)
+    .bind(assignment.entry_id)
+    .bind(actor_id)
+    .bind(&txid)
+    .bind(proof)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO payment_reports (order_id, submitted_by, kind) VALUES ($1, $2, 'proof')
+         ON CONFLICT (order_id) DO UPDATE SET kind = 'proof', updated_at = now()",
+    )
+    .bind(order.id)
+    .bind(actor_id)
+    .execute(&mut *tx)
+    .await?;
+    if advancing {
+        if from == OrderState::Requested {
+            let r = sqlx::query(
+                "UPDATE orders SET state = 'AwaitingPayment' WHERE id = $1 AND state = 'Requested'",
+            )
+            .bind(order.id)
+            .execute(&mut *tx)
+            .await?;
+            if r.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Err(PaymentError::TransitionDenied);
+            }
+        }
+        let r = sqlx::query(
+            "UPDATE orders SET state = 'Paid', evidence_level = 'BuyerProofSubmitted'
+              WHERE id = $1 AND state = 'AwaitingPayment'
+                AND evidence_level IN ('None', 'BuyerReported')",
+        )
+        .bind(order.id)
+        .execute(&mut *tx)
+        .await?;
+        if r.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(PaymentError::TransitionDenied);
+        }
+    }
+    // Design update #2.3a: a proof with no seller confirmation yet is
+    // flagged for review the moment it lands. If the seller already
+    // attested, they have confirmed — no flag.
+    let attested: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM payment_attestations WHERE order_id = $1)",
+    )
+    .bind(order.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !attested {
+        raise_flag(&mut tx, order.id, "proof-unconfirmed").await?;
+    }
+    tx.commit().await?;
+    if advancing {
+        // The buyer sees the same event an attestation produces.
+        // The seller is told nothing (visibility rule).
+        let _ = crate::orders::notify(pool, order.buyer_id, "order_paid", &order.public_id).await;
+        return Ok(OrderState::Paid);
+    }
+    Ok(from)
+}
+
+/// Buyer fallback (design update #2.2): a manual "I paid" confirm for
+/// buyers who cannot produce a proof. Records the weaker
+/// BuyerReported evidence level and a manual report row: the dispute
+/// path opens, but the order does NOT advance, and neither the sweep
+/// nor a seller declaration is blocked by it.
+pub async fn submit_manual_report(
+    pool: &PgPool,
+    order: &crate::orders::Order,
+    actor_id: i64,
+) -> Result<OrderState, PaymentError> {
+    if actor_id != order.buyer_id {
+        return Err(PaymentError::NotBuyer);
+    }
+    let from = stored_state(&order.state);
+    if !matches!(from, OrderState::Requested | OrderState::AwaitingPayment) {
+        return Err(PaymentError::OrderClosed);
+    }
+    if !has_assignment(pool, order.id).await? {
+        return Err(PaymentError::NoAssignment);
+    }
+    if let Some(report) = payment_report_for_order(pool, order.id).await? {
+        // A report is already on file (a proof outranks this fallback;
+        // a manual report is already recorded). Idempotent.
+        let _ = report;
+        return Ok(from);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO payment_reports (order_id, submitted_by, kind) VALUES ($1, $2, 'manual')
+         ON CONFLICT (order_id) DO NOTHING",
+    )
+    .bind(order.id)
+    .bind(actor_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE orders SET evidence_level = 'BuyerReported' WHERE id = $1 AND evidence_level = 'None'",
+    )
+    .bind(order.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(from)
+}
+
+/// Seller confirmation (design update #2.1): per-order, bound to the
+/// order's assigned subaddress. From AwaitingPayment this IS
+/// mark_paid (the v1 attestation). On an order already Paid on a
+/// buyer-submitted proof it records the seller's own attestation
+/// alongside, raises the evidence level to SellerAttested, and clears
+/// the proof-unconfirmed flag — the seller confirms against the same
+/// order + subaddress either way, and from the seller's side the two
+/// Paid paths are indistinguishable.
+pub async fn confirm_payment(
+    pool: &PgPool,
+    order: &crate::orders::Order,
+    actor_id: i64,
+    cfg: &PaymentConfig,
+) -> Result<OrderState, PaymentError> {
+    if actor_id != order.seller_id {
+        return Err(PaymentError::NotSeller);
+    }
+    let from = stored_state(&order.state);
+    if from == OrderState::AwaitingPayment {
+        return mark_paid(pool, order, actor_id, cfg).await;
+    }
+    if !matches!(from, OrderState::Paid | OrderState::Fulfilled | OrderState::Disputed) {
+        return Err(PaymentError::OrderClosed);
+    }
+    let assignment = assignment_for_order(pool, order.id, cfg)
+        .await?
+        .ok_or(PaymentError::NoAssignment)?;
+    let attested: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM payment_attestations WHERE order_id = $1)",
+    )
+    .bind(order.id)
+    .fetch_one(pool)
+    .await?;
+    if attested {
+        return Ok(from); // already confirmed for this order; idempotent
+    }
+    if order.evidence_level != "BuyerProofSubmitted" {
+        // Nothing buyer-submitted to confirm against (defensive: a
+        // Paid direct order's record is attestation or proof).
+        return Err(PaymentError::OrderClosed);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO payment_attestations (order_id, pool_entry_id, submitted_by, claim_kind, amount_atomic)
+         VALUES ($1, $2, $3, 'seller-attestation', NULL)
+         ON CONFLICT (order_id) DO NOTHING",
+    )
+    .bind(order.id)
+    .bind(assignment.entry_id)
+    .bind(actor_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE orders SET evidence_level = 'SellerAttested'
+          WHERE id = $1 AND evidence_level = 'BuyerProofSubmitted'",
+    )
+    .bind(order.id)
+    .execute(&mut *tx)
+    .await?;
+    clear_unconfirmed_flags(&mut tx, order.id).await?;
+    tx.commit().await?;
+    Ok(from)
+}
+
+/// Seller not-received declaration (design update #2.4), for one
+/// specific order + its assigned subaddress, available once the order
+/// is older than the unpaid-expiry horizon. With a proof on file the
+/// declaration only records the statement and raises the
+/// proof-contradiction flag — the order does NOT close. Without a
+/// proof it closes the order as unpaid, the same end state the expiry
+/// sweep produces (entry retired, buyer notified).
+pub async fn declare_not_received(
+    pool: &PgPool,
+    order: &crate::orders::Order,
+    actor_id: i64,
+    cfg: &PaymentConfig,
+) -> Result<OrderState, PaymentError> {
+    if actor_id != order.seller_id {
+        return Err(PaymentError::NotSeller);
+    }
+    let already: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM payment_declarations WHERE order_id = $1)",
+    )
+    .bind(order.id)
+    .fetch_one(pool)
+    .await?;
+    if already {
+        return Err(PaymentError::AlreadyDeclared);
+    }
+    let old_enough: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM orders WHERE id = $1
+            AND created_at <= now() - ($2 || ' hours')::interval)",
+    )
+    .bind(order.id)
+    .bind(cfg.unpaid_expiry_hours.to_string())
+    .fetch_one(pool)
+    .await?;
+    if !old_enough {
+        return Err(PaymentError::DeclarationTooEarly);
+    }
+    let assignment = assignment_for_order(pool, order.id, cfg)
+        .await?
+        .ok_or(PaymentError::NoAssignment)?;
+    let has_proof: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM payment_proofs WHERE order_id = $1)")
+            .bind(order.id)
+            .fetch_one(pool)
+            .await?;
+    let from = stored_state(&order.state);
+    if has_proof {
+        if from != OrderState::Paid {
+            // Post-shipment or terminal states: a declaration is
+            // incoherent there; the dispute path is the remedy.
+            return Err(PaymentError::OrderClosed);
+        }
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO payment_declarations (order_id, pool_entry_id, declared_by)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(order.id)
+        .bind(assignment.entry_id)
+        .bind(actor_id)
+        .execute(&mut *tx)
+        .await?;
+        raise_flag(&mut tx, order.id, "proof-contradiction").await?;
+        tx.commit().await?;
+        return Ok(OrderState::Paid);
+    }
+    if !matches!(from, OrderState::Requested | OrderState::AwaitingPayment) {
+        return Err(PaymentError::OrderClosed);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO payment_declarations (order_id, pool_entry_id, declared_by)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(order.id)
+    .bind(assignment.entry_id)
+    .bind(actor_id)
+    .execute(&mut *tx)
+    .await?;
+    let r = sqlx::query(
+        "UPDATE orders SET state = 'Cancelled', terminal_at = now()
+          WHERE id = $1 AND state IN ('Requested', 'AwaitingPayment')",
+    )
+    .bind(order.id)
+    .execute(&mut *tx)
+    .await?;
+    if r.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Err(PaymentError::TransitionDenied);
+    }
+    sqlx::query(
+        "UPDATE payment_pool_entries SET state = 'retired', retired_at = now()
+          WHERE order_id = $1 AND state = 'assigned'",
+    )
+    .bind(order.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let _ = crate::orders::notify(pool, order.buyer_id, "order_not_received", &order.public_id).await;
+    Ok(OrderState::Cancelled)
+}
+
+/// Whether the seller may declare not-received for this order right
+/// now (declaration preconditions, minus the assignment check the
+/// declaration itself performs). Drives the order-page form.
+pub async fn declaration_available(
+    pool: &PgPool,
+    order: &crate::orders::Order,
+    cfg: &PaymentConfig,
+) -> Result<bool, PaymentError> {
+    let already: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM payment_declarations WHERE order_id = $1)",
+    )
+    .bind(order.id)
+    .fetch_one(pool)
+    .await?;
+    if already {
+        return Ok(false);
+    }
+    let old_enough: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM orders WHERE id = $1
+            AND created_at <= now() - ($2 || ' hours')::interval)",
+    )
+    .bind(order.id)
+    .bind(cfg.unpaid_expiry_hours.to_string())
+    .fetch_one(pool)
+    .await?;
+    if !old_enough {
+        return Ok(false);
+    }
+    let has_proof: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM payment_proofs WHERE order_id = $1)")
+            .bind(order.id)
+            .fetch_one(pool)
+            .await?;
+    Ok(if has_proof {
+        order.state == "Paid"
+    } else {
+        matches!(order.state.as_str(), "Requested" | "AwaitingPayment")
+    })
+}
+
+pub async fn payment_flag_by_id(
+    pool: &PgPool,
+    flag_id: i64,
+) -> Result<Option<PaymentFlag>, PaymentError> {
+    let row: Option<(i64, i64, String, String, String, String, Option<String>)> =
+        sqlx::query_as(&format!(
+            "SELECT f.id, f.order_id, o.public_id, f.kind, f.state, {}, {}
+               FROM payment_review_flags f JOIN orders o ON o.id = f.order_id
+              WHERE f.id = $1",
+            ts_col("f.created_at"),
+            ts_col("f.closed_at")
+        ))
+        .bind(flag_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(id, oid, pub_id, kind, state, created_at, closed_at)| PaymentFlag {
+        id,
+        order_id: oid,
+        order_public_id: pub_id,
+        kind,
+        state,
+        created_at,
+        closed_at,
+    }))
+}
+
+/// The declaration-dispute exception (design update #2.4): an order
+/// closed by a seller declaration while a buyer MANUAL report was on
+/// file keeps the buyer's dispute path — the report stays on the
+/// record and the dispute reopens the order. Proof-closed orders
+/// cannot exist (a declaration never closes over a proof), so this
+/// keys on the manual row.
+pub async fn declaration_dispute_reopenable(
+    pool: &PgPool,
+    order_id: i64,
+) -> Result<bool, PaymentError> {
+    let ok: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM payment_declarations WHERE order_id = $1)
+            AND EXISTS(SELECT 1 FROM payment_reports WHERE order_id = $1 AND kind = 'manual')",
+    )
+    .bind(order_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(ok)
+}
+
+// ---------------------------------------------------------------------------
 // Expiry sweep (minimal in-process form; the general scheduler is
 // Stage 10). Cancels unpaid direct orders WITH an assignment whose
 // created_at is older than the configured expiry; their entries retire.
@@ -783,7 +1437,12 @@ pub async fn expire_unpaid_orders(pool: &PgPool, cfg: &PaymentConfig) -> Result<
           WHERE o.settlement = 'direct'
             AND o.state IN ('Requested', 'AwaitingPayment')
             AND o.created_at < now() - ($1 || ' hours')::interval
-            AND EXISTS (SELECT 1 FROM payment_pool_entries p WHERE p.order_id = o.id)",
+            AND EXISTS (SELECT 1 FROM payment_pool_entries p WHERE p.order_id = o.id)
+            -- Owner decision 2026-10-18: a proof-submitted order is
+            -- never eaten by the sweep. A manual report alone does
+            -- not exempt an order (design update #2.4 coordinates the
+            -- sweep and the seller declaration to agree).
+            AND NOT EXISTS (SELECT 1 FROM payment_proofs p WHERE p.order_id = o.id)",
     )
     .bind(cfg.unpaid_expiry_hours.to_string())
     .fetch_all(pool)

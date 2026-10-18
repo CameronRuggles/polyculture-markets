@@ -31,6 +31,9 @@ pub const EV_WALLET_OBSERVED: u8 = 4;
 pub fn evidence_u8(s: &str) -> u8 {
     match s {
         "BuyerReported" => EV_BUYER_REPORTED,
+        // Buyer-submitted proof (2026-10-18) is buyer-side evidence:
+        // it never counts as an attested/verified class for weighting.
+        "BuyerProofSubmitted" => EV_BUYER_REPORTED,
         "SellerAttested" => EV_SELLER_ATTESTED,
         "ProofVerified" => EV_PROOF_VERIFIED,
         "WalletObserved" => EV_WALLET_OBSERVED,

@@ -285,6 +285,38 @@ pub async fn report_action(
     Ok(())
 }
 
+/// Act on an auto-review payment flag (tx-proof flow, 2026-10-18):
+/// moderators resolve or dismiss flags from the moderation queue.
+/// The 'cleared' state is reserved for the automatic clearing that
+/// happens when a seller confirms payment (payments.rs).
+pub async fn payment_flag_action(
+    pool: &PgPool,
+    flag_id: i64,
+    moderator_id: i64,
+    action: &str,
+) -> Result<(), ModError> {
+    let new_state = match action {
+        "dismiss" => "dismissed",
+        "resolve" => "resolved",
+        _ => return Err(ModError::BadInput),
+    };
+    let upd = sqlx::query(
+        "UPDATE payment_review_flags SET state = $2, closed_at = now() WHERE id = $1 AND state = 'open'",
+    )
+    .bind(flag_id)
+    .bind(new_state)
+    .execute(pool)
+    .await
+    .map_err(|_| ModError::Db)?;
+    if upd.rows_affected() != 1 {
+        return Err(ModError::NotFound);
+    }
+    log_action(pool, moderator_id, None, None, &format!("payment-flag-{action}"), "")
+        .await
+        .map_err(|_| ModError::Db)?;
+    Ok(())
+}
+
 // -- account actions: warn + close ---------------------------------------------------
 
 async fn log_action(

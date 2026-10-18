@@ -486,6 +486,7 @@ fn state_of(s: &str) -> Option<OrderState> {
 fn evidence_of(s: &str) -> EvidenceLevel {
     match s {
         "BuyerReported" => EvidenceLevel::BuyerReported,
+        "BuyerProofSubmitted" => EvidenceLevel::BuyerProofSubmitted,
         "SellerAttested" => EvidenceLevel::SellerAttested,
         "ProofVerified" => EvidenceLevel::ProofVerified,
         "WalletObserved" => EvidenceLevel::WalletObserved,
@@ -501,6 +502,43 @@ pub async fn apply_action(
     action: &str,
     actor_id: i64,
 ) -> Result<OrderState, OrderError> {
+    if action == "dispute" && actor_id == order.buyer_id && order.state == "Cancelled" {
+        // Declaration-dispute exception (owner design update #2.4,
+        // 2026-10-18): an order closed by a seller not-received
+        // declaration while a buyer MANUAL report was on file keeps
+        // the buyer's dispute path — the report stays on the record,
+        // and the buyer's dispute reopens the order. This is a core
+        // reopening of a declaration closure, performed here like the
+        // expiry sweep's core cancellations in payments.rs; every
+        // other Cancelled order falls through to the domain table,
+        // which denies the transition as before.
+        let reopenable = crate::payments::declaration_dispute_reopenable(pool, order.id)
+            .await
+            .map_err(|_| OrderError::NotFound)?;
+        if reopenable {
+            let r = sqlx::query(
+                "UPDATE orders SET state = 'Disputed' WHERE id = $1 AND state = 'Cancelled'",
+            )
+            .bind(order.id)
+            .execute(pool)
+            .await
+            .map_err(|_| OrderError::NotFound)?;
+            if r.rows_affected() == 1 {
+                let _ = sqlx::query(
+                    "INSERT INTO disputes (order_id, opened_by)
+                     SELECT $1, $2 WHERE NOT EXISTS (
+                         SELECT 1 FROM disputes WHERE order_id = $1
+                           AND state IN ('open', 'awaiting_buyer_confirmation'))",
+                )
+                .bind(order.id)
+                .bind(actor_id)
+                .execute(pool)
+                .await;
+                let _ = notify(pool, order.seller_id, "dispute_opened", &order.public_id).await;
+                return Ok(OrderState::Disputed);
+            }
+        }
+    }
     let (actor, to) = match (action, order.buyer_id == actor_id, order.seller_id == actor_id) {
         ("accept", false, true) => (Actor::Seller, OrderState::AwaitingPayment),
         ("decline", false, true) => (Actor::Seller, OrderState::Declined),
@@ -540,19 +578,51 @@ pub async fn apply_action(
             }
         }
     }
-    if action == "dispute" && from == OrderState::AwaitingPayment {
-        // §9 guard: buyer reported payment >= 72h ago, no seller response.
-        let old_enough: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM payment_evidence
-              WHERE invoice_id IN (SELECT id FROM invoices WHERE order_id = $1)
-                AND claim_kind = 'buyer-report' AND created_at < now() - interval '72 hours')",
-        )
-        .bind(order.id)
-        .fetch_one(pool)
-        .await
-        .map_err(|_| OrderError::NotFound)?;
-        if !old_enough {
+    if matches!(action, "cancel" | "decline") && actor_id == order.seller_id {
+        // Owner decision 2026-10-18: once a buyer payment report
+        // (proof or manual) is on file, the order is never the
+        // seller's to close unilaterally — their paths are shipping,
+        // a dispute, or (after the expiry horizon) the not-received
+        // declaration in payments.rs. (From AwaitingPayment the
+        // domain table already refuses a seller cancel whenever the
+        // evidence level has risen; this guard also covers a decline
+        // from Requested, where the table has no evidence condition.)
+        let reported = crate::payments::has_payment_report(pool, order.id)
+            .await
+            .map_err(|_| OrderError::NotFound)?;
+        if reported {
             return Err(OrderError::TransitionDenied);
+        }
+    }
+    if action == "dispute" && from == OrderState::AwaitingPayment {
+        // Direct orders (owner decision 2026-10-18): the buyer
+        // payment report is the gate — no invoice, no 72-hour wait.
+        // Orders WITHOUT an assignment keep the §9 invoice guard
+        // byte-identical (invoice flow, Stage 4/9 locked suites).
+        let assigned = crate::payments::has_assignment(pool, order.id)
+            .await
+            .map_err(|_| OrderError::NotFound)?;
+        if assigned {
+            let reported = crate::payments::has_payment_report(pool, order.id)
+                .await
+                .map_err(|_| OrderError::NotFound)?;
+            if !reported {
+                return Err(OrderError::TransitionDenied);
+            }
+        } else {
+            // §9 guard: buyer reported payment >= 72h ago, no seller response.
+            let old_enough: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM payment_evidence
+                  WHERE invoice_id IN (SELECT id FROM invoices WHERE order_id = $1)
+                    AND claim_kind = 'buyer-report' AND created_at < now() - interval '72 hours')",
+            )
+            .bind(order.id)
+            .fetch_one(pool)
+            .await
+            .map_err(|_| OrderError::NotFound)?;
+            if !old_enough {
+                return Err(OrderError::TransitionDenied);
+            }
         }
     }
     let to_s = format!("{to:?}");
