@@ -11,6 +11,12 @@
 {% if let Some(a) = assigned_address %}<li>Assigned payment address (paid directly by the buyer): <code>{{ a }}</code></li>{% endif %}
 {% if let Some(m) = signed_message %}<li>Seller's wallet-signed message for this address: <code>{{ m }}</code></li>{% endif %}
 </ul>
+{% if let Some(p) = buyer_proof %}
+<h2>Buyer-submitted payment proof</h2>
+<p>The buyer submitted this transaction proof. It is carried <strong>unverified</strong> — check it in your own wallet against the assigned address and the order amount.</p>
+<p>Transaction ID: <code>{{ p.txid }}</code> · submitted by the buyer {{ p.created_at }}</p>
+<pre>{{ p.proof }}</pre>
+{% endif %}
 <h2>Disclosed messages</h2>
 {% if disclosures.is_empty() %}<p>Nothing has been disclosed yet.</p>{% endif %}
 {% for d in disclosures %}

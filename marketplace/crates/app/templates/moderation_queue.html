@@ -20,6 +20,11 @@
 <button type="submit">Apply</button></form>
 </article>
 {% endfor %}
+<h2>Payment review flags</h2>
+{% if payment_flags.is_empty() %}<p>No open payment flags.</p>{% endif %}
+{% for f in payment_flags %}
+<p>#{{ f.id }} · order <code>{{ f.order_public_id }}</code> · {{ f.kind }} · raised {{ f.created_at }} · <a href="/moderation/flags/{{ f.id }}">Open</a></p>
+{% endfor %}
 <h2>Accounts</h2>
 <form method="get" action="/moderation/accounts">
 <label>Search by username <input type="text" name="q" value="{{ query }}"></label>

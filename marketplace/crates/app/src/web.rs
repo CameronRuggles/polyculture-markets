@@ -384,6 +384,7 @@ pub fn router(state: AppState) -> Router {
         .route("/moderation", get(moderation_queue))
         .route("/moderation/accounts", get(moderation_queue))
         .route("/moderation/reports/{id}", post(report_decide))
+        .route("/moderation/flags/{id}", get(flag_page).post(flag_decide))
         .route("/moderation/accounts/{id}/warn", post(account_warn))
         .route("/moderation/accounts/{id}/close", post(account_close_mod))
         .route("/moderation/listings/{id}/remove", post(listing_remove))
@@ -1803,8 +1804,24 @@ struct OrderTpl {
     actions: Vec<String>,
     /// Direct Payments v1: the order carries a payment assignment.
     has_payment: bool,
-    /// The viewing seller may mark this order paid.
-    can_mark_paid: bool,
+    /// Tx-proof flow (2026-10-18): the viewing seller may confirm
+    /// payment for this order (per-order, bound to the subaddress;
+    /// design update #2.1). Rendered identically whatever the source
+    /// of the order's Paid state.
+    can_confirm: bool,
+    /// The order's assigned subaddress (the seller's own), named by
+    /// the confirmation form.
+    assigned_address: Option<String>,
+    /// The viewing buyer's own submitted proof — buyer only; the
+    /// seller's render never receives this data (visibility rule).
+    my_proof: Option<crate::payments::PaymentProof>,
+    /// The buyer may submit (or revise) a proof in this state.
+    proof_open: bool,
+    /// The buyer has a manual "I paid" report on file.
+    manual_reported: bool,
+    /// The viewing seller may declare not-received (past the
+    /// unpaid-expiry horizon; design update #2.4).
+    can_declare: bool,
     message: Option<String>,
     csrf: String,
     // Stage 9: review + dispute presentation.
@@ -1858,12 +1875,27 @@ fn permitted_actions(o: &ord::Order, me: i64) -> Vec<String> {
 fn evidence_label(level: &str) -> String {
     match level {
         "BuyerReported" => "Buyer reports payment (not confirmed by the seller)".into(),
+        // Tx-proof flow (2026-10-18): the truthful label for the buyer
+        // and for moderators. The seller never sees this string (see
+        // seller_evidence_label).
+        "BuyerProofSubmitted" => "Buyer-submitted payment proof (unverified)".into(),
         // Direct Payments v1 copy rule: "seller confirmed payment" —
         // never "verified" as a payment claim.
         "SellerAttested" => "Seller confirmed payment".into(),
         "ProofVerified" => "Payment proof recorded".into(),
         "WalletObserved" => "Payment observed by wallet".into(),
         _ => "No payment evidence recorded".into(),
+    }
+}
+
+/// The seller-facing evidence label (owner-directed visibility rule,
+/// 2026-10-18): a proof-driven Paid must be indistinguishable from an
+/// attestation-driven Paid, so the seller sees the same line either
+/// way. The proof's existence is never displayed to the seller.
+fn seller_evidence_label(level: &str) -> String {
+    match level {
+        "BuyerProofSubmitted" => "Seller confirmed payment".into(),
+        other => evidence_label(other),
     }
 }
 
@@ -1883,9 +1915,60 @@ async fn order_page(
         return (StatusCode::NOT_FOUND, "No such order").into_response();
     }
     let has_payment = crate::payments::has_assignment(&st.pool, o.id).await.unwrap_or(false);
-    let can_mark_paid = has_payment && o.state == "AwaitingPayment" && o.seller_id == sess.account_id;
-    // Stage 9: review state + dispute link for this order.
+    // Tx-proof flow (2026-10-18): per-viewer payment presentation.
+    // The seller's render is built WITHOUT any proof data: only the
+    // buyer branch below ever fetches the proof row.
     let is_buyer = o.buyer_id == sess.account_id;
+    let viewer_is_seller = o.seller_id == sess.account_id;
+    let assignment = if has_payment {
+        crate::payments::assignment_for_order(&st.pool, o.id, &st.payments)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let assigned_address = assignment.as_ref().map(|a| a.address.clone());
+    let can_confirm = has_payment
+        && viewer_is_seller
+        && matches!(
+            o.state.as_str(),
+            "AwaitingPayment" | "Paid" | "Fulfilled" | "Disputed"
+        );
+    let proof_open = is_buyer
+        && has_payment
+        && matches!(
+            o.state.as_str(),
+            "Requested" | "AwaitingPayment" | "Paid" | "Fulfilled"
+        );
+    let my_proof = if is_buyer {
+        crate::payments::payment_proof_for_order(&st.pool, o.id)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let manual_reported = if is_buyer {
+        crate::payments::payment_report_for_order(&st.pool, o.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.kind == "manual")
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let can_declare = viewer_is_seller
+        && has_payment
+        && crate::payments::declaration_available(&st.pool, &o, &st.payments)
+            .await
+            .unwrap_or(false);
+    let evidence = if viewer_is_seller {
+        seller_evidence_label(&o.evidence_level)
+    } else {
+        evidence_label(&o.evidence_level)
+    };
     let review = crate::reviews::review_for_order(&st.pool, &st.stage9, o.id)
         .await
         .ok()
@@ -1901,10 +1984,15 @@ async fn order_page(
     let title = format!("Order {}", o.public_id);
     let tpl = OrderTpl {
         total_xmr: domain::Atomic(o.total_atomic as u64).format_decimal(),
-        evidence_label: evidence_label(&o.evidence_level),
+        evidence_label: evidence,
         actions: permitted_actions(&o, sess.account_id),
         has_payment,
-        can_mark_paid,
+        can_confirm,
+        assigned_address,
+        my_proof,
+        proof_open,
+        manual_reported,
+        can_declare,
         message: p.get("msg").cloned(),
         csrf,
         review,
@@ -1917,11 +2005,18 @@ async fn order_page(
     page(&st, &headers, &title, tpl.render().unwrap()).await
 }
 
+#[derive(Deserialize)]
+struct OrderActionForm {
+    csrf: String,
+    txid: Option<String>,
+    proof: Option<String>,
+}
+
 async fn order_action(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, action)): Path<(String, String)>,
-    Form(f): Form<CsrfOnly>,
+    Form(f): Form<OrderActionForm>,
 ) -> Response {
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
@@ -1934,6 +2029,55 @@ async fn order_action(
     };
     if o.buyer_id != sess.account_id && o.seller_id != sess.account_id {
         return (StatusCode::NOT_FOUND, "No such order").into_response();
+    }
+    if action == "submit-proof" {
+        // Tx-proof flow (2026-10-18): the buyer's evidence submission.
+        // Buyer-facing copy only — the seller is never notified.
+        return match crate::payments::submit_payment_proof(
+            &st.pool,
+            &o,
+            sess.account_id,
+            f.txid.as_deref().unwrap_or(""),
+            f.proof.as_deref().unwrap_or(""),
+            &st.payments,
+        )
+        .await
+        {
+            Ok(_) => Redirect::to(&format!(
+                "/orders/{id}?msg={}",
+                "Payment proof recorded. It is carried unverified: the seller and moderators check it in their own wallets."
+            ))
+            .into_response(),
+            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Proof not accepted: {e:?}")).into_response(),
+        };
+    }
+    if action == "manual-report" {
+        // The buyer's manual "I paid" fallback (BuyerReported).
+        return match crate::payments::submit_manual_report(&st.pool, &o, sess.account_id).await {
+            Ok(_) => Redirect::to(&format!(
+                "/orders/{id}?msg={}",
+                "Your payment report is recorded on your word alone — weaker protection than a transaction proof."
+            ))
+            .into_response(),
+            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Report not accepted: {e:?}")).into_response(),
+        };
+    }
+    if action == "confirm-payment" {
+        // Per-order seller confirmation bound to the subaddress
+        // (design update #2.1); identical wording for every Paid path.
+        return match crate::payments::confirm_payment(&st.pool, &o, sess.account_id, &st.payments).await {
+            Ok(_) => Redirect::to(&format!("/orders/{id}?msg={}", "Payment confirmed for this order.")).into_response(),
+            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Confirmation not allowed: {e:?}")).into_response(),
+        };
+    }
+    if action == "declare-not-received" {
+        // Seller not-received declaration (design update #2.4). The
+        // confirmation wording is identical whether or not a proof
+        // is on file — the seller learns nothing from it.
+        return match crate::payments::declare_not_received(&st.pool, &o, sess.account_id, &st.payments).await {
+            Ok(_) => Redirect::to(&format!("/orders/{id}?msg={}", "Declaration recorded.")).into_response(),
+            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Declaration not allowed: {e:?}")).into_response(),
+        };
     }
     if action == "mark-paid" {
         // Direct Payments v1: the seller's mark-paid submits a
@@ -1965,6 +2109,16 @@ struct PayTpl {
     payment_uri: String,
     assignment: Option<crate::payments::Assignment>,
     is_paid: bool,
+    /// Closed states (audit task 4, 2026-10-18): no payable address
+    /// is presented; the page says the order is closed instead.
+    closed: bool,
+}
+
+/// Terminal order states for payment purposes (fix-brief task 4):
+/// the pay page must not present a payable address in any of these.
+/// There is no separate Expired state — expiry lands in Cancelled.
+fn payment_closed(state: &str) -> bool {
+    matches!(state, "Cancelled" | "Declined" | "Completed" | "Resolved")
 }
 
 async fn pay_page(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
@@ -1979,10 +2133,17 @@ async fn pay_page(State(st): State<AppState>, headers: HeaderMap, Path(id): Path
     if o.buyer_id != sess.account_id && o.seller_id != sess.account_id {
         return (StatusCode::NOT_FOUND, "No such order").into_response();
     }
-    let assignment = crate::payments::assignment_for_order(&st.pool, o.id, &st.payments)
-        .await
-        .ok()
-        .flatten();
+    let closed = payment_closed(&o.state);
+    // Closed orders render with NO assignment at all: the address,
+    // the payment URI and the QR are withheld, not just hidden.
+    let assignment = if closed {
+        None
+    } else {
+        crate::payments::assignment_for_order(&st.pool, o.id, &st.payments)
+            .await
+            .ok()
+            .flatten()
+    };
     let payment_uri = match &assignment {
         Some(a) => domain::statements::payment_uri_for(&a.address, o.total_atomic as u64),
         None => String::new(),
@@ -1993,6 +2154,7 @@ async fn pay_page(State(st): State<AppState>, headers: HeaderMap, Path(id): Path
         payment_uri,
         assignment,
         is_paid: o.state == "Paid",
+        closed,
         order: o,
     };
     page(&st, &headers, &title, tpl.render().unwrap()).await
@@ -2007,6 +2169,10 @@ async fn pay_qr(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<S
     };
     if o.buyer_id != sess.account_id && o.seller_id != sess.account_id {
         return (StatusCode::NOT_FOUND, "No such order").into_response();
+    }
+    if payment_closed(&o.state) {
+        // Task 4: the QR route 404s on closed orders.
+        return (StatusCode::NOT_FOUND, "No payment assignment").into_response();
     }
     let Some(a) = crate::payments::assignment_for_order(&st.pool, o.id, &st.payments)
         .await
@@ -2469,6 +2635,11 @@ struct DisputeTpl {
     signed_message: Option<String>,
     signed_signature: Option<String>,
     disclosures: Vec<crate::disputes::DisclosureView>,
+    /// The buyer's submitted tx proof — populated ONLY when the
+    /// viewer is a moderator or the buyer party (owner-directed
+    /// visibility rule, 2026-10-18). A seller's render never carries
+    /// this data.
+    buyer_proof: Option<crate::payments::PaymentProof>,
     is_participant: bool,
     is_moderator: bool,
     is_buyer: bool,
@@ -2517,6 +2688,23 @@ async fn dispute_page(
     let totp_enrolled = crate::moderation::totp_enrolled(&st.pool, sess.account_id)
         .await
         .unwrap_or(false);
+    // Visibility rule: moderators and the buyer party see the real
+    // evidence label and the submitted proof; the seller party sees
+    // the indistinguishable label and no proof data at all.
+    let viewer_is_seller_party = is_participant && o.seller_id == sess.account_id;
+    let evidence = if viewer_is_seller_party {
+        seller_evidence_label(&o.evidence_level)
+    } else {
+        evidence_label(&o.evidence_level)
+    };
+    let buyer_proof = if is_moderator || o.buyer_id == sess.account_id {
+        crate::payments::payment_proof_for_order(&st.pool, o.id)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     let tpl = DisputeTpl {
         csrf,
         dispute_id: d.id,
@@ -2527,7 +2715,8 @@ async fn dispute_page(
         buyer_username,
         seller_username,
         total_xmr: domain::Atomic(o.total_atomic as u64).format_decimal(),
-        evidence_label: evidence_label(&o.evidence_level),
+        evidence_label: evidence,
+        buyer_proof,
         terms_hash: o.terms_sha256.clone(),
         assigned_address: assignment.as_ref().map(|a| a.address.clone()),
         signed_message: assignment.as_ref().map(|a| a.message.clone()),
@@ -2688,6 +2877,8 @@ struct ModerationQueueTpl {
     csrf: String,
     disputes: Vec<(crate::disputes::Dispute, String, String, String)>,
     reports: Vec<crate::moderation::Report>,
+    /// Open auto-review payment flags (tx-proof flow, 2026-10-18).
+    payment_flags: Vec<crate::payments::PaymentFlag>,
     accounts: Vec<crate::moderation::AccountHit>,
     query: String,
     listing_query: String,
@@ -2734,6 +2925,7 @@ async fn moderation_queue(
         csrf,
         disputes: crate::disputes::open_disputes(&st.pool).await.unwrap_or_default(),
         reports: crate::moderation::open_reports(&st.pool).await.unwrap_or_default(),
+        payment_flags: crate::payments::open_payment_flags(&st.pool).await.unwrap_or_default(),
         accounts,
         query: q,
         listing_query,
@@ -2767,6 +2959,88 @@ async fn report_decide(
     match crate::moderation::report_action(&st.pool, id, sess.account_id, &f.action).await {
         Ok(()) => Redirect::to("/moderation?msg=Report updated.").into_response(),
         Err(e) => Redirect::to(&format!("/moderation?msg=Report action failed: {e:?}")).into_response(),
+    }
+}
+
+// -- payment review flags (tx-proof flow, 2026-10-18) -------------------------
+
+#[derive(Template)]
+#[template(path = "moderation_flag.html")]
+struct FlagTpl {
+    csrf: String,
+    flag: crate::payments::PaymentFlag,
+    order_state: String,
+    buyer_username: String,
+    seller_username: String,
+    /// The proof the flag is about — moderators only; this page is
+    /// behind guard_moderator, so the data never reaches a seller.
+    proof: Option<crate::payments::PaymentProof>,
+    dispute_id: Option<i64>,
+    totp_enrolled: bool,
+    message: Option<String>,
+}
+
+async fn flag_page(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    let (sess, csrf) = match guard_moderator(&st, &headers).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(flag) = crate::payments::payment_flag_by_id(&st.pool, id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (StatusCode::NOT_FOUND, "No such flag").into_response();
+    };
+    let Some(o) = ord::order_by_internal_id(&st.pool, flag.order_id).await else {
+        return (StatusCode::NOT_FOUND, "No such flag").into_response();
+    };
+    let proof = crate::payments::payment_proof_for_order(&st.pool, o.id)
+        .await
+        .ok()
+        .flatten();
+    let dispute_id = crate::disputes::dispute_for_order(&st.pool, o.id)
+        .await
+        .ok()
+        .flatten()
+        .map(|d| d.id);
+    let tpl = FlagTpl {
+        csrf,
+        flag,
+        order_state: o.state.clone(),
+        buyer_username: db::username_of_id(&st.pool, o.buyer_id).await,
+        seller_username: db::username_of_id(&st.pool, o.seller_id).await,
+        proof,
+        dispute_id,
+        totp_enrolled: crate::moderation::totp_enrolled(&st.pool, sess.account_id)
+            .await
+            .unwrap_or(false),
+        message: p.get("msg").cloned(),
+    };
+    page(&st, &headers, "Payment review flag", tpl.render().unwrap()).await
+}
+
+async fn flag_decide(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<ModReportForm>,
+) -> Response {
+    let (sess, _c) = match guard_post(&st, &headers, "/moderation/flags/{id}", &f.csrf).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Err(e) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
+        return Redirect::to(&format!("/moderation?msg=Action refused: {e:?}")).into_response();
+    }
+    match crate::moderation::payment_flag_action(&st.pool, id, sess.account_id, &f.action).await {
+        Ok(()) => Redirect::to("/moderation?msg=Flag updated.").into_response(),
+        Err(e) => Redirect::to(&format!("/moderation?msg=Flag action failed: {e:?}")).into_response(),
     }
 }
 

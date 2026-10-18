@@ -7,10 +7,43 @@
 <a href="/orders/{{ order.public_id }}/terms.txt">Download terms</a></p>
 <p>Direct payment: this marketplace never holds funds. The seller is paid directly in Monero; there is no escrow and the marketplace cannot recover payments.</p>
 {% if has_payment %}<p><a href="/orders/{{ order.public_id }}/pay">Payment page for this order</a></p>{% endif %}
-{% if can_mark_paid %}
-<form method="post" action="/orders/{{ order.public_id }}/mark-paid">
+{% if can_confirm %}
+<form method="post" action="/orders/{{ order.public_id }}/confirm-payment">
 <input type="hidden" name="csrf" value="{{ csrf }}">
-<button type="submit">Mark paid (seller confirmed payment)</button></form>
+<button type="submit">Confirm payment received for order {{ order.public_id }}{% if let Some(a) = assigned_address %} — subaddress {{ a }}{% endif %}</button></form>
+{% endif %}
+{% if can_declare %}
+<form method="post" action="/orders/{{ order.public_id }}/declare-not-received">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Declare payment not received for order {{ order.public_id }}{% if let Some(a) = assigned_address %} — subaddress {{ a }}{% endif %}</button></form>
+{% endif %}
+{% if let Some(p) = my_proof %}
+<h2>Your submitted payment proof</h2>
+<p>You submitted this transaction proof. It is carried <strong>unverified</strong>: the marketplace never checks proofs and never shows yours to the seller. Moderators can check it in a dispute.</p>
+<p>Transaction ID: <code>{{ p.txid }}</code> · first submitted {{ p.created_at }}{% if p.updated_at != p.created_at %} · last revised {{ p.updated_at }}{% endif %}</p>
+<pre>{{ p.proof }}</pre>
+{% endif %}
+{% if proof_open %}
+<h2>Proof of payment</h2>
+<p><strong>Strongest protection: submit your transaction proof.</strong> After you pay, create the proof in your wallet and paste it here. Submitting it marks the order paid on that evidence, stops the order expiring, and is what a moderator checks if you dispute. You can submit or revise it at any point while the order is open — including later, if a problem appears.</p>
+<ul>
+<li><strong>Feather:</strong> History → right-click the transaction → Create Tx Proof → choose “Prove payment to an address” → Get formatted proof.</li>
+<li><strong>Monero GUI:</strong> History → click the “P” button on the transaction.</li>
+<li><strong>Command line:</strong> run <code>get_tx_proof</code> in monero-wallet-cli.</li>
+</ul>
+<form method="post" action="/orders/{{ order.public_id }}/submit-proof">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Transaction ID (64 hex characters)<br><input type="text" name="txid" size="70" maxlength="64" required></label>
+<label>Transaction proof<br><textarea name="proof" rows="4" cols="70" required></textarea></label>
+<button type="submit">Submit transaction proof</button></form>
+<details>
+<summary>No proof? Confirm payment in words alone (weaker protection)</summary>
+<p>If your wallet cannot create a proof, you can still record that you paid. This is your word alone — <strong>weaker protection</strong> than a transaction proof: it opens your dispute path, but it does not mark the order paid, does not stop the order expiring, and a seller declaration of non-receipt can close the order over it (you could then dispute the declaration).</p>
+{% if manual_reported %}<p>You have already recorded a manual payment report for this order.</p>{% endif %}
+<form method="post" action="/orders/{{ order.public_id }}/manual-report">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">I paid — record my report</button></form>
+</details>
 {% endif %}
 <form method="post" action="/conversations/for-order/{{ order.public_id }}">
 <input type="hidden" name="csrf" value="{{ csrf }}">

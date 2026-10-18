@@ -87,6 +87,12 @@ pub const ROUTES: &[RouteRule] = &[
     RouteRule { method: "GET", path: "/orders/{id}/pay", roles: AUTHENTICATED, csrf: false },
     RouteRule { method: "GET", path: "/orders/{id}/pay/qr.png", roles: AUTHENTICATED, csrf: false },
     RouteRule { method: "POST", path: "/orders/{id}/mark-paid", roles: AUTHENTICATED, csrf: true },
+    // Tx-proof flow (2026-10-18): buyer proof submission + manual
+    // report; seller per-order confirmation + not-received declaration.
+    RouteRule { method: "POST", path: "/orders/{id}/submit-proof", roles: AUTHENTICATED, csrf: true },
+    RouteRule { method: "POST", path: "/orders/{id}/manual-report", roles: AUTHENTICATED, csrf: true },
+    RouteRule { method: "POST", path: "/orders/{id}/confirm-payment", roles: AUTHENTICATED, csrf: true },
+    RouteRule { method: "POST", path: "/orders/{id}/declare-not-received", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "GET", path: "/invoices/{id}", roles: AUTHENTICATED, csrf: false },
     RouteRule { method: "GET", path: "/invoices/{id}/qr.png", roles: AUTHENTICATED, csrf: false },
     RouteRule { method: "GET", path: "/invoices/{id}/statement.txt", roles: AUTHENTICATED, csrf: false },
@@ -135,6 +141,8 @@ pub const ROUTES: &[RouteRule] = &[
     RouteRule { method: "POST", path: "/disputes/{id}/confirm-refund", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "GET", path: "/moderation/accounts", roles: MODERATION, csrf: false },
     RouteRule { method: "POST", path: "/moderation/reports/{id}", roles: MODERATION, csrf: true },
+    RouteRule { method: "GET", path: "/moderation/flags/{id}", roles: MODERATION, csrf: false },
+    RouteRule { method: "POST", path: "/moderation/flags/{id}", roles: MODERATION, csrf: true },
     RouteRule { method: "POST", path: "/moderation/accounts/{id}/warn", roles: MODERATION, csrf: true },
     RouteRule { method: "POST", path: "/moderation/accounts/{id}/close", roles: MODERATION, csrf: true },
     RouteRule { method: "POST", path: "/moderation/listings/{id}/remove", roles: MODERATION, csrf: true },

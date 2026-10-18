@@ -1,0 +1,25 @@
+<h1>Payment review flag #{{ flag.id }}</h1>
+{% if let Some(m) = message %}<p role="alert">{{ m }}</p>{% endif %}
+<p>Order: <code>{{ flag.order_public_id }}</code> · order state {{ order_state }} · buyer {{ buyer_username }} vs seller {{ seller_username }}</p>
+<p>Flag: <strong>{{ flag.kind }}</strong> · state {{ flag.state }} · raised {{ flag.created_at }}</p>
+{% if flag.kind == "proof-unconfirmed" %}<p>A buyer-submitted payment proof is on file and the seller has not confirmed payment for this order. The flag clears automatically if the seller confirms.</p>{% endif %}
+{% if flag.kind == "proof-contradiction" %}<p>A buyer-submitted payment proof is on file and the seller has declared payment not received for this order — a direct contradiction for a moderator to judge.</p>{% endif %}
+{% if let Some(d) = dispute_id %}<p>This order has a dispute: <a href="/disputes/{{ d }}">open the dispute record</a></p>{% endif %}
+{% if let Some(p) = proof %}
+<h2>Buyer-submitted payment proof</h2>
+<p>Carried <strong>unverified</strong> — check it in your own wallet against the order's assigned address and amount (see the order / dispute record for the address).</p>
+<p>Transaction ID: <code>{{ p.txid }}</code> · first submitted {{ p.created_at }}</p>
+<pre>{{ p.proof }}</pre>
+{% else %}
+<p>No proof is stored for this order.</p>
+{% endif %}
+{% if flag.state == "open" %}
+<h2>Work this flag</h2>
+{% if !totp_enrolled %}<p role="alert">You have not enrolled in TOTP. Moderator actions are refused until you enroll on your <a href="/account/security">security page</a>.</p>{% endif %}
+<form method="post" action="/moderation/flags/{{ flag.id }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Action <select name="action"><option value="resolve">resolve</option><option value="dismiss">dismiss</option></select></label>
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Apply</button></form>
+{% endif %}
+<p><a href="/moderation">Back to the moderation queue</a></p>

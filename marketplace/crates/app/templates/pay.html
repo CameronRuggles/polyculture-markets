@@ -1,6 +1,9 @@
 <h1>Pay for {{ order.listing_title }}</h1>
 <p>Order: <code>{{ order.public_id }}</code> · State: <strong>{{ order.state }}</strong></p>
-{% if is_paid %}
+{% if closed %}
+<p role="alert"><strong>This order is closed. Do not pay.</strong></p>
+<p>The order is {{ order.state }} — it no longer accepts payment. If you already paid, contact the seller from the order page.</p>
+{% else if is_paid %}
 <p role="status">Seller confirmed payment.</p>
 {% endif %}
 {% if let Some(a) = assignment %}
@@ -32,6 +35,7 @@
 <h2>Please read</h2>
 <p>You pay the seller directly. This marketplace never holds your money and cannot refund you or recover a payment sent to the wrong address. If the seller doesn't deliver, any refund is up to the seller. Pay the exact amount in one transaction, and message the seller if anything goes wrong.</p>
 <p>After paying, message the seller on the order page. The seller marks the order paid after seeing the funds in their own wallet; the order page will then say "seller confirmed payment".</p>
+<p><strong>Protect yourself:</strong> after paying, submit your transaction proof from the order page. It is your strongest protection if anything goes wrong. The marketplace carries the proof unverified; the seller and moderators check it in their own wallets.</p>
 {% else %}
 <h2>Payments are not set up for this order</h2>
 <p>This order has no payment assignment: the seller has not set up direct Monero payments, so there is no payment address for this order. Message the seller from the order page to arrange how to proceed.</p>
