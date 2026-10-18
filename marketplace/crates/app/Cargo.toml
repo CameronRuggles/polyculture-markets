@@ -1,0 +1,38 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+# Stage 10: the server binary gets a deployable name (the systemd
+# unit and deploy script install it as /usr/local/bin/marketplace-app).
+[[bin]]
+name = "marketplace-app"
+path = "src/main.rs"
+
+[dependencies]
+modules-api = { path = "../modules-api" }
+domain = { path = "../domain" }
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "time"] }
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+# Stage 9: TOTP (RFC 6238 standard construction over HMAC-SHA1) and the
+# Nettle AEAD used for key-file encryption of secrets at rest. All three
+# crates are already in the locked dependency tree (Nettle is the
+# project's standard crypto backend, Q8); versions pinned by Cargo.lock.
+hmac = "0.12"
+sha1 = "0.10"
+nettle = "7.5"
+hex = "0.4"
+time = { version = "0.3", features = ["macros"] }
+askama = "0.12"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+sequoia-openpgp = { version = "2.4.1", features = ["compression"] }
+envelope = { path = "../envelope" }
+anyhow = "1"

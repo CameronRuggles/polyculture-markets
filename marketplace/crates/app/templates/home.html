@@ -1,0 +1,20 @@
+<h1>{{ site_name }}</h1>
+<p>A privacy-first marketplace where buyers and sellers trade directly. This server never holds funds, never sees plaintext messages, and never asks for your wallet keys.</p>
+{% if network_name != "mainnet" %}
+<p role="status"><strong>Demonstration instance.</strong> This marketplace runs on the Monero <strong>{{ network_name }}</strong> — every coin here is a valueless test coin. Do not send real Monero to any address shown on this instance.</p>
+{% endif %}
+<h2>How it works</h2>
+<ul>
+<li><strong>Browse</strong> the <a href="/listings">catalogue</a> — no account needed to look.</li>
+<li><strong>Register</strong> with a username and passphrase. There is no email and no password reset — save the recovery code you are shown.</li>
+<li><strong>Order</strong> from a seller. You pay the seller directly in Monero, wallet to wallet, to a one-time subaddress the seller signed in advance. The order page explains every step, and the payment page shows you how to verify the address in your own wallet before you pay.</li>
+<li><strong>Messages</strong> are end-to-end encrypted on your own device. The server stores ciphertext only and can never read them.</li>
+<li><strong>Reputation</strong> is built from minimized trade facts, shown raw next to any score — including the ways it can be gamed. Read the <a href="/limitations">limitations</a> before trusting it.</li>
+</ul>
+<h2>Before you trade</h2>
+<p>Payments here are direct and final: there is <strong>no escrow</strong> and the marketplace cannot refund you or recover a payment. Read <a href="/payment-risks">payment risks</a> and the <a href="/security-guide">security guide</a>, verify addresses and fingerprints yourself, and start small with any new seller.</p>
+{% if registrations_open %}
+<p><a href="/register">Create an account</a> · <a href="/listings">Browse listings</a></p>
+{% else %}
+<p>Registration is currently closed on this instance. <a href="/listings">Browse listings</a></p>
+{% endif %}

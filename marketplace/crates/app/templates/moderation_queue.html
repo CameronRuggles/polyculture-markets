@@ -1,0 +1,66 @@
+<h1>Moderation queue</h1>
+{% if let Some(m) = message %}<p role="alert">{{ m }}</p>{% endif %}
+{% if !totp_enrolled %}<p role="alert">You have not enrolled in TOTP. Every moderator action below will be refused until you enroll on your <a href="/account/security">security page</a>.</p>{% endif %}
+<p>Moderator powers are deliberately narrow: record dispute outcomes, warn accounts, close accounts, remove listings. There is no ban and no suspension — a closed account's identity ends, but nothing here can stop a person registering again, and nothing claims otherwise. Moderators cannot move funds and cannot browse anyone's conversations. Seller admission: <a href="/moderation/sellers">seller queue</a>.</p>
+<h2>Open disputes</h2>
+{% if disputes.is_empty() %}<p>No open disputes.</p>{% endif %}
+{% for d in disputes %}
+<p>Dispute {{ d.0.id }} · order <code>{{ d.1 }}</code> · buyer {{ d.2 }} vs seller {{ d.3 }} · state {{ d.0.state }} · <a href="/disputes/{{ d.0.id }}">Open</a></p>
+{% endfor %}
+<h2>Open reports</h2>
+{% if reports.is_empty() %}<p>No open reports.</p>{% endif %}
+{% for r in reports %}
+<article>
+<p>#{{ r.id }} · {{ r.target }} · category {{ r.category }} · reported by {{ r.reporter_username }} · {{ r.created_at }}</p>
+<p>Reason: {{ r.reason }}</p>
+<form method="post" action="/moderation/reports/{{ r.id }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Action <select name="action"><option value="dismiss">dismiss</option><option value="resolve">resolve</option></select></label>
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Apply</button></form>
+</article>
+{% endfor %}
+<h2>Accounts</h2>
+<form method="get" action="/moderation/accounts">
+<label>Search by username <input type="text" name="q" value="{{ query }}"></label>
+<button type="submit">Search</button></form>
+{% for a in accounts %}
+<article>
+<p><a href="/sellers/{{ a.public_id }}">{{ a.username }}</a> · role {{ a.role }} · status {{ a.status }}{% if a.warned %} · warned{% endif %}</p>
+<form method="post" action="/moderation/accounts/{{ a.public_id }}/warn">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Warning reason <input type="text" name="reason" maxlength="500" required></label>
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Warn account</button></form>
+{% if a.status != "closed" %}
+<form method="post" action="/moderation/accounts/{{ a.public_id }}/close">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Close account</button></form>
+{% endif %}
+</article>
+{% endfor %}
+<h2>Listing removal</h2>
+<p>Look up a listing by its public ID to remove it from the catalogue or restore a removed one. Removal hides the listing; the seller's orders and history are untouched. Every action needs a current TOTP code.</p>
+<form method="get" action="/moderation">
+<label>Listing public ID <input type="text" name="listing" value="{{ listing_query }}"></label>
+<button type="submit">Look up listing</button></form>
+{% if let Some(l) = listing_hit %}
+<article>
+<p><a href="/listings/{{ l.public_id }}">{{ l.title }}</a> · status {{ l.status }} · seller {{ l.seller_name }}</p>
+{% if l.status == "removed" %}
+<form method="post" action="/moderation/listings/{{ l.public_id }}/restore">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Restore listing</button></form>
+{% else %}
+<form method="post" action="/moderation/listings/{{ l.public_id }}/remove">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Remove listing</button></form>
+{% endif %}
+</article>
+{% else if !listing_query.is_empty() %}
+<p>No listing with that public ID.</p>
+{% endif %}
+

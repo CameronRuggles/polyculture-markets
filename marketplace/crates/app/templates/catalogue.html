@@ -1,0 +1,16 @@
+<h1>Listings</h1>
+<form method="get" action="/listings">
+<label>Search <input name="q" value="{{ q }}"></label>
+<label>Category <select name="category">
+<option value="">All</option>
+{% for c in categories %}<option value="{{ c }}" {% if c.as_str() == category.as_str() %}selected{% endif %}>{{ c }}</option>{% endfor %}
+</select></label>
+<button type="submit">Search</button></form>
+{% for l in listings %}
+<article><h2><a href="/listings/{{ l.public_id }}">{{ l.title }}</a></h2>
+<p>{{ l.price_xmr }} XMR · {{ l.category }} · seller {{ l.seller_name }}</p></article>
+{% endfor %}
+{% if listings.is_empty() %}<p>No listings found.</p>{% endif %}
+<nav>{% if page > 1 %}<a href="/listings?page={{ page - 1 }}&q={{ q }}&category={{ category }}">Newer</a> {% endif %}
+<a href="/listings?page={{ page + 1 }}&q={{ q }}&category={{ category }}">Older</a></nav>
+

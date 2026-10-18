@@ -1,0 +1,24 @@
+<h1>Conversation with {{ other_name }}</h1>
+{% if let Some(m) = message %}<p role="alert">{{ m }}</p>{% endif %}
+{% if rotation_warning %}<p role="alert">{{ other_name }} rotated their identity key since this conversation began. Download and independently verify the new key before sending sensitive information.</p>{% endif %}
+<p>Messages are end-to-end encrypted. The server stores ciphertext only and never displays it.
+Encrypt locally to both keys: your own, and {{ other_name }}'s current key
+<code>{{ other_fingerprint }}</code> — <a href="/sellers/{{ other_public_id }}/key.asc">download it</a>
+and verify the fingerprint against a copy you trust.</p>
+<p>Example: <code>gpg --encrypt --armor --recipient YOURKEY --recipient {{ other_fingerprint }}</code></p>
+{% for m in messages %}
+<p>{% if m.1 == me %}<strong>You</strong>{% else %}<strong>{{ other_name }}</strong>{% endif %} · {{ m.3 }} ·
+{{ m.2 }} bytes · <a href="/conversations/{{ conv_id }}/messages/{{ m.0 }}/download">Download ciphertext (.asc)</a></p>
+{% endfor %}
+<h2>Send an encrypted message</h2>
+<form method="post" action="/conversations/{{ conv_id }}/messages">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Paste the armored encrypted message (there is no plaintext composer — encrypt on your own device)<br>
+<textarea name="ciphertext" rows="10" cols="70"></textarea></label>
+<button type="submit">Send</button></form>
+<p>…or upload the armored file:</p>
+<form method="post" action="/conversations/{{ conv_id }}/messages/file" enctype="multipart/form-data">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="file" name="ciphertext_file" required>
+<button type="submit">Upload</button></form>
+

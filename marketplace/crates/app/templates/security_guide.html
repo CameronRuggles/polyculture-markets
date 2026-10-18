@@ -1,0 +1,32 @@
+<h1>Security guide</h1>
+<h2>The threat model in one paragraph</h2>
+<p>This marketplace is designed so that a stolen database reveals no plaintext messages, no shipping details, no wallet keys, and no raw session tokens — and so that a compromised server cannot steal funds, because funds never pass through it. It is <strong>not</strong> designed to hide metadata: the operator knows which accounts interact and when, and network observers can correlate timing and sizes. Use Tor, use a dedicated identity key, and verify everything the server shows you against something it does not control.</p>
+<h2>Your identity key</h2>
+<ol>
+<li>Create a <strong>dedicated OpenPGP key for this marketplace</strong> — not a key you use elsewhere. Keep the private key on your own device; the server only ever holds the public certificate.</li>
+<li>Register the certificate on your <a href="/account/security">account security page</a>. Your fingerprint is your durable identity: account names can be imitated, fingerprints cannot.</li>
+<li><strong>Pin other people's keys locally.</strong> When you fetch a seller's key from their profile, verify the fingerprint against a copy you trust (their other channels, a previous order) and save it in your own keyring. The fingerprint printed on a page served by this server is a convenience, not a proof.</li>
+<li>If you rotate your key, sign the rotation with the old key whenever you can. An unsigned ("uncertified") rotation shows a warning on your profile for 90 days, because the server cannot tell it apart from a takeover.</li>
+</ol>
+<h2>Messages: sign, then encrypt, locally</h2>
+<ol>
+<li>Compose on your own device. There is deliberately no plaintext composer here.</li>
+<li><strong>Sign</strong> with your key first, then <strong>encrypt</strong> to both the recipient's key and your own (so you can read your sent copy).</li>
+<li>Paste or upload the armored ciphertext. The server checks the envelope's shape — recipients, size, packet structure — and rejects anything malformed. It cannot read the content.</li>
+<li>Only signed messages count as evidence in a dispute. An unsigned claim is labelled an unverified claim, however true it may be.</li>
+</ol>
+<h2>Verify a payment before you send it</h2>
+<ol>
+<li>Open the order's payment page. Check the amount, and that the network named in the signed message matches the network you intend to pay on.</li>
+<li>Copy the signed message and signature exactly and verify them with your wallet's verify feature, against the seller's <strong>primary address</strong>.</li>
+<li>Check that the subaddress at the end of the signed message is exactly the subaddress you are about to pay, and that the primary address matches a copy you pinned earlier.</li>
+<li>Only then pay — the exact amount, in one transaction. The full walkthrough is on every payment page, next to the address.</li>
+</ol>
+<h2>Disputes and disclosure</h2>
+<p>If a trade goes wrong you may <em>voluntarily</em> disclose specific messages to moderators: decrypt locally and paste the plaintext with its detached signature. The marketplace checks the signature against the <strong>other party's</strong> pinned key; only a verifying signature is labelled evidence. Disclosed content is stored encrypted and deleted a fixed period after the dispute resolves — the dispute page states the exact number of days before you submit anything.</p>
+<h2>What never to do</h2>
+<ul>
+<li>Never paste a wallet seed, a private key, or a wallet password into any page here. No legitimate page asks for one — a page that does is not this marketplace.</li>
+<li>Never trust an address or fingerprint that reaches you through only one channel.</li>
+<li>Never reuse this marketplace's passphrase or identity key anywhere else.</li>
+</ul>

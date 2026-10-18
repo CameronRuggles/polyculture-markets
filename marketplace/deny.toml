@@ -1,0 +1,78 @@
+# cargo-deny configuration for Polyculture Markets (marketplace workspace).
+#
+# Authored 2026-10-17 as part of the deterministic-tools pass
+# (DETERMINISTIC-TOOLS-REPORT-2026-10-17.md). Spec v2 §6 / operations:
+# "cargo audit and cargo deny in CI (advisories and license compatibility
+# with AGPL)".
+#
+# The project itself is AGPL-3.0-or-later. The allow list below is every
+# licence actually present in the locked dependency tree on 2026-10-17,
+# each of which is compatible with distribution under AGPL-3.0-or-later:
+# permissive licences trivially; the LGPL family (sequoia-openpgp and
+# buffered-reader, LGPL-2.0-or-later; nettle / nettle-sys, offered as
+# LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only — the LGPL-3.0 branch is
+# the one relied on) combines with AGPL-3.0, and LGPL-2.0-or-later may be
+# exercised under later GPL-family terms. No GPL-only dependency exists
+# in the tree.
+
+[advisories]
+# Deliberately NO ignore for RUSTSEC-2023-0071 (rsa, Marvin attack):
+# cargo-deny checks the feature-resolved graph, and rsa is not in it —
+# it sits in Cargo.lock only as an optional dependency of sqlx-mysql,
+# while this project compiles sqlx's postgres backend only (verified:
+# `cargo tree` has no rsa, no rsa artefact in target/, and deny's first
+# run reported the ignore as "advisory not detected / no crate matched").
+# Leaving the advisory armed here means that if the MySQL backend is
+# ever enabled, deny fails loudly. `cargo audit`, which scans the raw
+# lockfile, carries the ignore instead — see .cargo/audit.toml.
+ignore = []
+# Yanked crates are errors by default in cargo-deny; keep that.
+
+[licenses]
+allow = [
+    "0BSD",
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "LGPL-2.0-or-later",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-only",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "bzip2-1.0.6",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# Workspace members (app, domain, media-worker, modules-api,
+# security-tests) carry no `license` field in their Cargo.toml; they are
+# this project's own unpublished code under the repo AGPL LICENSE.
+ignore = true
+
+[bans]
+# The tree legitimately carries multiple versions today (syn 2/3,
+# getrandom 0.2/0.4, hashbrown, shlex, itertools, miniz_oxide — see the
+# tools report for the full list). Warn so the list stays visible;
+# collapsing them means dependency surgery, a separate decision.
+multiple-versions = "warn"
+# cargo-deny counts a version-less `path = "..."` dependency as a
+# wildcard; every wildcard in this tree is a workspace-internal path
+# dependency (app -> domain/modules-api/envelope, etc.), which is pinned
+# by the path itself. All external dependencies carry explicit version
+# requirements (verified in the tools report). Warn, so a genuine
+# external `*` requirement would still surface in output.
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

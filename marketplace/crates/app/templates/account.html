@@ -1,0 +1,9 @@
+<h1>{{ username }}</h1>
+<p>Role: {{ role }}</p>
+{% if account_closed %}<p role="alert"><strong>This account is closed.</strong></p>{% endif %}
+{% if let Some(d) = warned_date %}<p role="alert">A moderator issued a warning to this account on {{ d }}. Warnings are recorded and shown to you here and in your inbox; they do not restrict the account.</p>{% endif %}
+{% if let Some(c) = recovery_code %}<p><strong>Your recovery code (shown once): {{ c }}</strong></p>{% endif %}
+<form method="post" action="/logout">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Log out</button></form>
+

@@ -1,0 +1,38 @@
+# Proposed .gitignore for the Polyculture Markets repo root.
+# Install as .gitignore BEFORE git init (see
+# SCRUB-AUDIT-ADDENDUM-2026-10-17.md). Prepared 2026-10-17.
+
+# Build output and vendored binaries
+target/
+downloads/
+
+# Secrets and key material — never in history
+*.key
+*.keys
+marketplace.key
+stage0-spike/fixtures-wallet/
+
+# Demo deploy record containing a plaintext gate password
+DEMO-DEPLOY-REPORT.md
+
+# Local dev database setup with hardcoded dev password
+# (remove this line if dev-setup.sh is parameterised instead)
+marketplace/deploy/dev-setup.sh
+
+# Runtime data, not source
+marketplace/media/
+tmp/
+
+# Mutation-testing output
+mutants.out
+mutants.out.old
+mutants-runs/
+mutants-stage9/
+mutants-stage10/
+
+# Databases and local state (NOT migrations/*.sql — those are source)
+*.db
+*.sqlite
+.env
+*.sql
+!marketplace/migrations/*.sql

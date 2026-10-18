@@ -1,0 +1,39 @@
+# seller-helper — standalone seller tool for Direct Monero Payments v1.
+#
+# This crate is deliberately NOT a member of the marketplace workspace:
+# the empty [workspace] table below detaches it, so it builds entirely
+# on its own (`cargo build` in this directory) and can be distributed,
+# audited and rebuilt from source independently of the marketplace.
+[package]
+name = "seller-helper"
+version = "0.1.0"
+edition = "2021"
+description = "Seller-side helper for Direct Monero Payments v1: pre-generates wallet-signed subaddresses via a local monero-wallet-rpc"
+license = "AGPL-3.0-or-later"
+
+[workspace]
+
+[[bin]]
+name = "seller-helper"
+path = "src/main.rs"
+
+# Dependencies are kept minimal on purpose:
+# - `monero` (pinned to the same major the marketplace uses, 0.22) is the
+#   vetted crate used for address parsing / network / kind checks. No
+#   Monero cryptography is hand-rolled in this tool; signing happens in
+#   the seller's own wallet via RPC.
+# - `serde` / `serde_json` for the config file, JSON-RPC and batch file.
+# - `md5` for HTTP Digest authentication against monero-wallet-rpc
+#   (Monero's epee server requires Digest auth when --rpc-login is set).
+# HTTP itself is plain `std::net::TcpStream` to 127.0.0.1: no TLS stack,
+# no HTTP client crate, and therefore no code path that could talk to
+# anything but the configured loopback wallet RPC.
+# Exact resolved versions are pinned in Cargo.lock, which is committed.
+[dependencies]
+monero = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md5 = "0.7"
+
+[profile.release]
+opt-level = 3

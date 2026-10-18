@@ -1,0 +1,10 @@
+[package]
+name = "envelope"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Amended spec section 14 envelope validation (packet-level, never decrypts)."
+
+[dependencies]
+modules-api = { path = "../modules-api" }
+sequoia-openpgp = { version = "2.4.1", features = ["compression"] }

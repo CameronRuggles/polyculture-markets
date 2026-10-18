@@ -1,0 +1,5 @@
+statement-format: marketplace-key-rotation-v1
+marketplace-id: mkt_4f9c2a7e1b3d5f60718293a4b5c6d7e8
+account-id: acct_0123456789abcdef0123456789abcdef
+old-fingerprint: 01:3456789ABCDEF012345693a4b5c6d71234567
+new-d-at: 1Z

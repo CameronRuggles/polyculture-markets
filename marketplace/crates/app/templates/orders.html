@@ -1,0 +1,7 @@
+<h1>Your orders</h1>
+{% for o in orders %}
+<p><a href="/orders/{{ o.public_id }}">{{ o.listing_title }}</a> · {{ o.state }} ·
+{{ o.total_xmr }} XMR · {% if o.buyer_id == me %}buying{% else %}selling{% endif %} · {{ o.created_at }}</p>
+{% endfor %}
+{% if orders.is_empty() %}<p>No orders yet.</p>{% endif %}
+

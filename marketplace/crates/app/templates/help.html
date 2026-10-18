@@ -1,0 +1,27 @@
+<h1>Help</h1>
+<h2>Accounts</h2>
+<p><strong>There is no email and no password reset.</strong> When you register you are shown a recovery code exactly once — save it somewhere safe. With the code you can set a new passphrase on the <a href="/account/recover">recovery page</a>; recovery signs out every session. Without the code, a lost passphrase means a lost account, and nobody — including the operator — can restore it.</p>
+<p>Closing your account is on the <a href="/account/security">security page</a>: type CLOSE, enter your passphrase. Closure ends the identity (listings unpublished, login disabled, reputation frozen) but does not erase your order and review history — your counterparties' records depend on it.</p>
+<h2>Buying</h2>
+<ol>
+<li>Find a listing and place an order. The seller accepts, and the order gets a one-time payment subaddress from the seller's signed batch.</li>
+<li>Open the payment page from the order. Verify the signed message in your own wallet (the page walks you through it), then pay the exact amount in one transaction.</li>
+<li>Message the seller from the order page. When they see the funds, they mark the order paid — "seller confirmed payment" — then fulfil it. When it arrives, mark it complete.</li>
+<li>You may leave one review per completed or resolved order, and edit it for 7 days.</li>
+</ol>
+<h2>Selling</h2>
+<ol>
+<li>Apply from the <a href="/seller">Sell page</a>; a moderator approves seller accounts.</li>
+<li>Register your identity key, then set up direct payments: save your primary Monero address and upload a batch of wallet-signed subaddresses generated with the seller helper tool. The dashboard shows the exact marketplace ID, network, and seller ID the tool needs.</li>
+<li>Keep your pool topped up — when it runs out, your listings stop taking orders until you upload another batch, and the dashboard warns you as it runs low.</li>
+<li>Mark orders paid only when the funds are actually in your wallet: your attestation is the record buyers and moderators rely on.</li>
+</ol>
+<h2>Messages</h2>
+<p>Messages are encrypted on your device and stored as ciphertext — see the <a href="/security-guide">security guide</a> for the exact procedure. The server can never read them, recover them, or hand them to moderators: in a dispute, only messages you choose to disclose, with signatures that verify, count as evidence.</p>
+<h2>Something went wrong?</h2>
+<ul>
+<li><strong>Order problem:</strong> message your counterparty from the order page, then open a dispute from the same page if you cannot resolve it.</li>
+<li><strong>Abuse, fraud, illegal listing:</strong> use the report form on the listing, profile, or review.</li>
+<li><strong>Locked out:</strong> use your recovery code. There is no other route, by design.</li>
+<li><strong>Security concern about the software itself:</strong> see the source page (footer) for how to reach the project.</li>
+</ul>

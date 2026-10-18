@@ -1,0 +1,64 @@
+# Locked security suites (spec §22). This package exists only to host the
+# blind-authored suites in this directory as runnable cargo tests.
+#
+# Authorship rule (tests/security/README.md): the blind_*.rs files here are
+# written by authors who have seen only the spec, SPEC-V2-AMENDMENTS.md, and
+# docs/api-contract.md. Implementers may create scaffolding (this manifest,
+# src/lib.rs) but never author or edit test content. Fixture constructions
+# may change only with the owner's sight of the diff; assertions never.
+
+[package]
+name = "security-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "blind_stage1"
+path = "blind_stage1.rs"
+
+[[test]]
+name = "blind_stage2"
+path = "blind_stage2.rs"
+
+[[test]]
+name = "blind_stage3"
+path = "blind_stage3.rs"
+
+[[test]]
+name = "blind_stage4"
+path = "blind_stage4.rs"
+
+[[test]]
+name = "blind_stage6"
+path = "blind_stage6.rs"
+
+[dependencies]
+# Stage 10 scaffolding (implementer-provided; test content is the
+# blind author's alone): HTTP-level assertions use the real router
+# via tower oneshot. axum/tower/http-body-util are the versions
+# already in the locked workspace tree.
+axum = { version = "0.8" }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+app = { path = "../../crates/app" }
+domain = { path = "../../crates/domain" }
+modules-api = { path = "../../crates/modules-api" }
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "time"] }
+time = { version = "0.3", features = ["macros"] }
+
+[[test]]
+name = "blind_direct_v1"
+path = "blind_direct_v1.rs"
+
+[[test]]
+name = "blind_stage9"
+path = "blind_stage9.rs"
+
+[[test]]
+name = "blind_stage10"
+path = "blind_stage10.rs"

@@ -1,0 +1,10 @@
+<h1>Source code</h1>
+<p>This marketplace software is free software, released under the <strong>GNU Affero General Public License, version 3</strong> (AGPL-3.0). The licence is not a formality: if you can use this instance, you are entitled to the complete corresponding source code of the software running it.</p>
+{% if let Some(u) = source_url %}
+<p>This instance's source code is published by its operator at: <a href="{{ u }}">{{ u }}</a></p>
+{% else %}
+<p>This instance's operator has not configured a source link. Ask the operator for the source code of the version shown in the page footer — under the AGPL they must provide it. If you run an instance yourself, set <code>SOURCE_URL</code> so this page links your published source.</p>
+{% endif %}
+<p>Instance version: {{ version }} · Marketplace ID: <code>{{ marketplace_id }}</code></p>
+<h2>Why this matters here</h2>
+<p>The security claims on the <a href="/limitations">limitations page</a> — no stored plaintext, no wallet keys, direct payments the server cannot redirect — are claims about this code. The source is how you check them, and the signed statements and subaddress signatures are how you stay safe even if an operator's running code differs from the published source: verify in your own wallet, every time.</p>

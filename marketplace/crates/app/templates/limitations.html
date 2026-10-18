@@ -1,0 +1,39 @@
+<h1>Limitations</h1>
+<p>This marketplace is built to give strong guarantees about <strong>payment custody</strong> and <strong>message content</strong>, and weak ones about <strong>metadata</strong>. Those are different properties; this page never blurs them.</p>
+<h2>What this system does protect</h2>
+<ul>
+<li><strong>Funds never pass through the marketplace.</strong> Buyers pay sellers directly, wallet to wallet. A compromised server cannot steal money it never holds.</li>
+<li><strong>Message content.</strong> Messages are encrypted on your device; the database holds ciphertext only. There is no plaintext, no shipping details, and no wallet keys or seeds stored here — ever.</li>
+<li><strong>Payment addresses.</strong> Sellers pre-sign their payment addresses with their own wallet. Your wallet can verify the signature before you pay, so a compromised server cannot silently swap in its own address — <em>if you verify</em>.</li>
+<li><strong>Accounts.</strong> Passphrases are hashed with Argon2id; sessions rotate; every form carries a CSRF token.</li>
+</ul>
+<h2>What it does not protect against</h2>
+<ul>
+<li><strong>A seller who takes payment and does not deliver.</strong> There is no escrow, so every order carries this risk. Reputation and disputes inform you; they cannot make you whole.</li>
+<li><strong>Compromised devices.</strong> If your computer or wallet is compromised, nothing here helps.</li>
+<li><strong>Traffic correlation and metadata.</strong> The operator always knows which accounts interact, which listings they order, and when. Timing and sizes are visible to network observers; use Tor.</li>
+<li><strong>A malicious server on your first visit</strong>, before you have pinned anyone's key. Verify fingerprints against copies obtained elsewhere.</li>
+<li><strong>Review farming.</strong> Weighted reputation raises the cost of sock-puppet farming; it does not prevent it. The raw facts are shown so you can judge for yourself.</li>
+<li><strong>Skipped verification.</strong> The verification steps only protect people who do them.</li>
+</ul>
+<h2>Payments are attested, not verified</h2>
+<p>This instance does not verify payments on-chain and runs no wallet. An order shows "seller confirmed payment" because the seller said so after seeing funds in their own wallet. Nothing on this site can prove a payment happened.</p>
+<h2>This instance</h2>
+<ul>
+<li>Deployment profile: <strong>{{ profile }}</strong></li>
+<li>Monero network: <strong>{{ network_name }}</strong></li>
+<li>Marketplace ID: <code>{{ marketplace_id }}</code></li>
+<li>Software version: {{ version }}</li>
+<li>Registration: {% if registrations_open %}open{% else %}closed{% endif %}</li>
+<li>Payment module: direct payments (signed subaddress pool + seller attestation). No escrow, no on-chain proof checking.</li>
+<li>Reputation model: configured by the operator; raw trade facts are always shown next to any score.</li>
+</ul>
+<h2>How long data is kept (this instance's actual values)</h2>
+<ul>
+<li>Read inbox notifications: deleted {{ notifications_read_days }} days after being read. Unread notifications are kept.</li>
+<li>Sessions: deleted {{ sessions_expired_days }} days after they expire.</li>
+<li>Security events: deleted after {{ security_events_days }} days.</li>
+<li>Dispute disclosures: deleted {{ disclosures_resolved_days }} days after the dispute is resolved.</li>
+<li>Orders, invoices, and terms: kept while the accounts exist. Automatic purging of old orders is not yet implemented on this software — the operator can delete data manually, and account closure ends an identity without erasing counterparty history.</li>
+</ul>
+<p>See also <a href="/payment-risks">payment risks</a>, the <a href="/security-guide">security guide</a>, and this instance's <a href="/policy">policy</a>.</p>

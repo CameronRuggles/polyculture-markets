@@ -1,0 +1,71 @@
+<h1>Seller dashboard</h1>
+{% if let Some(m) = payment_message %}<p role="alert">{{ m }}</p>{% endif %}
+{% if is_seller %}
+<h2>Monero payments (direct)</h2>
+<p>Buyers pay you directly, wallet to wallet. This marketplace never holds funds or keys. Copy these values into the seller helper tool's <code>init</code> exactly as shown:</p>
+<p>Marketplace ID: <code>{{ payment_marketplace_id }}</code><br>
+Network: <code>{{ payment_network }}</code><br>
+Your seller ID: <code>{{ payment_seller_id }}</code></p>
+{% if let Some(d) = payment_changed %}
+<p role="alert">Payment identity changed on {{ d }}. A "payment identity changed" notice is shown on your profile and payment pages, and your unused payment addresses were retired.</p>
+{% endif %}
+{% if let Some(p) = payment_primary %}
+<p>Primary address: <code>{{ p }}</code></p>
+<p>Unused payment addresses in your pool: {{ payment_unused }}</p>
+{% if payment_low %}<p role="alert">Your address pool is running low — {{ payment_unused }} left. Generate and upload a fresh batch soon: when the pool runs out, your listings stop taking new orders until you upload more.</p>{% endif %}
+{% else %}
+<p>You have not set a primary payment address yet. Until you set one and upload a batch of signed subaddresses, orders proceed without a payment assignment.</p>
+{% endif %}
+<form method="post" action="/seller/payment-identity">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Primary address (standard address, account 0 index 0)
+<input name="primary_address" size="100"></label>
+<button type="submit">Save primary address</button></form>
+<p>Changing the primary address treats it as a new payment identity: all unused pool addresses are retired and a change notice shows for a set period. Order and review history is never erased.</p>
+<h3>Upload a signed subaddress batch</h3>
+<p>Generate the batch with the seller helper tool, then paste the batch JSON or choose the batch file. Uploads are all-or-nothing: one bad entry rejects the whole batch.</p>
+<form method="post" action="/seller/payment-batches" enctype="multipart/form-data">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Batch JSON <textarea name="batch_json" rows="8" cols="80"></textarea></label>
+<label>Batch file <input type="file" name="batch_file" accept="application/json,.json"></label>
+<button type="submit">Upload batch</button></form>
+<h2>Your listings</h2>
+{% for l in listings %}
+<article><h3>{{ l.title }} — {{ l.status }}</h3>
+<p>{{ l.price_xmr }} XMR · <a href="/listings/{{ l.public_id }}">view</a></p>
+<form method="post" action="/seller/listings/{{ l.public_id }}/status">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Status <select name="status">
+<option value="draft">draft</option><option value="published">published</option>
+<option value="paused">paused</option><option value="removed">removed</option></select></label>
+<button type="submit">Update</button></form>
+<form method="post" action="/seller/listings/{{ l.public_id }}/media" enctype="multipart/form-data">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Image (JPEG/PNG, max 5 MiB) <input type="file" name="image" accept="image/png,image/jpeg"></label>
+<button type="submit">Upload</button></form>
+<p>Warning: photo backgrounds and reflections can identify you.</p>
+</article>
+{% endfor %}
+<h2>New listing</h2>
+<form method="post" action="/seller/listings">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Title <input name="title" required maxlength="120"></label>
+<label>Description (paragraphs, - bullets, **bold**)
+<textarea name="description" rows="8" cols="60" required></textarea></label>
+<label>Price (XMR) <input name="price" required></label>
+<label>Category <select name="category">
+{% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></label>
+<label>Destination module <select name="destination_module">
+<option value="signed-address-pool">signed-address-pool</option>
+<option value="signed-invoice">signed-invoice</option></select></label>
+<label><input type="checkbox" name="auto_invoice" value="true"> Issue invoices automatically (pool module only)</label>
+<button type="submit">Create draft</button></form>
+{% else %}
+<h2>Become a seller</h2>
+{% if let Some(s) = application_state %}<p>Application state: {{ s }}</p>{% endif %}
+<form method="post" action="/seller/apply">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Apply to sell</button></form>
+<p>Seller admission is by approval on this instance.</p>
+{% endif %}
+

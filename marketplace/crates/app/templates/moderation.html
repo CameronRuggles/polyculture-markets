@@ -1,0 +1,10 @@
+<h1>Pending seller applications</h1>
+{% for a in applications %}
+<p>{{ a.1 }}
+<form method="post" action="/moderation/sellers/{{ a.0 }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button name="decision" value="approve" type="submit">Approve</button>
+<button name="decision" value="decline" type="submit">Decline</button></form></p>
+{% endfor %}
+{% if applications.is_empty() %}<p>None pending.</p>{% endif %}
+

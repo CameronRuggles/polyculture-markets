@@ -1,0 +1,40 @@
+<h1>Pay for {{ order.listing_title }}</h1>
+<p>Order: <code>{{ order.public_id }}</code> · State: <strong>{{ order.state }}</strong></p>
+{% if is_paid %}
+<p role="status">Seller confirmed payment.</p>
+{% endif %}
+{% if let Some(a) = assignment %}
+<h2>Amount to pay</h2>
+<p>Pay exactly <strong>{{ total_xmr }} XMR</strong> to this subaddress (one transaction):</p>
+<p><code>{{ a.address }}</code></p>
+<p><a href="{{ payment_uri }}">Open in wallet (monero: link)</a></p>
+<p><img src="/orders/{{ order.public_id }}/pay/qr.png" alt="QR code for the payment link" width="296" height="296"></p>
+<h2>Seller's primary address</h2>
+<p><code>{{ a.primary_address }}</code></p>
+{% if let Some(d) = a.identity_changed_at %}
+<p role="alert">Payment identity changed: this seller changed their primary payment address on {{ d }}. Their earlier payment address no longer applies. Independently confirm this new address with the seller through another channel before paying.</p>
+{% else %}
+<p>Unchanged since {{ a.identity_created_at }}.</p>
+{% endif %}
+<h2>Verify before you pay</h2>
+<p>The seller signed the message below with the key of their primary address. Verify it in your own wallet — that is how you know the subaddress above really belongs to the seller and was not swapped by this server.</p>
+<p>Signed message (copy exactly, one line):</p>
+<textarea readonly rows="3" cols="80">{{ a.message }}</textarea>
+<p>Signature (copy exactly):</p>
+<textarea readonly rows="3" cols="80">{{ a.signature }}</textarea>
+<ol>
+<li>Open your wallet's "verify message" or "verify signature" feature. Monero GUI, Feather, and monero-wallet-cli can all verify a signed message (monero-wallet-cli verifies from a file).</li>
+<li>Paste the message, the seller's primary address and the signature. The wallet must report a good signature.</li>
+<li>Check that the subaddress at the end of the message is the one you're about to pay, and that the network and seller ID are right.</li>
+<li>Check that the seller's primary address matches the one from your earlier orders or the seller's other channels.</li>
+<li>Only then pay, from your own wallet.</li>
+</ol>
+<h2>Please read</h2>
+<p>You pay the seller directly. This marketplace never holds your money and cannot refund you or recover a payment sent to the wrong address. If the seller doesn't deliver, any refund is up to the seller. Pay the exact amount in one transaction, and message the seller if anything goes wrong.</p>
+<p>After paying, message the seller on the order page. The seller marks the order paid after seeing the funds in their own wallet; the order page will then say "seller confirmed payment".</p>
+{% else %}
+<h2>Payments are not set up for this order</h2>
+<p>This order has no payment assignment: the seller has not set up direct Monero payments, so there is no payment address for this order. Message the seller from the order page to arrange how to proceed.</p>
+{% endif %}
+<p><a href="/orders/{{ order.public_id }}">Back to the order</a></p>
+

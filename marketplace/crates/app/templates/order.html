@@ -1,0 +1,59 @@
+<h1>{{ order.listing_title }}</h1>
+{% if let Some(m) = message %}<p role="alert">{{ m }}</p>{% endif %}
+<p>State: <strong>{{ order.state }}</strong> · Total: {{ total_xmr }} XMR · Settlement: {{ order.settlement }}</p>
+<p>Payment evidence: {{ evidence_label }}</p>
+<p>Seller key pinned for this order: <code>{{ order.seller_fpr_pinned }}</code></p>
+<p>Terms SHA-256: <code>{{ order.terms_sha256 }}</code> ·
+<a href="/orders/{{ order.public_id }}/terms.txt">Download terms</a></p>
+<p>Direct payment: this marketplace never holds funds. The seller is paid directly in Monero; there is no escrow and the marketplace cannot recover payments.</p>
+{% if has_payment %}<p><a href="/orders/{{ order.public_id }}/pay">Payment page for this order</a></p>{% endif %}
+{% if can_mark_paid %}
+<form method="post" action="/orders/{{ order.public_id }}/mark-paid">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Mark paid (seller confirmed payment)</button></form>
+{% endif %}
+<form method="post" action="/conversations/for-order/{{ order.public_id }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Message the other party</button></form>
+{% for a in actions %}
+<form method="post" action="/orders/{{ order.public_id }}/{{ a }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">{{ a }}</button></form>
+{% endfor %}
+{% if let Some((did, dstate)) = dispute %}
+<h2>Dispute</h2>
+<p>This order has a dispute ({{ dstate }}). <a href="/disputes/{{ did }}">Open the dispute record</a></p>
+{% endif %}
+<h2>Review</h2>
+{% if let Some(r) = review %}
+<p><strong>{{ r.score }} / 5</strong> — {{ r.created_at }}{% if r.payment_verified_badge %} · <em>payment verified on-chain</em>{% endif %}</p>
+<p>{{ r.text }}</p>
+{% if let Some(reply) = r.seller_reply %}<p><em>Seller reply:</em> {{ reply }}</p>{% endif %}
+{% if can_review %}
+<p>You can edit this review within 7 days of posting it.</p>
+<form method="post" action="/orders/{{ order.public_id }}/review">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Score <select name="score">
+<option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option>
+</select></label>
+<label>Review <textarea name="text" maxlength="1000" rows="4" cols="60">{{ r.text }}</textarea></label>
+<button type="submit">Update review</button></form>
+{% endif %}
+{% if can_reply %}
+<form method="post" action="/orders/{{ order.public_id }}/review/reply">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Seller reply (one public reply) <textarea name="text" maxlength="1000" rows="3" cols="60"></textarea></label>
+<button type="submit">Post reply</button></form>
+{% endif %}
+{% else if can_review %}
+<form method="post" action="/orders/{{ order.public_id }}/review">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Score <select name="score">
+<option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option>
+</select></label>
+<label>Review <textarea name="text" maxlength="1000" rows="4" cols="60" placeholder="Plain text, up to 1000 characters. Shown publicly on the seller's profile."></textarea></label>
+<button type="submit">Post review</button></form>
+{% else %}
+<p>No review yet. The buyer can review once the order is completed or resolved.</p>
+{% endif %}
+

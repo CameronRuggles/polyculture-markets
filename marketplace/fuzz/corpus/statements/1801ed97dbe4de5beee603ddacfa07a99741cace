@@ -1,0 +1,10 @@
+statement-format: marketplace-invoice-v1
+marketplace-id: mkt_4f9c2a7e1b3d5f60718293a4b5c6d7e8
+invoice-id: inv_8d1e5b0c3a7f2b4d6f8091a3b5c7d9e0
+order-id: ord_2b6a9e4d1c083f5a7c9e1b2d4f607182
+seller-key-fingerprint: 0123456789ABCDEF0123456789ABCDEF01234567
+network: monero-stagenet
+destination: 7BnERTpvL5MbCLtj5n9No7J5oE5hHiB3tVCK5cjSvCsYWD2WRJLFuWeKTLiXo5QJqt2ZwUaLy2Vh1Ad51K7FNgqcHgjW85o
+amount-atomic: 1250000000000
+expires-at: 2026-10-16T17:00:00Z
+terms-sha256: 0123456789abcdef0123456789abcdef0ement-format: mark3456789abcdef

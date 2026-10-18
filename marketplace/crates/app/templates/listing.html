@@ -1,0 +1,26 @@
+<h1>{{ listing.title }}</h1>
+<p>{{ price_xmr }} XMR · {{ listing.category }} · seller <a href="/sellers/{{ listing.seller_public_id }}">{{ listing.seller_name }}</a></p>
+{% for m in media %}<p><img src="/media/{{ m.0 }}" width="{{ m.1 }}" height="{{ m.2 }}" alt="Listing image"></p>{% endfor %}
+<div>{{ description_html|safe }}</div>
+<p>Payment module: {{ listing.destination_module }} · Pricing: {{ listing.pricing_module }}</p>
+{% if let Some(n) = payment_notice %}<p role="alert">{{ n }}</p>{% endif %}
+{% if can_order %}
+<h2>Order</h2>
+<form method="post" action="/orders">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="listing_id" value="{{ listing.public_id }}">
+<input type="hidden" name="idem" value="{{ idem }}">
+<label>Quantity <input name="quantity" type="number" value="1" min="1"></label>
+<button type="submit">Place order</button></form>
+{% endif %}
+{% if viewer_logged_in %}
+<h2>Report this listing</h2>
+<form method="post" action="/reports">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="target_kind" value="listing">
+<input type="hidden" name="target_id" value="{{ listing.public_id }}">
+<label>Category: <select name="category"><option value="illegal-goods">illegal goods</option><option value="fraud">fraud</option><option value="abuse">abuse</option><option value="other">other</option></select></label>
+<label>Reason: <input type="text" name="reason" maxlength="2000" required></label>
+<button type="submit">Report listing</button></form>
+{% endif %}
+

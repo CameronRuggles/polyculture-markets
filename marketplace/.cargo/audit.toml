@@ -1,0 +1,19 @@
+# cargo-audit configuration for the marketplace workspace.
+#
+# cargo-audit scans the raw Cargo.lock, which includes optional
+# dependencies that are never compiled. RUSTSEC-2023-0071 (rsa 0.9.10,
+# "Marvin Attack" timing side-channel, severity 5.9 medium, no fixed
+# release available) matches only because sqlx's Cargo.lock entry lists
+# its optional MySQL backend (sqlx-mysql -> rsa). This project builds
+# sqlx with the postgres backend only:
+#   * `cargo tree` contains no rsa and no sqlx-mysql;
+#   * no rsa artefact exists under target/;
+#   * cargo-deny's feature-resolved advisory check does not detect it.
+# The Marvin attack additionally requires RSA private-key decryption
+# operations; this codebase performs none. Accepted 2026-10-17 as part
+# of the deterministic-tools pass — see
+# DETERMINISTIC-TOOLS-REPORT-2026-10-17.md in the parent directory.
+# If the sqlx MySQL backend is ever enabled, this ignore must be
+# removed and the exposure re-assessed.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

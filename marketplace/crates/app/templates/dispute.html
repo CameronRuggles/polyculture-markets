@@ -1,0 +1,63 @@
+<h1>Dispute for order {{ order_public_id }}</h1>
+{% if let Some(m) = message %}<p role="alert">{{ m }}</p>{% endif %}
+<p>Listing: {{ listing_title }} · Total: {{ total_xmr }} XMR</p>
+<p>Buyer: {{ buyer_username }} · Seller: {{ seller_username }}</p>
+<p>State: <strong>{{ dispute_state }}</strong>{% if let Some(o) = outcome %} · Outcome: {{ o }}{% endif %}</p>
+<h2>What moderators can see</h2>
+<p>Moderators see the public order record below and anything a party voluntarily discloses. They cannot browse your conversation — messages are end-to-end encrypted and the server holds only ciphertext.</p>
+<ul>
+<li>Payment evidence on the order: {{ evidence_label }}</li>
+<li>Terms SHA-256: <code>{{ terms_hash }}</code></li>
+{% if let Some(a) = assigned_address %}<li>Assigned payment address (paid directly by the buyer): <code>{{ a }}</code></li>{% endif %}
+{% if let Some(m) = signed_message %}<li>Seller's wallet-signed message for this address: <code>{{ m }}</code></li>{% endif %}
+</ul>
+<h2>Disclosed messages</h2>
+{% if disclosures.is_empty() %}<p>Nothing has been disclosed yet.</p>{% endif %}
+{% for d in disclosures %}
+<article>
+<p>{{ d.submitter_username }} · {{ d.created_at }} ·
+{% if d.signature_status == "verified" %}<strong>Evidence — signature verified against the other party's pinned key</strong>{% else %}<strong>Unverified claim</strong> — the signature did not verify against the other party's pinned key{% endif %}</p>
+<pre>{{ d.message }}</pre>
+</article>
+{% endfor %}
+{% if can_disclose %}
+<h2>Disclose a message</h2>
+<p>Disclosing is voluntary and one-way. Before you submit, be sure you understand exactly what happens:</p>
+<ul>
+<li>Moderators will see the <strong>plaintext</strong> you paste below, together with the detached signature.</li>
+<li>The marketplace checks the signature against the <strong>other party's</strong> pinned key. If it verifies, the message is labelled evidence; anything else is labelled an unverified claim.</li>
+<li>Disclosed content is stored (encrypted at rest) until <strong>{{ retention_days }} days after this dispute is resolved</strong>, then deleted.</li>
+<li>Only disclose messages from this order's conversation. Decrypt locally and paste; the server never receives your conversation ciphertext for moderation.</li>
+</ul>
+<form method="post" action="/disputes/{{ dispute_id }}/disclosures">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Message plaintext<br><textarea name="message" rows="6" cols="70" required></textarea></label>
+<label>Detached signature (armored)<br><textarea name="signature" rows="6" cols="70" required></textarea></label>
+<button type="submit">Disclose to moderators</button></form>
+{% endif %}
+{% if awaiting_buyer %}
+<h2>Refund proposed</h2>
+<p>A moderator recorded a <strong>refund-confirmed</strong> outcome. It takes effect only when the buyer confirms the refund was received.</p>
+{% if is_buyer %}
+<form method="post" action="/disputes/{{ dispute_id }}/confirm-refund">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">I confirm the refund was received — resolve this dispute</button></form>
+{% endif %}
+{% endif %}
+{% if show_resolve %}
+<h2>Record an outcome (moderator)</h2>
+{% if !totp_enrolled %}<p role="alert">You have not enrolled in TOTP. Moderator actions are refused until you enroll on your <a href="/account/security">security page</a>.</p>{% endif %}
+<form method="post" action="/disputes/{{ dispute_id }}/resolve">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Outcome <select name="outcome">
+<option value="delivered-confirmed">delivered-confirmed</option>
+<option value="refund-confirmed">refund-confirmed (buyer must confirm)</option>
+<option value="seller-at-fault">seller-at-fault</option>
+<option value="buyer-at-fault">buyer-at-fault</option>
+<option value="unresolved">unresolved</option>
+</select></label>
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Record outcome</button></form>
+<p>Resolving records a public outcome that feeds the seller's reputation facts. Moderators cannot move funds — payment was direct between buyer and seller.</p>
+{% endif %}
+

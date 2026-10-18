@@ -1,0 +1,9 @@
+<h1>Inbox</h1>
+<form method="post" action="/inbox/read-all">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Mark all read</button></form>
+{% for n in items %}
+<p>{% if !n.4 %}<strong>[new]</strong> {% endif %}{{ n.1 }} · {{ n.2 }} · {{ n.3 }}</p>
+{% endfor %}
+{% if items.is_empty() %}<p>Nothing here.</p>{% endif %}
+

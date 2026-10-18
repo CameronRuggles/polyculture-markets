@@ -1,0 +1,11 @@
+[package]
+name = "domain"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+modules-api = { path = "../modules-api" }
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }

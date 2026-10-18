@@ -1,0 +1,13 @@
+[package]
+name = "stage0_spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+hex = "0.4.3"
+monero = "0.22.0"
+sequoia-openpgp = { version = "2.4.1", default-features = false, features = ["crypto-rust", "compression", "allow-experimental-crypto", "allow-variable-time-crypto"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+ureq = { version = "3.4.2", features = ["json"] }

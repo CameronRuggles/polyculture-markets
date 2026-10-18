@@ -1,0 +1,7 @@
+statement-format: marketplace-invoice-v1
+marketplace-id: mkt_4f9c2a7e1b3d5f60718293a4b5c6d7e8
+invoice-id: inv_8d1e5b0c3a7f2b4d6f8091a3b5c7d9e0
+order-id: ord_2b6a9e4d1c083fa579ecb12d4f607182
+seller-key-fingerprint: 0123456789ABCDEF0123456789ABCDEF01234567
+network: monero-stagenet
+destination: 6BnERTpvL5MbCLtj5n9No7J5oE5hHiB3tVCK5cjSvCsYWD2WR6atrme-s2os55QJqt2ZwUazy2Vh1Ad51K7FNgqcHgjatf0123456789abcdef0123453456789abcdef

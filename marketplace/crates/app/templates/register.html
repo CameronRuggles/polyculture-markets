@@ -1,0 +1,9 @@
+<h1>Create account</h1>
+{% if let Some(e) = error %}<p role="alert">{{ e }}</p>{% endif %}
+<form method="post" action="/register">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Username <input name="username" required maxlength="24"></label>
+<label>Passphrase <input type="password" name="password" required></label>
+<button type="submit">Register</button></form>
+<p>Save the recovery code shown after registering. There is no email reset.</p>
+

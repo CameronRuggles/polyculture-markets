@@ -1,0 +1,4 @@
+# Locked paths (spec s22): changes require the owner review, never an implementer acting alone.
+/tests/security/ @owner
+/docs/invariants.md @owner
+/docs/threat-model.md @owner

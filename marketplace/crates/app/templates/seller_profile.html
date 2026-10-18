@@ -1,0 +1,83 @@
+<h1>{{ username }}</h1>
+<p>Role: {{ role }}</p>
+{% if account_closed %}<p role="alert"><strong>Account closed</strong>{% if let Some(d) = closed_date %} on {{ d }}{% endif %}. This identity has ended: it cannot log in or trade. Its history remains visible because counterparties' records depend on it. Closing an account does not stop anyone from registering a new account — no marketplace can prove otherwise.</p>{% endif %}
+{% if let Some(d) = recovered_date %}<p role="alert">This account was recovered on {{ d }}.</p>{% endif %}
+{% if let Some(d) = uncertified_rotation_date %}
+<p role="alert">Identity continuity could not be verified. This account rotated to a new key without the old key's signature on {{ d }}. Independently verify this new key before sending sensitive information or payment.</p>
+{% endif %}
+<h2>Identity key</h2>
+{% if let Some(f) = current_fingerprint %}
+<p>Fingerprint: <code>{{ f }}</code> · <a href="/sellers/{{ public_id }}/key.asc">Download key</a></p>
+<p>Verify this fingerprint against a copy you trust. The fingerprint on this page is a convenience; only a key you pinned locally protects you from a malicious operator.</p>
+{% else %}<p>No key registered.</p>{% endif %}
+{% if let Some(d) = payment_changed %}
+<p role="alert">Payment identity changed: this seller changed their primary payment address on {{ d }}. Independently confirm the new address with the seller before paying.</p>
+{% endif %}
+{% if let Some(p) = payment_primary %}
+<h2>Payment address</h2>
+<p>Primary Monero address: <code>{{ p }}</code></p>
+<p>Verify this address against a copy you trust (an earlier order or the seller's other channels) before paying.</p>
+{% endif %}
+{% if !profile_text.is_empty() %}<h2>About</h2><p>{{ profile_text }}</p>{% endif %}
+<h2>Reputation</h2>
+{% if !rep_model.is_empty() %}
+{% if rep_model == "raw-counts" %}
+<p>This marketplace shows raw trade facts only (no computed score).</p>
+{% else if let Some(s) = rep_score %}
+<p><strong>{{ s }} / 5</strong> — weighted score ({{ rep_model }}) from {{ rep_review_count }} review(s), {{ rep_established }} from established buyers.</p>
+{% else %}
+<p><strong>Not enough history</strong> — {{ rep_review_count }} review(s) so far; a weighted score appears once reviews carry enough total weight.</p>
+{% endif %}
+{% endif %}
+<h3>Trade facts</h3>
+<ul>
+<li>Member since {{ raw.member_since }} ({{ raw.age_days }} days)</li>
+<li>First completed sale: {{ raw.first_sale }}</li>
+<li>Completed orders: {{ raw.completed }}</li>
+<li>Distinct buyers: {{ raw.buyers }}</li>
+<li>Orders with seller-confirmed payment: {{ raw.confirmed }}</li>
+<li>Orders with payment verified on-chain: {{ raw.verified }} — this marketplace does not verify payments on-chain; sellers confirm payment themselves.</li>
+<li>Disputes opened: {{ raw.disputes_opened }} · resolved against this seller: {{ raw.disputes_against }}</li>
+<li>Key rotations: {{ raw.rot_certified }} certified, {{ raw.rot_uncertified }} uncertified</li>
+</ul>
+<p>Reputation here is built from minimized order facts only. It cannot prove a seller is honest: a determined seller can farm reputation with sock-puppet accounts, and no weighting scheme prevents that. Treat reputation as one public signal among several — check the key history, the trade facts, and your own verification.</p>
+<h2>Reviews</h2>
+{% if reviews.is_empty() %}<p>No reviews yet.</p>{% endif %}
+{% for r in reviews %}
+<article>
+<p><strong>{{ r.score }} / 5</strong> — {{ r.created_at }} · order <code>{{ r.order_public_id }}</code>{% if r.payment_verified_badge %} · <em>payment verified on-chain</em>{% endif %}</p>
+<p>{{ r.text }}</p>
+{% if let Some(reply) = r.seller_reply %}<p><em>Seller reply:</em> {{ reply }}</p>{% endif %}
+{% if viewer_logged_in %}
+<form method="post" action="/reports">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="target_kind" value="review">
+<input type="hidden" name="target_id" value="{{ r.order_public_id }}">
+<label>Report this review: <select name="category"><option value="abuse">abuse</option><option value="fraud">fraud</option><option value="illegal-goods">illegal goods</option><option value="other">other</option></select></label>
+<input type="text" name="reason" maxlength="2000" required>
+<button type="submit">Report review</button></form>
+{% endif %}
+</article>
+{% endfor %}
+<h2>Key history</h2>
+{% for k in history %}
+<p>v{{ k.1 }} · <code>{{ k.0 }}</code> · {{ k.2 }} · since {{ k.3 }}{% if let Some(r) = k.4 %} · retired {{ r }}{% endif %}</p>
+{% endfor %}
+<form method="post" action="/conversations/direct/{{ public_id }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Message {{ username }}</button></form>
+<h2>Listings</h2>
+{% for l in listings %}
+<p><a href="/listings/{{ l.public_id }}">{{ l.title }}</a> — {{ l.price_xmr }} XMR</p>
+{% endfor %}
+{% if viewer_logged_in %}
+<h2>Report this profile</h2>
+<form method="post" action="/reports">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="target_kind" value="profile">
+<input type="hidden" name="target_id" value="{{ public_id }}">
+<label>Category: <select name="category"><option value="fraud">fraud</option><option value="abuse">abuse</option><option value="illegal-goods">illegal goods</option><option value="other">other</option></select></label>
+<label>Reason: <input type="text" name="reason" maxlength="2000" required></label>
+<button type="submit">Report profile</button></form>
+{% endif %}
+

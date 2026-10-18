@@ -1,0 +1,77 @@
+# cargo-fuzz targets for the marketplace parsers — spec v2 §22.5:
+# "The envelope parser, statement parsers, terms file, listing markup,
+# and image worker each get a cargo-fuzz target, run for a bounded time
+# in CI."
+#
+# Created 2026-10-17 (deterministic-tools pass). This crate is NOT a
+# member of the marketplace workspace: it has its own workspace root
+# below so the main workspace's Cargo.lock and build are untouched.
+# Build/run with a nightly toolchain:
+#   cargo +nightly fuzz run envelope_validate -- -max_total_time=300
+# (cargo-fuzz builds with sanitizers; the marketplace crates it links
+# are the real workspace crates, by path.)
+
+[package]
+name = "marketplace-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+envelope = { path = "../crates/envelope" }
+domain = { path = "../crates/domain" }
+modules-api = { path = "../crates/modules-api" }
+app = { path = "../crates/app" }
+# Same pin and feature set the media worker itself uses.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[[bin]]
+name = "envelope_validate"
+path = "src/bin/envelope_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_keyref"
+path = "src/bin/envelope_keyref.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "statements"
+path = "src/bin/statements.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "markup"
+path = "src/bin/markup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terms_file"
+path = "src/bin/terms_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_worker"
+path = "src/bin/image_worker.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace.
+[workspace]
+members = ["."]

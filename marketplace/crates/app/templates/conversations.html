@@ -1,0 +1,8 @@
+<h1>Conversations</h1>
+{% for c in conversations %}
+<p><a href="/conversations/{{ c.id }}">{{ c.other_name }}</a>
+{% if let Some(o) = c.order_public_id %} · order {{ o }}{% else %} · direct{% endif %}
+{% if c.unread > 0 %} · <strong>{{ c.unread }} new</strong>{% endif %} · since {{ c.last_at }}</p>
+{% endfor %}
+{% if conversations.is_empty() %}<p>No conversations yet. Open one from an order page or a seller's profile.</p>{% endif %}
+

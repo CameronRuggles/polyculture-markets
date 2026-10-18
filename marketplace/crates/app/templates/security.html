@@ -1,0 +1,64 @@
+<h1>Account security</h1>
+{% if let Some(m) = message %}<p role="status">{{ m }}</p>{% endif %}
+{% for w in warnings %}<p role="alert">{{ w }}</p>{% endfor %}
+<h2>Identity key</h2>
+{% if let Some(f) = current_fingerprint %}
+<p>Current fingerprint: <code>{{ f }}</code></p>
+<h3>Rotate key</h3>
+<form method="post" action="/account/keys/rotate">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>New certificate (armored)<br><textarea name="new_cert" rows="8" cols="70"></textarea></label>
+<label>Rotation statement (marketplace-key-rotation-v1)<br><textarea name="statement" rows="7" cols="70"></textarea></label>
+<label>Signature by old key (.asc)<br><textarea name="sig_old" rows="5" cols="70"></textarea></label>
+<label>Signature by new key (.asc)<br><textarea name="sig_new" rows="5" cols="70"></textarea></label>
+<label><input type="checkbox" name="lost" value="true"> I lost my old key (uncertified rotation — a warning will show on your profile for 90 days)</label>
+<button type="submit">Rotate</button></form>
+{% else %}
+<p>No identity key yet. Sellers must register one; buyers need one to send messages.</p>
+<form method="post" action="/account/keys">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>OpenPGP certificate (armored)<br><textarea name="cert" rows="10" cols="70" required></textarea></label>
+<button type="submit">Register key</button></form>
+{% endif %}
+<h2>Sessions</h2>
+{% for s in sessions %}
+<p>Session {{ s.0 }} · created {{ s.1 }} · last seen {{ s.2 }}{% if s.3 %} · revoked{% else %}
+<form method="post" action="/account/sessions/{{ s.0 }}/revoke">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Revoke</button></form>{% endif %}</p>
+{% endfor %}
+<h2>Two-factor authentication (TOTP)</h2>
+<p>Moderator accounts must enroll: every moderator action (resolving a dispute, warning or closing an account, removing a listing) requires a current code. Any account may enroll.</p>
+{% if totp_enabled %}
+<p><strong>TOTP is on</strong> for this account.</p>
+<form method="post" action="/account/totp/disable">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Current code <input name="code" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Turn off TOTP</button></form>
+{% else if let Some(secret) = totp_pending_secret %}
+<p>Add this secret to your authenticator app, then confirm with a code:</p>
+<p>Secret: <code>{{ secret }}</code></p>
+{% if let Some(uri) = totp_pending_uri %}<p>URI: <code>{{ uri }}</code></p>{% endif %}
+<form method="post" action="/account/totp/confirm">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Code <input name="code" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Activate TOTP</button></form>
+{% else %}
+<form method="post" action="/account/totp/begin">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Start TOTP enrollment</button></form>
+{% endif %}
+<h2>Close this account</h2>
+<p>Closing ends this identity: you will not be able to log in again, your listings will be unpublished, unused payment addresses retired, and your reputation will stop growing. Your order and review history stays visible to people you traded with — their records depend on it. Closure cannot be undone from here. It also does not erase anything, and nothing prevents a new account being registered later.</p>
+<form method="post" action="/account/close">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Passphrase <input type="password" name="password" autocomplete="current-password" required></label>
+<label>Type CLOSE to confirm <input type="text" name="confirm" required></label>
+<button type="submit">Close my account</button></form>
+<h2>Profile text</h2>
+<p>Plain text only. List other places your fingerprint is published; links are shown as text, never as anchors.</p>
+<form method="post" action="/account/profile">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label><textarea name="profile_text" rows="4" cols="70" maxlength="1000">{{ profile_text }}</textarea></label>
+<button type="submit">Save</button></form>
+

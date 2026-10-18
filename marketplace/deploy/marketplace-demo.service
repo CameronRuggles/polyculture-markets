@@ -1,0 +1,31 @@
+[Unit]
+Description=Polyculture Markets — demo instance (stagenet)
+Documentation=file:/opt/marketplace/DEPLOY-DEMO-RUNBOOK.md
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=marketplace
+Group=marketplace
+WorkingDirectory=/var/lib/marketplace
+EnvironmentFile=/etc/marketplace/marketplace.env
+ExecStart=/usr/local/bin/marketplace-app
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the app needs its state dir, /tmp, and loopback only.
+# It never binds a public interface itself (BIND_ADDR is loopback;
+# reach it via SSH tunnel or a TLS reverse proxy — see the runbook).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/marketplace
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

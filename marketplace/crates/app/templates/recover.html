@@ -1,0 +1,10 @@
+<h1>Recover account</h1>
+{% if let Some(e) = error %}<p role="alert">{{ e }}</p>{% endif %}
+<form method="post" action="/account/recover">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Username <input name="username" required></label>
+<label>Recovery code <input name="code" required></label>
+<label>New passphrase <input type="password" name="password" required></label>
+<button type="submit">Set new passphrase</button></form>
+<p>Recovery signs out every session and marks the profile as recovered for 30 days.</p>
+
