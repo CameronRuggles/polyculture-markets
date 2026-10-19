@@ -84,9 +84,23 @@ no registered-vs-unknown recipient distinction; `RecipientKeyRetired` returned
 only for keys the sender was already shown in this conversation; ciphertext
 downloads restricted to participants; rejected plaintext never echoed or logged.
 
-**T6 — Malicious uploads.** Images decoded/re-encoded in an isolated media
-worker (no network, read-only FS, seccomp, resource limits), metadata stripped,
-JPEG/PNG only. Attachments are opaque, download-only, never rendered inline.
+**T6 — Malicious uploads.** Images are decoded/re-encoded by a separate
+media-worker process and metadata is stripped; JPEG/PNG only. Attachments are
+opaque, download-only, never rendered inline. Worker containment, stated
+exactly as built (corrected 2026-10-19 — an earlier version of this section
+claimed isolation the code did not have): IN CODE, the worker child is
+killed when its timeout expires (`kill_on_drop`; a runaway decoder cannot
+outlive the request), and at most two workers run concurrently
+process-wide, so decoder resource use is bounded in count as well as
+time. WHERE THE DEPLOYMENT PROVIDES bubblewrap, the worker additionally
+runs sandboxed (`MEDIA_WORKER_SANDBOX=bwrap`): no network namespace, a
+read-only root containing only the worker binary, the single input file,
+and a scratch directory — off by default because bubblewrap is a
+deployment dependency, not something this code can assume. Per-worker
+MEMORY caps are a deployment measure (systemd `MemoryMax=` on the app
+unit), not something the application enforces on its child. There is no
+seccomp profile; the worker is a separate minimal binary that only
+reads one file and writes one file, and the claim ends there.
 
 **T7 — DoS.** Per-account throttles (built: a per-account request throttle on
 signed-in POSTs, plus messaging-layer limits — 60 messages/minute per account,

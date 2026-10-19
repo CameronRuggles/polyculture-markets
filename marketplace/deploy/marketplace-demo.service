@@ -26,6 +26,12 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
+# Media worker containment (CM2): the in-code layers are kill-on-drop
+# on timeout and at most 2 concurrent workers. A memory ceiling is a
+# deployment measure — this caps the whole unit (app + workers).
+# For the bubblewrap sandbox around the worker itself, install
+# bubblewrap and set MEDIA_WORKER_SANDBOX=bwrap in the env file.
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target
