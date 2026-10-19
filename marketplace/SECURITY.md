@@ -5,11 +5,20 @@ metadata. It never holds customer funds.
 
 ## Reporting
 
-Report vulnerabilities privately to the instance operator or the project
-maintainer through the contact on the instance's Security page. Do not open
-public issues for vulnerabilities that affect fund safety, destination
-integrity, message confidentiality, or account security until a fix has been
-released.
+Report vulnerabilities in this software privately through GitHub's
+private vulnerability reporting for the project repository:
+
+- **https://github.com/CameronRuggles/polyculture-markets/security/advisories/new**
+
+That form goes to the project maintainer only. (Private vulnerability
+reporting was enabled on the repository on 2026-10-18.) Vulnerabilities
+in one operator's *deployment* — their host, their configuration, their
+key custody — belong to that instance's operator; the instance's own
+Security page carries their contact.
+
+Do not open a public issue for a vulnerability that affects fund safety,
+destination integrity, message confidentiality, or account security until
+a fix has been released.
 
 ## Scope notes
 

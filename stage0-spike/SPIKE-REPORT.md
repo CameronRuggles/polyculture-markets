@@ -1,5 +1,10 @@
 # Stage 0 Feasibility Spike — Report
 
+> **ARCHIVED 2026-10-18** — this spike is preserved history, not a
+> component. See `ARCHIVED.md` in this directory before building or
+> citing anything here (its pinned lockfile is deliberately frozen,
+> including a rustls version with known advisories).
+
 Date: 2026-10-13 · Scope: the four make-or-break assumptions named before the
 build estimate, plus the §22 blind-test workflow. This is a spike, not
 Stage 0 proper: the threat-model doc, `modules-api` traits, and initial
