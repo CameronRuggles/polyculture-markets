@@ -1,0 +1,10 @@
+# Locked paths (spec §22): changes require the owner's review, never
+# an implementer acting alone. Patterns are relative to the repo root
+# (the app tree lives under marketplace/). This file replaces
+# marketplace/CODEOWNERS, which GitHub ignored — CODEOWNERS is only
+# read from the repo root, docs/, or .github/, and the old file also
+# named a placeholder handle (@owner) that is not a real account.
+
+/marketplace/tests/security/ @CameronRuggles
+/marketplace/docs/invariants.md @CameronRuggles
+/marketplace/docs/threat-model.md @CameronRuggles
