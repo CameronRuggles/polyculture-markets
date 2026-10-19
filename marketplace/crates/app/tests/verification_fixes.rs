@@ -715,3 +715,96 @@ async fn stepup_failures_counted_session_revoked_generic_error() {
     cleanup(&pool, &[id]).await;
     srv.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Task 4 (V5): the TOTP gate's counter and replay claim are atomic.
+// ---------------------------------------------------------------------------
+
+fn library_keyfile() -> (KeyFile, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("verifix-kf-{}-{}", std::process::id(), uniq()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let kf = KeyFile::load_or_generate(&dir.join("keyfile")).unwrap();
+    (kf, dir)
+}
+
+#[tokio::test]
+async fn totp_gate_counters_and_replay_are_atomic() {
+    let Some(pool) = pool().await else { return };
+    let (kf, kf_dir) = library_keyfile();
+
+    // -- 60 concurrent wrong codes trip the lock (exactly once). --
+    let (id, _u) = make_account(&pool, "buyer", PW).await;
+    let secret = enroll(&pool, &kf, id).await;
+    let wrong = wrong_code(&secret);
+    let barrier = Arc::new(tokio::sync::Barrier::new(60));
+    let mut burst = Vec::new();
+    for _ in 0..60 {
+        let (p, k, b, w) = (pool.clone(), kf.clone(), barrier.clone(), wrong.clone());
+        burst.push(tokio::spawn(async move {
+            b.wait().await;
+            moderation::verify_totp_gate(&p, &k, id, &w).await
+        }));
+    }
+    let mut invalid = 0;
+    for h in burst {
+        match h.await.unwrap() {
+            Err(ModError::TotpInvalid) => invalid += 1,
+            Err(ModError::TotpLocked) => {}
+            other => panic!("a wrong code in a burst must be Invalid or Locked, got {other:?}"),
+        }
+    }
+    assert!(invalid >= 1, "at least the counting failures report Invalid");
+    // The lock is on: even the CORRECT code is now refused as locked.
+    let err = moderation::verify_totp_gate(&pool, &kf, id, &code(&secret, 0))
+        .await
+        .expect_err("a correct code is refused while locked");
+    assert!(matches!(err, ModError::TotpLocked), "got {err:?}");
+    // Exactly one lockout notice for the whole burst episode.
+    let notices: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE account_id = $1 AND event_type = 'totp_locked'",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(notices, 1, "one notice per lockout episode, however the burst interleaved");
+    let count: i32 = sqlx::query_scalar("SELECT totp_fail_count FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "the counter reset when the lock tripped, burst tail included");
+
+    // -- Two concurrent presentations of the SAME valid code:
+    //    exactly one succeeds; the other is a replay. --
+    let (id2, _u2) = make_account(&pool, "buyer", PW).await;
+    let secret2 = enroll(&pool, &kf, id2).await;
+    let good = code(&secret2, 0);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut pair = Vec::new();
+    for _ in 0..2 {
+        let (p, k, b, g) = (pool.clone(), kf.clone(), barrier.clone(), good.clone());
+        pair.push(tokio::spawn(async move {
+            b.wait().await;
+            moderation::verify_totp_gate(&p, &k, id2, &g).await
+        }));
+    }
+    let mut oks = 0;
+    let mut replays = 0;
+    for h in pair {
+        match h.await.unwrap() {
+            Ok(()) => oks += 1,
+            Err(ModError::TotpReplayed) => replays += 1,
+            other => panic!("the same-code race resolves as Ok or Replayed, got {other:?}"),
+        }
+    }
+    assert_eq!((oks, replays), (1, 1), "exactly one of the two racers may consume the step");
+    // And a sequential third presentation is a replay too.
+    let err = moderation::verify_totp_gate(&pool, &kf, id2, &good)
+        .await
+        .expect_err("the consumed code stays consumed");
+    assert!(matches!(err, ModError::TotpReplayed), "got {err:?}");
+
+    cleanup(&pool, &[id, id2]).await;
+    let _ = std::fs::remove_dir_all(&kf_dir);
+}

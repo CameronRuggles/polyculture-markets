@@ -87,28 +87,33 @@ pub const TOTP_LOCK_MINUTES: i64 = 15;
 /// code observed once is useless to an attacker either way, and the
 /// legitimate holder racing their own code must not lock themselves
 /// out).
+///
+/// Verification-fix V5 (2026-10-19): the counter and the replay
+/// claim are ATOMIC. The first version read the count/step, decided
+/// in Rust, and wrote back — concurrent requests all read the same
+/// state, so a parallel burst of wrong codes counted as one failure
+/// and the same valid code presented twice at the same instant
+/// passed twice. Now the failure increment is a single
+/// `SET count = count + 1 ... RETURNING` guarded against a live
+/// lock, the lock trip is a conditional claim (exactly one caller
+/// owns the episode and its notice), and a step is accepted only
+/// through a conditional UPDATE that zero rows turn into a replay.
 pub async fn verify_totp_gate(
     pool: &PgPool,
     kf: &KeyFile,
     account_id: i64,
     presented_code: &str,
 ) -> Result<(), ModError> {
-    let row: Option<(
-        Option<Vec<u8>>,
-        Option<OffsetDateTime>,
-        Option<i64>,
-        i32,
-        Option<OffsetDateTime>,
-    )> = sqlx::query_as(
-        "SELECT totp_secret_enc, totp_enabled_at, totp_last_step, totp_fail_count,
-                totp_locked_until
-           FROM accounts WHERE id = $1",
-    )
-    .bind(account_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| ModError::Db)?;
-    let Some((secret_enc, enabled_at, last_step, fail_count, locked_until)) = row else {
+    let row: Option<(Option<Vec<u8>>, Option<OffsetDateTime>, Option<OffsetDateTime>)> =
+        sqlx::query_as(
+            "SELECT totp_secret_enc, totp_enabled_at, totp_locked_until
+               FROM accounts WHERE id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ModError::Db)?;
+    let Some((secret_enc, enabled_at, locked_until)) = row else {
         return Err(ModError::NotFound);
     };
     let (Some(enc), Some(_)) = (secret_enc, enabled_at) else {
@@ -135,47 +140,58 @@ pub async fn verify_totp_gate(
     let now_secs = now.unix_timestamp().max(0) as u64;
     match crate::totp::verify_step(&secret, presented_code, now_secs) {
         Some(step) => {
-            if let Some(last) = last_step {
-                if (step as i64) <= last {
-                    return Err(ModError::TotpReplayed);
-                }
-            }
-            sqlx::query(
+            // Claim the step atomically: the UPDATE lands only when
+            // no step >= this one has been accepted. Zero rows means
+            // a concurrent (or earlier) request already consumed it.
+            let claim = sqlx::query(
                 "UPDATE accounts SET totp_last_step = $2, totp_fail_count = 0,
                         totp_locked_until = NULL, totp_lock_notified_at = NULL
-                  WHERE id = $1",
+                  WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)",
             )
             .bind(account_id)
             .bind(step as i64)
             .execute(pool)
             .await
             .map_err(|_| ModError::Db)?;
-            Ok(())
+            if claim.rows_affected() == 1 {
+                Ok(())
+            } else {
+                Err(ModError::TotpReplayed)
+            }
         }
         None => {
-            let new_count = fail_count + 1;
+            // Increment atomically; the WHERE keeps a burst that
+            // trips the lock mid-flight from piling more counts onto
+            // the fresh episode (those attempts see the lock).
+            let new_count: Option<i32> = sqlx::query_scalar(
+                "UPDATE accounts SET totp_fail_count = totp_fail_count + 1
+                  WHERE id = $1 AND (totp_locked_until IS NULL OR totp_locked_until <= now())
+                  RETURNING totp_fail_count",
+            )
+            .bind(account_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| ModError::Db)?;
+            let Some(new_count) = new_count else {
+                return Err(ModError::TotpLocked);
+            };
             if new_count >= TOTP_FAILURE_LOCK_THRESHOLD {
                 // Trip the lock; reset the counter so the NEXT
                 // episode needs a fresh run of failures after the
-                // cool-down. Notify once per episode.
-                sqlx::query(
+                // cool-down. The conditional claim makes exactly one
+                // caller own the episode — and its ONE notice.
+                let trip = sqlx::query(
                     "UPDATE accounts SET totp_fail_count = 0,
-                            totp_locked_until = now() + make_interval(mins => $2)
-                      WHERE id = $1",
+                            totp_locked_until = now() + make_interval(mins => $2),
+                            totp_lock_notified_at = now()
+                      WHERE id = $1 AND (totp_locked_until IS NULL OR totp_locked_until <= now())",
                 )
                 .bind(account_id)
                 .bind(TOTP_LOCK_MINUTES as i32)
                 .execute(pool)
                 .await
                 .map_err(|_| ModError::Db)?;
-                let notified: Option<OffsetDateTime> =
-                    sqlx::query_scalar("SELECT totp_lock_notified_at FROM accounts WHERE id = $1")
-                        .bind(account_id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|_| ModError::Db)?
-                        .flatten();
-                if notified.is_none() {
+                if trip.rows_affected() == 1 {
                     let _ = crate::orders::notify(
                         pool,
                         account_id,
@@ -183,20 +199,7 @@ pub async fn verify_totp_gate(
                         "code checking locked for 15 minutes after 10 failed codes",
                     )
                     .await;
-                    let _ = sqlx::query(
-                        "UPDATE accounts SET totp_lock_notified_at = now() WHERE id = $1",
-                    )
-                    .bind(account_id)
-                    .execute(pool)
-                    .await;
                 }
-            } else {
-                sqlx::query("UPDATE accounts SET totp_fail_count = $2 WHERE id = $1")
-                    .bind(account_id)
-                    .bind(new_count)
-                    .execute(pool)
-                    .await
-                    .map_err(|_| ModError::Db)?;
             }
             Err(ModError::TotpInvalid)
         }
