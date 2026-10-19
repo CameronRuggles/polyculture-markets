@@ -32,6 +32,7 @@
 <article>
 <p>{{ d.submitter_username }} · {{ d.created_at }} ·
 {% if d.signature_status == "verified" %}<strong>Evidence — signature verified against the other party's pinned key</strong>{% else %}<strong>Unverified claim</strong> — the signature did not verify against the other party's pinned key{% endif %}</p>
+{% if let Some(recv) = d.message_received_at %}{% if let Some(sig) = d.signature_created_at %}<p>Message received {{ recv }} · signature created {{ sig }}</p>{% endif %}{% endif %}
 <pre>{{ d.message }}</pre>
 </article>
 {% endfor %}
@@ -41,12 +42,15 @@
 <p>Disclosing is voluntary and one-way. Before you submit, be sure you understand exactly what happens:</p>
 <ul>
 <li>Decrypt the message on your own device and paste <strong>the whole output of <code>gpg --unwrap --armor</code></strong> below — one paste. The marketplace reads the plaintext out of it and checks the embedded signature against the <strong>other party's</strong> pinned key. If it verifies, the message is labelled evidence; an unwrapped message without their signature is labelled an unverified claim.</li>
+<li>Pick WHICH message you are disclosing. A disclosure only counts as evidence when its signature was made within a day before that message arrived in this order's conversation, and the page shows both times.</li>
 <li>Moderators will see the plaintext the marketplace extracts.</li>
 <li>Disclosed content is stored (encrypted at rest) until <strong>{{ retention_days }} days after this dispute is resolved</strong>, then deleted.</li>
 <li>Only disclose messages from this order's conversation. The server never receives your conversation ciphertext for moderation — only what you paste here.</li>
 </ul>
 <form method="post" action="/disputes/{{ dispute_id }}/disclosures">
 <input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Message being disclosed
+<select name="message_id" required>{% for m in disclosable_messages %}<option value="{{ m.0 }}">Message #{{ m.0 }} — received {{ m.1 }}</option>{% endfor %}</select></label>
 <label>Output of <code>gpg --unwrap --armor the-message.asc</code><br><textarea name="unwrapped" rows="10" cols="70" required></textarea></label>
 <button type="submit">Disclose to moderators</button></form>
 {% endif %}

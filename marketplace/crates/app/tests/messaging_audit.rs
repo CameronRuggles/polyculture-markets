@@ -754,6 +754,38 @@ async fn disputed_order(pool: &PgPool, seller: i64, buyer: i64, listing: &str) -
 // Task 3 (MM1): disclosure by unwrap paste.
 // ---------------------------------------------------------------------------
 
+/// Verification-fix V4: a disclosure names the conversation
+/// message it unwraps; plant one directly (blob file + row) with a
+/// chosen arrival time and return its id.
+async fn plant_disclosable_message(
+    pool: &PgPool,
+    conversation_id: i64,
+    sender: i64,
+    recipient: i64,
+    bytes: &[u8],
+    received_unix: i64,
+) -> i64 {
+    let dir = app::messages::blob_dir();
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let blob_ref = format!("test-{}", uniq());
+    tokio::fs::write(dir.join(format!("{blob_ref}.asc")), bytes).await.unwrap();
+    sqlx::query_scalar(
+        "INSERT INTO encrypted_messages
+            (conversation_id, sender_id, recipient_id, recipient_key_id, blob_ref, length, received_at, expires_at)
+         VALUES ($1, $2, $3, 'A5C23E96999A1AF9', $4, $5, to_timestamp($6), to_timestamp($6) + interval '90 days')
+         RETURNING id",
+    )
+    .bind(conversation_id)
+    .bind(sender)
+    .bind(recipient)
+    .bind(blob_ref)
+    .bind(bytes.len() as i32)
+    .bind(received_unix as f64)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
     let Some(pool) = pool().await else { return };
@@ -761,8 +793,28 @@ async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
     purge_fixture_addresses(&pool).await;
     let srv = test_server(&pool).await;
     let (seller, buyer, listing) = shop(&pool).await;
-    let (_oid, _opub, dispute_id) = disputed_order(&pool, seller, buyer, &listing).await;
+    let (oid, _opub, dispute_id) = disputed_order(&pool, seller, buyer, &listing).await;
     let token = session_for(&pool, buyer).await;
+
+    // V4: name the message being disclosed. Its arrival is planted
+    // one hour after the fixture signature was created, so the pair
+    // satisfies the 24h freshness rule deterministically.
+    let conv = app::messages::find_or_create_for_order(&pool, oid, buyer, seller)
+        .await
+        .unwrap();
+    let sig_unix = app::keys::extract_unwrapped_message(CERT_BOB.as_bytes(), UNWRAP_BOB_SIGNED.as_bytes())
+        .and_then(|u| u.signature_created_unix)
+        .expect("the signed fixture carries a signature creation time");
+    let signed_mid = plant_disclosable_message(
+        &pool,
+        conv,
+        seller,
+        buyer,
+        UNWRAP_BOB_SIGNED.as_bytes(),
+        sig_unix + 3600,
+    )
+    .await;
+    let signed_mid_s = signed_mid.to_string();
 
     // The unwrap output of bob's signed message, sent with CRLF the
     // way a browser submits it: verifies against bob's pinned key.
@@ -770,7 +822,7 @@ async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
         srv.addr,
         &format!("/disputes/{dispute_id}/disclosures"),
         Some(&cookie(&token)),
-        &[("csrf", CSRF), ("unwrapped", &crlf(UNWRAP_BOB_SIGNED))],
+        &[("csrf", CSRF), ("unwrapped", &crlf(UNWRAP_BOB_SIGNED)), ("message_id", &signed_mid_s)],
     )
     .await;
     assert!(is_redirect(&r), "unwrap disclosure: {} {}", r.status, r.body);
@@ -788,11 +840,21 @@ async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
     assert!(page.body.contains("Evidence — signature verified"), "verified label shown");
 
     // An unwrapped but UNSIGNED message: stored as an unverified claim.
+    let unsigned_mid = plant_disclosable_message(
+        &pool,
+        conv,
+        seller,
+        buyer,
+        UNWRAP_BOB_UNSIGNED.as_bytes(),
+        sig_unix + 3600,
+    )
+    .await;
+    let unsigned_mid_s = unsigned_mid.to_string();
     let r = post_form(
         srv.addr,
         &format!("/disputes/{dispute_id}/disclosures"),
         Some(&cookie(&token)),
-        &[("csrf", CSRF), ("unwrapped", UNWRAP_BOB_UNSIGNED)],
+        &[("csrf", CSRF), ("unwrapped", UNWRAP_BOB_UNSIGNED), ("message_id", &unsigned_mid_s)],
     )
     .await;
     assert!(is_redirect(&r), "unsigned unwrap: {} {}", r.status, r.body);
@@ -806,7 +868,7 @@ async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
         srv.addr,
         &format!("/disputes/{dispute_id}/disclosures"),
         Some(&cookie(&token)),
-        &[("csrf", CSRF), ("unwrapped", "this is not an unwrapped message")],
+        &[("csrf", CSRF), ("unwrapped", "this is not an unwrapped message"), ("message_id", &signed_mid_s)],
     )
     .await;
     assert!(is_redirect(&r), "garbage redirects with a message: {}", r.status);

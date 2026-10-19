@@ -440,12 +440,20 @@ pub async fn refresh_certificate(
 pub struct UnwrappedMessage {
     pub plaintext: String,
     pub verified: bool,
+    /// When the first good signature was created, from its own
+    /// creation-time subpacket, as a unix timestamp (verification-
+    /// fix V4: disclosures compare this against the named message's
+    /// arrival time — a signature far older than the message it
+    /// claims to unwrap cannot make the disclosure verified
+    /// evidence OF THAT MESSAGE). `None` with no good signature.
+    pub signature_created_unix: Option<i64>,
 }
 
 struct UnwrapHelper {
     cert: Cert,
     good: usize,
     bad: usize,
+    sig_created: Option<std::time::SystemTime>,
 }
 
 impl VerificationHelper for UnwrapHelper {
@@ -464,7 +472,24 @@ impl VerificationHelper for UnwrapHelper {
             if let MessageLayer::SignatureGroup { results } = layer {
                 for r in results {
                     match r {
-                        Ok(_) => self.good += 1,
+                        Ok(good) => {
+                            self.good += 1;
+                            if self.sig_created.is_none() {
+                                use sequoia_openpgp::packet::signature::subpacket::{
+                                    SubpacketTag, SubpacketValue,
+                                };
+                                if let Some(sp) = good
+                                    .sig
+                                    .hashed_area()
+                                    .subpacket(SubpacketTag::SignatureCreationTime)
+                                {
+                                    if let SubpacketValue::SignatureCreationTime(ts) = sp.value()
+                                    {
+                                        self.sig_created = Some((*ts).into());
+                                    }
+                                }
+                            }
+                        }
                         Err(_) => self.bad += 1,
                     }
                 }
@@ -485,7 +510,7 @@ pub fn extract_unwrapped_message(cert_bytes: &[u8], pasted: &[u8]) -> Option<Unw
     let policy = StandardPolicy::new();
     let mut verifier = VerifierBuilder::from_bytes(pasted)
         .ok()?
-        .with_policy(&policy, None, UnwrapHelper { cert, good: 0, bad: 0 })
+        .with_policy(&policy, None, UnwrapHelper { cert, good: 0, bad: 0, sig_created: None })
         .ok()?;
     let mut out = Vec::new();
     verifier.read_to_end(&mut out).ok()?;
@@ -493,6 +518,11 @@ pub fn extract_unwrapped_message(cert_bytes: &[u8], pasted: &[u8]) -> Option<Unw
     Some(UnwrappedMessage {
         plaintext: String::from_utf8_lossy(&out).into_owned(),
         verified: helper.good > 0 && helper.bad == 0,
+        signature_created_unix: helper.sig_created.map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        }),
     })
 }
 

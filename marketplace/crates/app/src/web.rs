@@ -3466,6 +3466,11 @@ struct DisputeTpl {
     signed_signature: Option<String>,
     signed_primary_address: Option<String>,
     disclosures: Vec<crate::disputes::DisclosureView>,
+    /// Verification-fix V4: the messages in this order's
+    /// conversation that the viewer could disclose (sent by the
+    /// OTHER party), as (message id, option label) — the disclosure
+    /// form names the message it unwraps.
+    disclosable_messages: Vec<(i64, String)>,
     /// Account Security Audit task 3 (AH1): for a moderator viewer
     /// without a live step-up grant, disclosures are not decrypted
     /// or rendered at all — the page shows the unlock form instead.
@@ -3561,6 +3566,26 @@ async fn dispute_page(
         Some(mid) => Some(db::username_of_id(&st.pool, mid).await),
         None => None,
     };
+    // V4: messages the viewer could disclose — the OTHER party's
+    // messages in this order's conversation. Only parties disclose,
+    // so moderators get an empty list (and no disclosure form).
+    let disclosable_messages: Vec<(i64, String)> = if is_participant {
+        let other = if o.buyer_id == sess.account_id { o.seller_id } else { o.buyer_id };
+        sqlx::query_as(
+            "SELECT m.id, to_char(m.received_at, 'YYYY-MM-DD HH24:MI UTC')
+               FROM encrypted_messages m
+               JOIN conversations c ON c.id = m.conversation_id
+              WHERE c.order_id = $1 AND m.sender_id = $2
+              ORDER BY m.received_at, m.id",
+        )
+        .bind(d.order_id)
+        .bind(other)
+        .fetch_all(&st.pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let tpl = DisputeTpl {
         csrf,
         dispute_id: d.id,
@@ -3580,6 +3605,7 @@ async fn dispute_page(
         signed_signature: assignment.as_ref().map(|a| a.signature.clone()),
         signed_primary_address: assignment.as_ref().map(|a| a.primary_address.clone()),
         disclosures,
+        disclosable_messages,
         disclosures_locked,
         is_participant,
         is_moderator,
@@ -3650,6 +3676,11 @@ struct DisclosureForm {
     /// plus a detached signature, but messages are signed inline, so
     /// no detached signature ever exists; see disputes.rs.
     unwrapped: String,
+    /// Verification-fix V4: the conversation message this paste
+    /// unwraps, chosen from the order's conversation (the other
+    /// party's messages). The disclosure is verified against THAT
+    /// message: its conversation, its sender, its arrival time.
+    message_id: Option<i64>,
 }
 
 async fn disclosure_submit(
@@ -3662,7 +3693,10 @@ async fn disclosure_submit(
         Ok(v) => v,
         Err(r) => return r,
     };
-    match crate::disputes::submit_disclosure_unwrapped(&st.pool, &st.keyfile, id, sess.account_id, &f.unwrapped).await {
+    let Some(message_id) = f.message_id else {
+        return Redirect::to(&format!("/disputes/{id}?msg=disclosure_rejected")).into_response();
+    };
+    match crate::disputes::submit_disclosure_unwrapped(&st.pool, &st.keyfile, id, sess.account_id, message_id, &f.unwrapped).await {
         Ok(status) => {
             let code = if status == "verified" { "signature verified" } else { "unverified claim" };
             Redirect::to(&format!("/disputes/{id}?msg={code}")).into_response()

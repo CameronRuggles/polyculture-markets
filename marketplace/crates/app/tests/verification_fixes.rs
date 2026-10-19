@@ -31,7 +31,12 @@ use app::config::InstanceConfig;
 use app::keyfile::KeyFile;
 use app::media::MediaPipeline;
 use app::moderation::{self, ModError};
+use app::orders::{apply_action, create_order_with_config, order_by_public_id};
 use app::passwords::HashGuard;
+use app::payments::{
+    canonical_message, payment_seller_id, set_primary_address, submit_payment_proof,
+    upload_batch, PaymentConfig,
+};
 use app::throttle::Throttles;
 use app::totp;
 use app::web::{router, AppState};
@@ -56,9 +61,182 @@ const CERT_CAROL_V2: &str = include_str!("fixtures/gpg/cert-carol-v2-revoked-sub
 const MSG_TO_CAROL_SUBKEY1: &str = include_str!("fixtures/gpg/msg-to-carol-subkey1.asc");
 const UNWRAP_BOB_SIGNED: &str = include_str!("fixtures/gpg/unwrap-bob-signed.asc");
 const UNWRAP_BOB_UNSIGNED: &str = include_str!("fixtures/gpg/unwrap-bob-unsigned.asc");
-const MSG_300_UNSIGNED: &str = include_str!("fixtures/gpg/msg-300-unsigned.asc");
 const DISCLOSE_PLAINTEXT: &str =
     "Bob here: your widget shipped today, tracking is in the next message.";
+
+const ALICE_FPR: &str = "698C2CE6489C747F1458C2BF35C511FEAF38F328";
+const BOB_FPR: &str = "54C8A581E49106123FB5CCBACED0A0143425A8E0";
+const CAROL_FPR: &str = "346F063FB3DB1FB8EDB9F17D4065C0B2115BED30";
+const SIG: &str =
+    "SigV2abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuv";
+const SUBS: &[&str] = &[
+    "75ecAyh9QuvfaDyaPRTVnwgc2QxjTByx2GM2haFsn8wrEu2vSVn7QctGiKQdpP5vNPeB2Fzbg8Sb78mqA22Qc2GaHdYhWsY",
+    "758HazrgczGbQ4rmrAuws3CcFLEa5zGRE9abUNcVeSP3KYGuoC9mGFHcX2R4HS7qxJCmFHrPAzDDNSshrwHAQLUyUDch7xW",
+    "73qWemDitUJbTzxfNhSEGi7YcTi1UYFrM1u3Ck2iL2qxhT3tY45KLk262yx58CKL81YjbyndXBjXSMXAczboytxUEvu4y7o",
+];
+
+static FIXTURE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+/// The fixture certificates have globally-unique fingerprints, so
+/// tests using them serialize and first purge residue accounts.
+async fn fixture_guard(pool: &PgPool) -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = FIXTURE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT account_id FROM identity_keys WHERE fingerprint = ANY($1)",
+    )
+    .bind(vec![
+        ALICE_FPR.to_string(),
+        BOB_FPR.to_string(),
+        CAROL_FPR.to_string(),
+    ])
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    if !ids.is_empty() {
+        cleanup(pool, &ids).await;
+    }
+    guard
+}
+
+async fn purge_fixture_addresses(pool: &PgPool) {
+    let owned: Vec<String> = SUBS.iter().map(|s| s.to_string()).collect();
+    for q in [
+        "DELETE FROM payment_declarations WHERE pool_entry_id IN (SELECT id FROM payment_pool_entries WHERE address = ANY($1))",
+        "DELETE FROM payment_review_flags WHERE order_id IN (SELECT order_id FROM payment_pool_entries WHERE address = ANY($1) AND order_id IS NOT NULL)",
+        "DELETE FROM payment_reports WHERE order_id IN (SELECT order_id FROM payment_pool_entries WHERE address = ANY($1) AND order_id IS NOT NULL)",
+        "DELETE FROM payment_proofs WHERE pool_entry_id IN (SELECT id FROM payment_pool_entries WHERE address = ANY($1))",
+        "DELETE FROM payment_attestations WHERE pool_entry_id IN (SELECT id FROM payment_pool_entries WHERE address = ANY($1))",
+        "DELETE FROM payment_pool_entries WHERE address = ANY($1)",
+        "DELETE FROM destinations WHERE address = ANY($1)",
+    ] {
+        sqlx::query(q).bind(&owned).execute(pool).await.expect("purge fixture addresses");
+    }
+}
+
+fn pay_cfg() -> PaymentConfig {
+    PaymentConfig::defaults("vespiary-market")
+}
+
+async fn make_listing(pool: &PgPool, seller_id: i64) -> String {
+    let public_id = app::db::public_id("lst_");
+    sqlx::query(
+        "INSERT INTO listings (public_id, seller_id, title, description, price_atomic,
+            pricing_module, destination_module, auto_invoice, status, category)
+         VALUES ($1, $2, 'Verify widget', 'desc', 1250000000000, 'xmr-only',
+                 'signed-address-pool', false, 'published', 'general')",
+    )
+    .bind(&public_id)
+    .bind(seller_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    public_id
+}
+
+fn batch_json(cfg: &PaymentConfig, seller_pub: &str, primary: &str, subs: &[&str]) -> String {
+    let seller_id = payment_seller_id(seller_pub).unwrap();
+    let entries: Vec<serde_json::Value> = subs
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "subaddress": s,
+                "message": canonical_message(&cfg.marketplace_id, cfg.network, &seller_id, primary, s),
+                "signature": SIG,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "format": "xmr-direct-batch-v1",
+        "marketplace_id": cfg.marketplace_id,
+        "network": "stagenet",
+        "seller_id": seller_id,
+        "primary_address": primary,
+        "entries": entries,
+    })
+    .to_string()
+}
+
+async fn public_id_of(pool: &PgPool, account_id: i64) -> String {
+    sqlx::query_scalar("SELECT public_id FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A bob-sells-to-alice shop (fixture certs), ready for an order.
+async fn fixture_shop(pool: &PgPool) -> (i64, i64, String) {
+    let c = pay_cfg();
+    let (seller, _su) = make_account(pool, "seller", PW).await;
+    let seller_pub = public_id_of(pool, seller).await;
+    install_cert(pool, seller, CERT_BOB).await;
+    let listing = make_listing(pool, seller).await;
+    set_primary_address(pool, seller, PRIMARY_A, &c).await.unwrap();
+    upload_batch(pool, seller, &batch_json(&c, &seller_pub, PRIMARY_A, SUBS), &c)
+        .await
+        .unwrap();
+    let (buyer, _bp) = make_account(pool, "buyer", PW).await;
+    install_cert(pool, buyer, CERT_ALICE).await;
+    (seller, buyer, listing)
+}
+
+async fn disputed_order(pool: &PgPool, seller: i64, buyer: i64, listing: &str) -> (i64, i64) {
+    let c = pay_cfg();
+    let (order, created) =
+        create_order_with_config(pool, "vespiary-market", buyer, listing, 1, &uniq(), &c)
+            .await
+            .unwrap();
+    assert!(created);
+    apply_action(pool, &order, "accept", seller).await.unwrap();
+    let order = order_by_public_id(pool, &order.public_id).await.unwrap();
+    submit_payment_proof(pool, &order, buyer, "aa".repeat(32).as_str(), "proof text", &c)
+        .await
+        .unwrap();
+    let order = order_by_public_id(pool, &order.public_id).await.unwrap();
+    apply_action(pool, &order, "dispute", buyer).await.unwrap();
+    let dispute = app::disputes::dispute_for_order(pool, order.id)
+        .await
+        .unwrap()
+        .expect("dispute row exists");
+    (order.id, dispute.id)
+}
+
+/// Plant a conversation message row (blob file + row) with a chosen
+/// arrival time; returns the message id.
+async fn plant_message(
+    pool: &PgPool,
+    conversation_id: i64,
+    sender: i64,
+    recipient: i64,
+    recipient_key_id: &str,
+    bytes: &[u8],
+    received_unix: i64,
+) -> i64 {
+    let dir = app::messages::blob_dir();
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let blob_ref = format!("test-{}", uniq());
+    tokio::fs::write(dir.join(format!("{blob_ref}.asc")), bytes).await.unwrap();
+    sqlx::query_scalar(
+        "INSERT INTO encrypted_messages
+            (conversation_id, sender_id, recipient_id, recipient_key_id, blob_ref, length, received_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($7) + interval '90 days')
+         RETURNING id",
+    )
+    .bind(conversation_id)
+    .bind(sender)
+    .bind(recipient)
+    .bind(recipient_key_id)
+    .bind(blob_ref)
+    .bind(bytes.len() as i32)
+    .bind(received_unix as f64)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+const MSG_300_UNSIGNED: &str = include_str!("fixtures/gpg/msg-300-unsigned.asc");
 
 /// Serializes this file's message-sending tests (task 9's limits
 /// are process-wide environment by design).
@@ -158,6 +336,26 @@ async fn install_cert(pool: &PgPool, account_id: i64, cert: &str) {
 }
 
 async fn cleanup(pool: &PgPool, accounts: &[i64]) {
+    // Conversations first, torn down by id (messages, sightings,
+    // participants, then the row), so no conversation outlives its
+    // participants regardless of order/direct shape.
+    let conv_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT conversation_id FROM conversation_participants WHERE account_id = ANY($1)",
+    )
+    .bind(accounts)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    for cid in &conv_ids {
+        for q in [
+            "DELETE FROM encrypted_messages WHERE conversation_id = $1",
+            "DELETE FROM conversation_key_sightings WHERE conversation_id = $1",
+            "DELETE FROM conversation_participants WHERE conversation_id = $1",
+            "DELETE FROM conversations WHERE id = $1",
+        ] {
+            sqlx::query(q).bind(cid).execute(pool).await.unwrap();
+        }
+    }
     for id in accounts {
         for q in [
             "DELETE FROM payment_review_flags WHERE order_id IN (SELECT id FROM orders WHERE buyer_id = $1 OR seller_id = $1)",
@@ -915,5 +1113,105 @@ async fn recovery_clears_totp_and_pauses_payment_changes() {
     assert_eq!(identity.primary_address, PRIMARY_B);
 
     cleanup(&pool, &[seller]).await;
+    srv.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Task 6 (V4): a disclosure is tied to a chosen conversation
+// message. Verified requires the signature to have been created
+// within 24h before that message arrived; a 3-day-old signature
+// against the same correctly-signed text is an unverified claim.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn disclosure_verified_only_for_fresh_signature_on_named_message() {
+    let Some(pool) = pool().await else { return };
+    let _guard = fixture_guard(&pool).await;
+    purge_fixture_addresses(&pool).await;
+    let srv = test_server(&pool).await;
+    let (seller, buyer, listing) = fixture_shop(&pool).await;
+    let (order_id, dispute_id) = disputed_order(&pool, seller, buyer, &listing).await;
+    let conv = app::messages::find_or_create_for_order(&pool, order_id, buyer, seller)
+        .await
+        .unwrap();
+    let sig_unix = app::keys::extract_unwrapped_message(CERT_BOB.as_bytes(), UNWRAP_BOB_SIGNED.as_bytes())
+        .and_then(|u| u.signature_created_unix)
+        .expect("signed fixture carries a signature creation time");
+
+    // Fresh: the message arrived an hour after its signature.
+    let fresh_mid = plant_message(
+        &pool, conv, seller, buyer, "A5C23E96999A1AF9", UNWRAP_BOB_SIGNED.as_bytes(), sig_unix + 3600,
+    )
+    .await;
+    let status = app::disputes::submit_disclosure_unwrapped(
+        &pool, &srv.keyfile, dispute_id, buyer, fresh_mid, UNWRAP_BOB_SIGNED,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, "verified", "fresh signature on the named message verifies");
+
+    // Stale: the SAME correctly-signed text, but the named message
+    // arrived three days after the signature was created.
+    let stale_mid = plant_message(
+        &pool, conv, seller, buyer, "A5C23E96999A1AF9", UNWRAP_BOB_SIGNED.as_bytes(),
+        sig_unix + 3 * 24 * 3600,
+    )
+    .await;
+    let status = app::disputes::submit_disclosure_unwrapped(
+        &pool, &srv.keyfile, dispute_id, buyer, stale_mid, UNWRAP_BOB_SIGNED,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        status, "unverified_claim",
+        "a signature 3 days older than the named message is only a claim"
+    );
+
+    // A message from a DIFFERENT conversation (or from the
+    // submitter themselves) cannot be named at all.
+    let direct = app::messages::find_or_create_direct(&pool, seller, buyer).await.unwrap();
+    let foreign_mid = plant_message(
+        &pool, direct, seller, buyer, "A5C23E96999A1AF9", UNWRAP_BOB_SIGNED.as_bytes(), sig_unix + 3600,
+    )
+    .await;
+    let err = app::disputes::submit_disclosure_unwrapped(
+        &pool, &srv.keyfile, dispute_id, buyer, foreign_mid, UNWRAP_BOB_SIGNED,
+    )
+    .await
+    .expect_err("a message outside the order conversation is refused");
+    assert!(matches!(err, app::disputes::DisputeError::BadInput), "got {err:?}");
+    let own_mid = plant_message(
+        &pool, conv, buyer, seller, "CED0A0143425A8E0", UNWRAP_BOB_SIGNED.as_bytes(), sig_unix + 3600,
+    )
+    .await;
+    let err = app::disputes::submit_disclosure_unwrapped(
+        &pool, &srv.keyfile, dispute_id, buyer, own_mid, UNWRAP_BOB_SIGNED,
+    )
+    .await
+    .expect_err("one's own message cannot be disclosed as the other party's");
+    assert!(matches!(err, app::disputes::DisputeError::BadInput), "got {err:?}");
+
+    // The dispute page shows BOTH times beside the verified entry.
+    let token = session_for(&pool, buyer).await;
+    let cookie = format!("session={token}");
+    let page = http_raw(
+        srv.addr,
+        "GET",
+        &format!("/disputes/{dispute_id}"),
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains(DISCLOSE_PLAINTEXT), "plaintext shown");
+    assert!(page.body.contains("Evidence — signature verified"), "verified label shown");
+    assert!(page.body.contains("Message received"), "arrival time shown: {}", page.body);
+    assert!(page.body.contains("signature created"), "signature time shown");
+    let views = app::disputes::disclosures_for(&pool, &srv.keyfile, dispute_id).await.unwrap();
+    let verified = views.iter().find(|v| v.signature_status == "verified").expect("one verified");
+    assert!(verified.message_received_at.is_some() && verified.signature_created_at.is_some());
+
+    cleanup(&pool, &[seller, buyer]).await;
     srv.stop();
 }
