@@ -104,9 +104,19 @@ reads one file and writes one file, and the claim ends there.
 
 **T7 — DoS.** Per-account throttles (built: a per-account request throttle on
 signed-in POSTs, plus messaging-layer limits — 60 messages/minute per account,
-a 16 MiB rolling daily byte budget per account, and per-conversation caps),
-new-account limits, global registration cap,
-Argon2 semaphore, body-size limits before parsing, header/idle timeouts.
+a 16 MiB rolling daily byte budget per account, and per-conversation caps).
+Storage-exhaustion bounds (built 2026-10-19, fix verification V9): per-account
+budgets cannot bound total storage while accounts are free to create, so the
+messaging layer also enforces an instance-wide daily storage ceiling
+(default 256 MiB of message ciphertext per 24h, operator-settable) and a
+free-disk floor on the blob volume (default 1 GiB) past which message storage
+is refused with a 503 rather than filling the disk; accounts less than a day
+old, or with no completed order, get a smaller 1 MiB daily budget. A global
+registration cap is built and operator-settable from the environment
+(`ACCOUNT_CAP` in the instance configuration); it ships unset — no cap — by
+default, so whether the instance accepts unlimited accounts is the operator's
+stated choice, not a hard-wired one. Also built: Argon2 semaphore, body-size
+limits before parsing, header/idle timeouts.
 PLANNED, not built in code: Tor proof-of-work defenses on the onion profile —
 an operator-side Tor configuration choice, not an application control.
 Residual: a determined attacker can degrade a
