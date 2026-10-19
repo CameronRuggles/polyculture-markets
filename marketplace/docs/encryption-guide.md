@@ -121,7 +121,9 @@ Before storing a message, the server opens only the envelope
 (packet structure — never the contents) and checks:
 
 - Size first: at most **64 KiB** of submitted (armored or binary)
-  bytes per message, **10 MiB** per attachment.
+  bytes per message. The file-upload form takes the same messages
+  under the same 64 KiB cap — there is no separate, larger
+  attachment allowance.
 - The message is encrypted to the recipient's **current** registered
   key. Any extra recipient must be one of your own registered keys
   (that is the encrypt-to-yourself copy above) — anything else is

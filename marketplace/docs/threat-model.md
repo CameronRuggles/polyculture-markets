@@ -55,17 +55,21 @@ and ciphertext remain exposed; disclosed honestly.
 
 **T2 — Operator/intruder substitutes a payment destination.** Controls: every
 destination arrives inside a seller-signed pool or invoice statement; core verifies
-the signature against the key pinned on the order; a second, independent parser
-(wallet-RPC `validate_address`) cross-checks submissions; destinations are unique
+the signature against the key pinned on the order; destinations are unique
 forever (global table) and validated as torsion-free subaddresses on the right
-network. Residual: a buyer who never verifies locally against their own pinned
+network by the in-process address parser. NOT built: a wallet-RPC
+`validate_address` cross-check — the server runs no wallet (an earlier draft of
+this document claimed one; messaging audit ML2). Residual: a buyer who never verifies locally against their own pinned
 key trusts the server's display — mitigated by downloads + guide, not eliminated.
 
 **T3 — Account takeover.** Controls: Argon2id + global hashing semaphore (503
 before exhaustion), per-username exponential delay (never lockout), session
 rotation on login/privilege change, `__Host-` cookies, CSRF synchronizer tokens,
 recovery codes that revoke all sessions and publicly mark the profile 30 days.
-Admin/moderator accounts: TOTP + separate listener (amendment). Residual:
+Admin/moderator accounts: TOTP at login and as a fresh step-up for moderator
+actions and disclosure reads (built, account security audit). PLANNED, not
+built: a separate listener for admin/moderator surfaces — today they ride the
+same listener as the public pages. Residual:
 passphrase quality is the user's.
 
 **T4 — Seller non-delivery / fraud.** No escrow in v2 — this risk is *accepted
@@ -84,9 +88,14 @@ downloads restricted to participants; rejected plaintext never echoed or logged.
 worker (no network, read-only FS, seccomp, resource limits), metadata stripped,
 JPEG/PNG only. Attachments are opaque, download-only, never rendered inline.
 
-**T7 — DoS.** Per-account throttles, new-account limits, global registration cap,
-Argon2 semaphore, body-size limits before parsing, Tor PoW defenses on the onion
-profile, header/idle timeouts. Residual: a determined attacker can degrade a
+**T7 — DoS.** Per-account throttles (built: a per-account request throttle on
+signed-in POSTs, plus messaging-layer limits — 60 messages/minute per account,
+a 16 MiB rolling daily byte budget per account, and per-conversation caps),
+new-account limits, global registration cap,
+Argon2 semaphore, body-size limits before parsing, header/idle timeouts.
+PLANNED, not built in code: Tor proof-of-work defenses on the onion profile —
+an operator-side Tor configuration choice, not an application control.
+Residual: a determined attacker can degrade a
 small instance; no funds or data loss results.
 
 **T8 — Module misbehaviour.** Modules propose; the core verifies, records,
