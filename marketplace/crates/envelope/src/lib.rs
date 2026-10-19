@@ -8,22 +8,69 @@
 
 pub use modules_api::EnvelopeError;
 use sequoia_openpgp::parse::Parse;
+use sequoia_openpgp::cert::amalgamation::ValidAmalgamation;
+use sequoia_openpgp::policy::StandardPolicy;
+use sequoia_openpgp::types::RevocationStatus;
 use sequoia_openpgp::Cert;
 use std::collections::HashSet;
 
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// A reference to one party's key. Built from a full certificate when
-/// available (matching is certificate-level: any key in the cert), or
-/// from a bare primary fingerprint (matching limited to it + its key ID).
+/// available, or from a bare primary fingerprint (matching limited to
+/// it + its key ID). Certificate matching covers only the keys a
+/// sender can usefully encrypt to RIGHT NOW: alive,
+/// encryption-capable subkeys (messaging audit MM3 — a certificate
+/// can carry revoked, expired, signing-only and certification keys,
+/// and none of those may vouch for a recipient match).
 #[derive(Clone, Debug)]
 pub struct KeyRef {
     fingerprint: String,
-    handles: HashSet<String>, // uppercase hex fingerprints + key IDs of all keys in the cert
+    handles: HashSet<String>, // uppercase hex fingerprints + key IDs of the matchable keys
 }
 
 impl KeyRef {
+    /// Strict matching (MM3): only subkeys that are alive (not
+    /// expired), not revoked, and encryption-capable under the
+    /// standard policy count as recipient handles — the same policy
+    /// work `keys::validate_cert` does at upload. A certificate that
+    /// fails policy validation as a whole (revoked/expired primary)
+    /// matches nothing, but still yields its primary fingerprint so
+    /// callers can name the key.
     pub fn from_cert(cert_bytes: &[u8]) -> Option<KeyRef> {
+        let cert = Cert::from_bytes(cert_bytes).ok()?;
+        let primary = format!("{:X}", cert.fingerprint());
+        let mut handles = HashSet::new();
+        if let Ok(valid) = cert.with_policy(&StandardPolicy::new(), None) {
+            for ka in valid.keys().subkeys() {
+                if !(ka.for_storage_encryption() || ka.for_transport_encryption()) {
+                    continue;
+                }
+                if ka.alive().is_err() {
+                    continue;
+                }
+                if matches!(ka.revocation_status(), RevocationStatus::Revoked(_)) {
+                    continue;
+                }
+                let key = ka.key();
+                handles.insert(format!("{:X}", key.fingerprint()));
+                handles.insert(format!("{:X}", key.keyid()));
+            }
+        }
+        Some(KeyRef {
+            fingerprint: primary,
+            handles,
+        })
+    }
+
+    /// Unfiltered matching: EVERY key in the certificate, alive or
+    /// not, encryption-capable or not. Used ONLY for retired-key
+    /// recognition (the RecipientKeyRetired path): a message encrypted
+    /// to a key the recipient has since rotated away from — including
+    /// one whose certificate later expired or whose subkey was
+    /// revoked in a refresh — must still be recognised as "encrypted
+    /// to a shown retired key", never silently reclassified.
+    pub fn from_cert_unfiltered(cert_bytes: &[u8]) -> Option<KeyRef> {
         let cert = Cert::from_bytes(cert_bytes).ok()?;
         let mut handles = HashSet::new();
         let mut primary = String::new();
@@ -170,8 +217,29 @@ fn packet_bytes(bytes: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
     }
     if let Some(start) = text.find("-----BEGIN PGP MESSAGE-----") {
         let rest = &text[start + "-----BEGIN PGP MESSAGE-----".len()..];
-        // Optional armor headers end at the first blank line.
-        let body_start = rest.find("\n\n").map(|i| i + 2).ok_or(EnvelopeError::Malformed)?;
+        // Optional armor headers end at the first blank line. Lines
+        // may end in LF or CRLF: browsers submit textarea content
+        // with CRLF line endings (messaging audit MH1), and a CRLF
+        // text contains no "\n\n", so the blank line is found by
+        // walking lines rather than searching for a byte pair. The
+        // first piece is the remainder of the BEGIN line itself.
+        let mut body_start = None;
+        let mut offset = 0usize;
+        for (n, line) in rest.split_inclusive('\n').enumerate() {
+            let content = line.trim_end_matches(['\n', '\r']);
+            if content.is_empty() {
+                if n > 0 {
+                    body_start = Some(offset + line.len());
+                    break;
+                }
+            } else if n == 0 || !content.contains(':') {
+                // Junk on the BEGIN line, or a non-header line before
+                // the blank separator: not well-formed armor.
+                return Err(EnvelopeError::Malformed);
+            }
+            offset += line.len();
+        }
+        let body_start = body_start.ok_or(EnvelopeError::Malformed)?;
         let body = &rest[body_start..];
         let end = body
             .find("-----END PGP MESSAGE-----")
@@ -207,6 +275,46 @@ struct RawPacket {
     body: Vec<u8>,
 }
 
+enum LenKind {
+    Definite(usize),
+    Partial(usize),
+}
+
+/// Read one new-format length field at `i` (RFC 9580 §4.2.2):
+/// returns the kind and the number of octets consumed. Partial body
+/// lengths decode to their chunk size, `1 << (octet - 224)` (the
+/// RFC's own worked example: 0xEA → 1024).
+fn read_new_length(bin: &[u8], i: usize) -> Result<(LenKind, usize), EnvelopeError> {
+    if i >= bin.len() {
+        return Err(EnvelopeError::Malformed);
+    }
+    let l = bin[i];
+    match l {
+        0..=191 => Ok((LenKind::Definite(l as usize), 1)),
+        192..=223 => {
+            if i + 1 >= bin.len() {
+                return Err(EnvelopeError::Malformed);
+            }
+            Ok((
+                LenKind::Definite(192 + (((l as usize) - 192) << 8) + bin[i + 1] as usize),
+                2,
+            ))
+        }
+        224..=254 => Ok((LenKind::Partial(1usize << (l - 224)), 1)),
+        255 => {
+            if i + 4 >= bin.len() {
+                return Err(EnvelopeError::Malformed);
+            }
+            Ok((
+                LenKind::Definite(
+                    u32::from_be_bytes([bin[i + 1], bin[i + 2], bin[i + 3], bin[i + 4]]) as usize,
+                ),
+                5,
+            ))
+        }
+    }
+}
+
 fn split_packets(bin: &[u8]) -> Result<Vec<RawPacket>, EnvelopeError> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -215,82 +323,98 @@ fn split_packets(bin: &[u8]) -> Result<Vec<RawPacket>, EnvelopeError> {
         if b0 & 0x80 == 0 {
             return Err(EnvelopeError::Malformed);
         }
-        let (tag, hdr) = if b0 & 0x40 != 0 {
-            // New format.
-            if i + 1 >= bin.len() {
-                return Err(EnvelopeError::Malformed);
-            }
-            let l = bin[i + 1];
-            match l {
-                0..=191 => (b0 & 0x3F, (2usize, l as usize)),
-                192..=223 => {
-                    if i + 2 >= bin.len() {
-                        return Err(EnvelopeError::Malformed);
-                    }
-                    (
-                        b0 & 0x3F,
-                        (3usize, 192 + (((l as usize) - 192) << 8) + bin[i + 2] as usize),
-                    )
-                }
-                224..=254 => return Err(EnvelopeError::Malformed), // partial lengths: not for complete messages
-                255 => {
-                    if i + 5 >= bin.len() {
-                        return Err(EnvelopeError::Malformed);
-                    }
-                    (
-                        b0 & 0x3F,
-                        (
-                            6usize,
-                            u32::from_be_bytes([bin[i + 2], bin[i + 3], bin[i + 4], bin[i + 5]])
-                                as usize,
-                        ),
-                    )
-                }
-            }
-        } else {
+        if b0 & 0x40 == 0 {
             // Old format: tag in bits 5..2, length type in bits 1..0.
             let tag = (b0 >> 2) & 0xF;
-            match b0 & 0x3 {
+            let (hlen, blen) = match b0 & 0x3 {
                 0 => {
                     if i + 1 >= bin.len() {
                         return Err(EnvelopeError::Malformed);
                     }
-                    (tag, (2usize, bin[i + 1] as usize))
+                    (2usize, bin[i + 1] as usize)
                 }
                 1 => {
                     if i + 2 >= bin.len() {
                         return Err(EnvelopeError::Malformed);
                     }
-                    (
-                        tag,
-                        (3usize, u16::from_be_bytes([bin[i + 1], bin[i + 2]]) as usize),
-                    )
+                    (3usize, u16::from_be_bytes([bin[i + 1], bin[i + 2]]) as usize)
                 }
                 2 => {
                     if i + 4 >= bin.len() {
                         return Err(EnvelopeError::Malformed);
                     }
                     (
-                        tag,
-                        (
-                            5usize,
-                            u32::from_be_bytes([bin[i + 1], bin[i + 2], bin[i + 3], bin[i + 4]])
-                                as usize,
-                        ),
+                        5usize,
+                        u32::from_be_bytes([bin[i + 1], bin[i + 2], bin[i + 3], bin[i + 4]])
+                            as usize,
                     )
                 }
                 _ => return Err(EnvelopeError::Malformed), // indeterminate length
+            };
+            if i + hlen + blen > bin.len() {
+                return Err(EnvelopeError::Malformed);
             }
-        };
-        let (tag, (hlen, blen)) = (tag, hdr);
-        if i + hlen + blen > bin.len() {
-            return Err(EnvelopeError::Malformed);
+            out.push(RawPacket {
+                tag,
+                body: bin[i + hlen..i + hlen + blen].to_vec(),
+            });
+            i += hlen + blen;
+            continue;
         }
-        out.push(RawPacket {
-            tag,
-            body: bin[i + hlen..i + hlen + blen].to_vec(),
-        });
-        i += hlen + blen;
+        // New format.
+        let tag = b0 & 0x3F;
+        let (first, used) = read_new_length(bin, i + 1)?;
+        let mut j = i + 1 + used; // first body octet / first chunk start
+        let mut body = Vec::new();
+        match first {
+            LenKind::Definite(blen) => {
+                if j + blen > bin.len() {
+                    return Err(EnvelopeError::Malformed);
+                }
+                body.extend_from_slice(&bin[j..j + blen]);
+                j += blen;
+            }
+            LenKind::Partial(mut chunk_len) => {
+                // Partial body lengths (RFC 9580 §4.2.2.4) are how
+                // GnuPG writes any message it streams — signed mail at
+                // any size, and anything past ~512 B (messaging audit
+                // MH2). They are accepted ONLY on the encrypted-data
+                // packet (SEIP tag 18 / AED tag 20), which is always
+                // the final packet of a message: chunks are accumulated
+                // under the caller's submitted-bytes cap, the packet
+                // must end the input, and the never-look-inside rule is
+                // unchanged — the scanner still reads only body[0]
+                // (version / AED header) of the assembled packet.
+                if tag != TAG_SEIP && tag != TAG_AED {
+                    return Err(EnvelopeError::Malformed);
+                }
+                loop {
+                    if j + chunk_len > bin.len() {
+                        return Err(EnvelopeError::Malformed);
+                    }
+                    body.extend_from_slice(&bin[j..j + chunk_len]);
+                    j += chunk_len;
+                    let (next, used) = read_new_length(bin, j)?;
+                    j += used;
+                    match next {
+                        LenKind::Partial(c) => chunk_len = c,
+                        LenKind::Definite(blen) => {
+                            if j + blen > bin.len() {
+                                return Err(EnvelopeError::Malformed);
+                            }
+                            body.extend_from_slice(&bin[j..j + blen]);
+                            j += blen;
+                            break;
+                        }
+                    }
+                }
+                if j != bin.len() {
+                    return Err(EnvelopeError::Malformed); // a partial packet is final
+                }
+            }
+        }
+        out.push(RawPacket { tag, body });
+        i = j;
     }
     Ok(out)
 }
@@ -573,7 +697,11 @@ mod packet_tests {
 
     #[test]
     fn split_rejects_partial_indeterminate_and_truncated() {
-        // New-format partial body length (224) is refused.
+        // New-format partial body length octet 224 declares a 1-byte
+        // chunk; after it the stream ends with no terminating length
+        // — truncated, refused. (Partial lengths themselves are
+        // ACCEPTED on the final data packet since MH2; see
+        // split_accepts_partial_on_final_data_packet.)
         assert!(split_packets(&[0xC0u8 | 18, 224, 1]).is_err());
         // Old-format indeterminate length (type 3) is refused.
         assert!(split_packets(&[0x80u8 | (1 << 2) | 3, 1, 2]).is_err());
@@ -581,5 +709,96 @@ mod packet_tests {
         assert!(split_packets(&[0xC0u8 | 18, 50, 1]).is_err());
         // A packet header byte without the always-1 bit is refused.
         assert!(split_packets(&[0x12u8, 0x00]).is_err());
+    }
+
+    /// A v3 PKESK naming key ID 1111…11 (the recipient handle the
+    /// hand-built contexts below use).
+    fn pkesk_11() -> Vec<u8> {
+        let mut v = vec![0xC0u8 | 1, 12, 3];
+        v.extend_from_slice(&[0x11; 8]);
+        v.extend_from_slice(&[1, 0xAA, 0xBB]);
+        v
+    }
+
+    fn ctx_11() -> EnvelopeContext {
+        EnvelopeContext {
+            sender: KeyRef::from_fingerprint("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+            recipient: KeyRef::from_fingerprint(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1111111111111111",
+            ),
+            recipient_retired_shown: vec![],
+        }
+    }
+
+    #[test]
+    fn split_accepts_partial_on_final_data_packet() {
+        // SEIP body stream: version 1 + 8 junk bytes = 9 bytes,
+        // framed as four 2-byte partial chunks + a 1-byte final chunk.
+        let mut msg = pkesk_11();
+        msg.push(0xC0 | 18);
+        let stream = [1u8, 9, 9, 9, 9, 9, 9, 9, 9];
+        for chunk in stream.chunks(2) {
+            if chunk.len() == 2 {
+                msg.push(225); // partial: 1 << (225 - 224) = 2 bytes
+                msg.extend_from_slice(chunk);
+            } else {
+                msg.push(chunk.len() as u8); // final definite chunk
+                msg.extend_from_slice(chunk);
+            }
+        }
+        let ps = split_packets(&msg).unwrap();
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[1].tag, 18);
+        assert_eq!(ps[1].body, stream.to_vec());
+        // …and the whole envelope validates (v3 PKESK + SEIP v1).
+        validate_envelope(&msg, &ctx_11()).unwrap();
+
+        // The same framing on the AED packet (header check applies to
+        // the ASSEMBLED body: version 1, AES-256, OCB, chunk 16, salt).
+        let mut msg = pkesk_11();
+        msg.push(0xC0 | 20);
+        let mut stream = vec![1u8, 9, 2, 16];
+        stream.extend(std::iter::repeat_n(0u8, 32)); // salt
+        stream.extend(std::iter::repeat_n(7u8, 40)); // payload
+        for chunk in stream.chunks(16) {
+            if chunk.len() == 16 {
+                msg.push(228); // partial: 1 << (228 - 224) = 16 bytes
+                msg.extend_from_slice(chunk);
+            } else {
+                msg.push(chunk.len() as u8);
+                msg.extend_from_slice(chunk);
+            }
+        }
+        let ps = split_packets(&msg).unwrap();
+        assert_eq!(ps[1].tag, 20);
+        assert_eq!(ps[1].body, stream);
+        validate_envelope(&msg, &ctx_11()).unwrap();
+    }
+
+    #[test]
+    fn split_refuses_partial_off_the_data_packet() {
+        // Partial length on a PKESK: refused even though the framing
+        // is otherwise complete (2-byte partial chunk + 1-byte final).
+        let mut pk = vec![0xC0u8 | 1, 224, 3, 0x11, 1, 0x11];
+        let ps = split_packets(&pk);
+        assert!(ps.is_err(), "partial PKESK must be refused");
+        pk.clear();
+        // A partial data packet that is NOT final (another packet
+        // follows): refused.
+        let mut msg = pkesk_11();
+        msg.push(0xC0 | 18);
+        msg.push(225); // 2-byte partial chunk
+        msg.extend_from_slice(&[1, 9]);
+        msg.push(1); // final 1-byte chunk
+        msg.push(9);
+        msg.extend_from_slice(&pkesk_11()); // trailing packet
+        assert!(split_packets(&msg).is_err(), "partial packet must be final");
+        // A partial chunk with nothing after it (no terminating
+        // length): refused.
+        let mut msg = pkesk_11();
+        msg.push(0xC0 | 18);
+        msg.push(225);
+        msg.extend_from_slice(&[1, 9]);
+        assert!(split_packets(&msg).is_err());
     }
 }
