@@ -12,6 +12,10 @@
 //! - **Concurrency cap.** A process-wide semaphore admits at most
 //!   `MAX_CONCURRENT_WORKERS` (2) workers at once; further uploads
 //!   queue instead of multiplying memory pressure.
+//! - **Per-job scratch.** Each job works in a fresh directory under
+//!   the pipeline tmp dir, deleted when the job ends. In the sandbox
+//!   that directory alone is bound at `/work`, so a worker can never
+//!   see another job's input or output.
 //! - **Optional sandbox wrapper.** When the deployment sets
 //!   `MEDIA_WORKER_SANDBOX=bwrap` and provides bubblewrap, each
 //!   worker runs inside it: no network namespace, a tmpfs root with
@@ -107,8 +111,28 @@ impl MediaPipeline {
         tokio::fs::create_dir_all(&self.tmp_dir).await.map_err(|_| MediaError::WorkerFailed)?;
         tokio::fs::create_dir_all(&self.media_dir).await.map_err(|_| MediaError::WorkerFailed)?;
         let stem = crate::db::public_id("");
-        let in_path = self.tmp_dir.join(format!("{stem}.in"));
-        let out_path = self.tmp_dir.join(format!("{stem}.out"));
+        // CM2 (fix verification): one scratch directory per job. The
+        // worker sees only its own job's files — in the sandbox this
+        // directory alone is bound at /work — and the whole directory
+        // is deleted when the job ends, on every exit path.
+        let job_dir = self.tmp_dir.join(&stem);
+        tokio::fs::create_dir_all(&job_dir).await.map_err(|_| MediaError::WorkerFailed)?;
+        let result = self.run_worker(&job_dir, &stem, bytes, timeout).await;
+        let _ = tokio::fs::remove_dir_all(&job_dir).await;
+        result
+    }
+
+    /// Run one worker job inside its private scratch directory
+    /// (`job_dir`, created by the caller; deleted by the caller).
+    async fn run_worker(
+        &self,
+        job_dir: &std::path::Path,
+        stem: &str,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<(String, i32, i32), MediaError> {
+        let in_path = job_dir.join("in");
+        let out_path = job_dir.join("out");
         tokio::fs::write(&in_path, bytes).await.map_err(|_| MediaError::WorkerFailed)?;
 
         // CM2: never more than MAX_CONCURRENT_WORKERS workers alive.
@@ -124,14 +148,9 @@ impl MediaPipeline {
         let run = cmd.output();
         let output = match tokio::time::timeout(timeout, run).await {
             Ok(Ok(o)) => o,
-            _ => {
-                let _ = tokio::fs::remove_file(&in_path).await;
-                return Err(MediaError::WorkerFailed);
-            }
+            _ => return Err(MediaError::WorkerFailed),
         };
-        let _ = tokio::fs::remove_file(&in_path).await;
         if !output.status.success() {
-            let _ = tokio::fs::remove_file(&out_path).await;
             return Err(MediaError::Rejected);
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -183,8 +202,10 @@ fn build_worker_command(
     if std::env::var("MEDIA_WORKER_SANDBOX").as_deref() == Ok("bwrap") {
         // Inside the sandbox the worker sees: /usr, /lib, /lib64
         // (read-only, for the dynamic loader), /dev, its own binary
-        // at /worker, the input at /in, and a scratch dir at /work
-        // (the pipeline tmp dir) holding the output. No network.
+        // at /worker, the input at /in, and the job's OWN scratch dir
+        // at /work (the output's parent — one directory per job, so
+        // concurrent workers cannot see each other's files). No
+        // network.
         // /lib64 is bound with --ro-bind-try (fix verification CM2):
         // some distributions have no /lib64 at all, and a plain
         // --ro-bind of a missing source fails the whole spawn.
