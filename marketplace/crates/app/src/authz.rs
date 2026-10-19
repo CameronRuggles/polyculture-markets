@@ -16,7 +16,13 @@
 //! moderation queue pages, sanitized-media serving, profile and inbox
 //! actions). They are declared here with the class of their surface so
 //! the table stays complete for the running app; §17 remains the
-//! authority for the routes it does list. (History: §17 originally
+//! authority for the routes it does list. (BL1 amendment, 2026-10-19:
+//! 13 rows naming routes the router has never served in the Direct
+//! Payments build — the retired /invoices/* and pool-statement rows,
+//! /seller/pools*, /messages/{id}/download and /security — were
+//! removed from this table and from the locked blind_stage1 suite's
+//! expected table, so a future handler cannot silently inherit them;
+//! see the AMENDMENT note in that suite.) (History: §17 originally
 //! declared no GET /orders collection route, so `authorize` denied it
 //! while the Stage 4 draft web layer served the page — deviation
 //! recorded in RETROFIT-REPORT.md. Resolved by owner amendment
@@ -56,7 +62,13 @@ pub const ROUTES: &[RouteRule] = &[
     RouteRule { method: "POST", path: "/register", roles: PUBLIC, csrf: true },
     RouteRule { method: "GET", path: "/login", roles: PUBLIC, csrf: false },
     RouteRule { method: "POST", path: "/login", roles: PUBLIC, csrf: true },
-    RouteRule { method: "GET", path: "/security", roles: PUBLIC, csrf: false },
+    // BL1 amendment (2026-10-19): the §17-era "GET /security" row was
+    // removed — the router never served that path (the security
+    // guide lives at /security-guide, account security at
+    // /account/security), so the row only waited to be inherited by
+    // a future handler. Twelve further dead rows were removed the
+    // same day; see the notes at their sites below and the
+    // AMENDMENT note in tests/security/blind_stage1.rs.
     RouteRule { method: "GET", path: "/limitations", roles: PUBLIC, csrf: false },
     RouteRule { method: "GET", path: "/policy", roles: PUBLIC, csrf: false },
     // -- Authenticated, any role (§17 signed-in surfaces; contract §7) --
@@ -94,28 +106,28 @@ pub const ROUTES: &[RouteRule] = &[
     RouteRule { method: "POST", path: "/orders/{id}/manual-report", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "POST", path: "/orders/{id}/confirm-payment", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "POST", path: "/orders/{id}/declare-not-received", roles: AUTHENTICATED, csrf: true },
-    RouteRule { method: "GET", path: "/invoices/{id}", roles: AUTHENTICATED, csrf: false },
-    RouteRule { method: "GET", path: "/invoices/{id}/qr.png", roles: AUTHENTICATED, csrf: false },
-    RouteRule { method: "GET", path: "/invoices/{id}/statement.txt", roles: AUTHENTICATED, csrf: false },
-    RouteRule { method: "GET", path: "/invoices/{id}/statement.txt.asc", roles: AUTHENTICATED, csrf: false },
-    RouteRule { method: "POST", path: "/invoices/{id}/signature", roles: AUTHENTICATED, csrf: true },
-    RouteRule { method: "POST", path: "/invoices/{id}/evidence/{module}", roles: AUTHENTICATED, csrf: true },
-    RouteRule { method: "GET", path: "/pools/{id}/statement.txt", roles: AUTHENTICATED, csrf: false },
-    RouteRule { method: "GET", path: "/pools/{id}/statement.txt.asc", roles: AUTHENTICATED, csrf: false },
+    // BL1 amendment (2026-10-19): the six /invoices/* rows and the
+    // two /pools/{id}/statement.txt[.asc] rows were removed. Direct
+    // Payments retired the invoice system; the router serves none
+    // of these paths, and the rows only waited to be inherited by a
+    // future handler.
     RouteRule { method: "GET", path: "/conversations/{id}", roles: AUTHENTICATED, csrf: false },
     RouteRule { method: "POST", path: "/conversations/{id}/messages", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "POST", path: "/conversations/{id}/block", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "POST", path: "/conversations/blocks/{id}", roles: AUTHENTICATED, csrf: true },
-    RouteRule { method: "GET", path: "/messages/{id}/download", roles: AUTHENTICATED, csrf: false },
+    // BL1 amendment (2026-10-19): the "GET /messages/{id}/download"
+    // row was removed — superseded by the served
+    // /conversations/{id}/messages/{mid}/download route.
     RouteRule { method: "GET", path: "/disputes/{id}", roles: AUTHENTICATED, csrf: false },
     RouteRule { method: "POST", path: "/disputes/{id}/disclosures", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "POST", path: "/reports", roles: AUTHENTICATED, csrf: true },
     // -- Seller surfaces --
     RouteRule { method: "GET", path: "/seller", roles: SELLER, csrf: false },
     RouteRule { method: "POST", path: "/seller/listings", roles: SELLER, csrf: true },
-    RouteRule { method: "GET", path: "/seller/pools", roles: SELLER, csrf: false },
-    RouteRule { method: "POST", path: "/seller/pools", roles: SELLER, csrf: true },
-    RouteRule { method: "POST", path: "/seller/pools/{id}/signature", roles: SELLER, csrf: true },
+    // BL1 amendment (2026-10-19): the three /seller/pools* rows were
+    // removed — pool management moved to /seller/payment-identity
+    // and /seller/payment-batches in Direct Payments; the router
+    // serves none of the pool paths.
     // Direct Payments v1 (2026-10-15): payment identity + batch upload
     // live on the seller dashboard surface.
     RouteRule { method: "POST", path: "/seller/payment-identity", roles: SELLER, csrf: true },

@@ -480,29 +480,19 @@ async fn publish_requires_payment_identity_and_unused_pool() {
     srv.stop();
 }
 
-/// The dead rules the LOCKED blind_stage1 suite pins: its expected
-/// authorize() table names each of these, so authorize() must keep
-/// answering Allow for them even though the router serves no such
-/// route. They cannot be removed without amending that locked
-/// suite (not authorized — see the batch report). This test pins
-/// the set: a NEW dead rule fails here, and if a pinned rule ever
-/// gains a route (or the locked suite is amended), the entry must
-/// be deliberately removed.
-const PINNED_DEAD_RULES: &[(&str, &str)] = &[
-    ("GET", "/invoices/{id}"),
-    ("GET", "/invoices/{id}/qr.png"),
-    ("GET", "/invoices/{id}/statement.txt"),
-    ("GET", "/invoices/{id}/statement.txt.asc"),
-    ("POST", "/invoices/{id}/signature"),
-    ("POST", "/invoices/{id}/evidence/{module}"),
-    ("GET", "/pools/{id}/statement.txt"),
-    ("GET", "/pools/{id}/statement.txt.asc"),
-    ("GET", "/seller/pools"),
-    ("POST", "/seller/pools"),
-    ("POST", "/seller/pools/{id}/signature"),
-    ("GET", "/messages/{id}/download"),
-    ("GET", "/security"),
-];
+/// The exception set is EMPTY since the BL1 amendment pass
+/// (2026-10-19): the locked blind_stage1 suite was amended to drop
+/// its 13 dead rows (the /invoices/*, pool-statement,
+/// /seller/pools*, /messages/{id}/download and /security rules),
+/// and the dead rules came out of `app::authz::ROUTES` with them.
+/// Before that amendment this list carried those 13 rules, because
+/// the locked suite pinned them in place. It is now kept as an
+/// empty set so this test fails on ANY authorization rule that
+/// names a route the router does not serve — a new dead rule, or
+/// a served route disappearing from under an existing rule. If a
+/// rule ever legitimately becomes an exception, re-adding it here
+/// must be a deliberate, documented act.
+const PINNED_DEAD_RULES: &[(&str, &str)] = &[];
 
 #[tokio::test]
 async fn every_authz_rule_names_a_served_route() {
@@ -548,8 +538,8 @@ async fn every_authz_rule_names_a_served_route() {
     assert_eq!(
         seen_dead, expected_dead,
         "the set of authorization rules naming unserved routes changed \
-         ({checked} rules probed): only the blind_stage1-pinned dead \
-         rules may be unserved"
+         ({checked} rules probed): since the BL1 amendment (2026-10-19) \
+         NO authorization rule may name an unserved route"
     );
     srv.stop();
 }

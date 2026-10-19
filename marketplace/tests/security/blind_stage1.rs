@@ -291,6 +291,28 @@ enum Class {
 
 /// The route table, derived from spec §17's route list (path forms as
 /// written there) and classified by contract §7's authorization semantics.
+///
+/// AMENDMENT (owner decision 2026-10-19 — BL1 completion pass; the
+/// owner was asked whether to authorize the pass and delegated the
+/// decision with "do whatever you think is best"; the decision taken
+/// was YES): 13 rows were removed from this table, together with the
+/// rules they pinned in `app::authz::ROUTES`. Each removed row is
+/// kept visible below, commented out in place with a REMOVED marker.
+/// The rows named routes the router has never served in the Direct
+/// Payments build — leftovers of the retired invoice system and its
+/// contemporaries: the six `/invoices/*` routes, the two
+/// `/pools/{id}/statement.txt[.asc]` routes, the three
+/// `/seller/pools*` routes (pool management moved to
+/// `/seller/payment-batches`), `GET /messages/{id}/download`
+/// (superseded by `/conversations/{id}/messages/{mid}/download`) and
+/// `GET /security`. While the rows stood, the matching dead rules
+/// had to stay in the authorization table, where any future handler
+/// would silently inherit them. The plain-language assertion list
+/// at the top of this file (A1–A3) describes the table as
+/// originally locked and is kept verbatim for the record; the
+/// table below is the amended one. `POST /orders/{id}/invoice` is
+/// NOT among the removed rows: it matches the served
+/// `/orders/{id}/{action}` route pattern and stays.
 const ROUTES: &[(&str, &str, Class)] = &[
     // --- Public (spec §17 unauthenticated set; contract §7) ---
     ("GET", "/listings", Class::Public),
@@ -301,7 +323,8 @@ const ROUTES: &[(&str, &str, Class)] = &[
     ("POST", "/register", Class::Public),
     ("GET", "/login", Class::Public),
     ("POST", "/login", Class::Public),
-    ("GET", "/security", Class::Public),
+    // REMOVED 2026-10-19 (BL1 amendment, see the AMENDMENT note above):
+    // ("GET", "/security", Class::Public),
     ("GET", "/limitations", Class::Public),
     ("GET", "/policy", Class::Public),
     // --- Authenticated, any role (contract §7: account, security/keys,
@@ -347,37 +370,42 @@ const ROUTES: &[(&str, &str, Class)] = &[
     ("POST", "/orders/{id}/complete", Class::Authenticated),
     ("POST", "/orders/{id}/dispute", Class::Authenticated),
     ("POST", "/orders/{id}/invoice", Class::Authenticated),
-    ("GET", "/invoices/{id}", Class::Authenticated),
-    ("GET", "/invoices/{id}/qr.png", Class::Authenticated),
-    ("GET", "/invoices/{id}/statement.txt", Class::Authenticated),
-    ("GET", "/invoices/{id}/statement.txt.asc", Class::Authenticated),
+    // REMOVED 2026-10-19 (BL1 amendment, see the AMENDMENT note above):
+    // ("GET", "/invoices/{id}", Class::Authenticated),
+    // ("GET", "/invoices/{id}/qr.png", Class::Authenticated),
+    // ("GET", "/invoices/{id}/statement.txt", Class::Authenticated),
+    // ("GET", "/invoices/{id}/statement.txt.asc", Class::Authenticated),
     // DERIVATION-UNCERTAIN: POST /invoices/{id}/signature is performed by
     // the order's seller in the §11 flow, and evidence submission by the
     // buyer; contract §7 names only the seller dashboard and listing
     // creation as seller-only surfaces, so both are encoded as
     // any-authenticated at route level with the party check at object
     // level.
-    ("POST", "/invoices/{id}/signature", Class::Authenticated),
-    ("POST", "/invoices/{id}/evidence/{module}", Class::Authenticated),
+    // REMOVED 2026-10-19 (BL1 amendment, see the AMENDMENT note above):
+    // ("POST", "/invoices/{id}/signature", Class::Authenticated),
+    // ("POST", "/invoices/{id}/evidence/{module}", Class::Authenticated),
     // DERIVATION-UNCERTAIN: spec §17 adds "a pool statement is visible
     // only to its seller and to buyers holding an invoice from that
     // pool". That is an object-level visibility rule; at route level the
     // statement is not public, so anonymous -> LoginRequired and every
     // signed-in role -> Allow, with the pool-specific rule on top.
-    ("GET", "/pools/{id}/statement.txt", Class::Authenticated),
-    ("GET", "/pools/{id}/statement.txt.asc", Class::Authenticated),
+    // REMOVED 2026-10-19 (BL1 amendment, see the AMENDMENT note above):
+    // ("GET", "/pools/{id}/statement.txt", Class::Authenticated),
+    // ("GET", "/pools/{id}/statement.txt.asc", Class::Authenticated),
     ("GET", "/conversations/{id}", Class::Authenticated),
     ("POST", "/conversations/{id}/messages", Class::Authenticated),
-    ("GET", "/messages/{id}/download", Class::Authenticated),
+    // REMOVED 2026-10-19 (BL1 amendment, see the AMENDMENT note above):
+    // ("GET", "/messages/{id}/download", Class::Authenticated),
     ("GET", "/disputes/{id}", Class::Authenticated),
     ("POST", "/disputes/{id}/disclosures", Class::Authenticated),
     ("POST", "/reports", Class::Authenticated),
     // --- Seller surfaces (Seller or Admin; contract §7) ---
     ("GET", "/seller", Class::Seller),
     ("POST", "/seller/listings", Class::Seller),
-    ("GET", "/seller/pools", Class::Seller),
-    ("POST", "/seller/pools", Class::Seller),
-    ("POST", "/seller/pools/{id}/signature", Class::Seller),
+    // REMOVED 2026-10-19 (BL1 amendment, see the AMENDMENT note above):
+    // ("GET", "/seller/pools", Class::Seller),
+    // ("POST", "/seller/pools", Class::Seller),
+    // ("POST", "/seller/pools/{id}/signature", Class::Seller),
     // --- Moderation surfaces (Moderator or Admin; contract §7) ---
     ("GET", "/moderation", Class::Moderation),
     ("POST", "/disputes/{id}/resolve", Class::Moderation),
