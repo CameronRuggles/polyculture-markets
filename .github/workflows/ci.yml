@@ -63,7 +63,9 @@ jobs:
       # credentials in lockstep with it.
       DATABASE_URL: postgres://postgres:dev@localhost:5432/marketplace_dev
       MEDIA_WORKER: ${{ github.workspace }}/marketplace/target/debug/media-worker
-      MEDIA_DIR: ${{ runner.temp }}/marketplace-media
+      # MEDIA_DIR is set per-step below: the runner context is not
+      # available in job-level env (that invalid context failed the
+      # workflow at startup on its first live run, 2026-10-19).
     steps:
       - uses: actions/checkout@v4
       - name: Install system build dependencies
@@ -75,6 +77,8 @@ jobs:
       - name: Build (locked, all targets)
         run: cargo build --locked --workspace --all-targets
       - name: Full test suite
+        env:
+          MEDIA_DIR: ${{ runner.temp }}/marketplace-media
         run: |
           mkdir -p "$MEDIA_DIR"
           cargo test --locked --workspace
