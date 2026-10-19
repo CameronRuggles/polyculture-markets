@@ -38,6 +38,7 @@ pub enum ListingError {
     Category,
     DestinationModule,
     AutoInvoiceNeedsPool,
+    Terms,
 }
 
 /// Contract §8 signature: the price arrives already parsed to atomic units
@@ -55,7 +56,17 @@ pub fn validate_listing(
     if t.is_empty() || t.chars().count() > 120 || t.contains(['<', '>', '\n']) {
         return Err(ListingError::Title);
     }
+    // BL3: no Unicode format characters (category Cf — bidi
+    // overrides, zero-width characters, tag characters) in seller
+    // text: what the reader sees must be what the bytes say, in
+    // the catalogue and in the signed terms file alike.
+    if modules_api::contains_format_chars(t) {
+        return Err(ListingError::Title);
+    }
     if description.trim().is_empty() || description.chars().count() > 20_000 {
+        return Err(ListingError::Description);
+    }
+    if modules_api::contains_format_chars(description) {
         return Err(ListingError::Description);
     }
     if price_atomic == 0 {
@@ -98,6 +109,21 @@ fn row_to_listing(r: ListingRow) -> Listing {
 }
 
 type ListingRow = (i64, String, i64, String, String, String, String, i64, String, String, String, bool, String, bool);
+
+/// BL3: the per-listing delivery/refund terms get the same
+/// format-character rule as the title and description — they are
+/// bound into the buyer's terms file verbatim. (No current form
+/// writes these columns; the check runs where the terms are
+/// consumed, in order creation, so no path can carry Cf text
+/// into a terms file.)
+pub fn validate_listing_terms(delivery_terms: &str, refund_terms: &str) -> Result<(), ListingError> {
+    if modules_api::contains_format_chars(delivery_terms)
+        || modules_api::contains_format_chars(refund_terms)
+    {
+        return Err(ListingError::Terms);
+    }
+    Ok(())
+}
 
 pub async fn create_listing(
     pool: &PgPool,

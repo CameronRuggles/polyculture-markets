@@ -554,6 +554,179 @@ const PRIMARY: &str = "55b6gZhKJ2b6EzvernZJBcPXiZym13w1CfbpDU6sR8aSGpaRbAmU4EMSH
 const SUBADDR: &str = "85ecAyh9QuvfaDyaPRTVnwgc2QxjTByx2GM2haFsn8wrEu2vSVn7QctGiKQdpP5vNPeB2Fzbg8Sb78mqA22Qc2GaHdYhWsY";
 
 // ---------------------------------------------------------------------------
+// Task 5 (BL3): Unicode format characters (category Cf) are
+// refused in seller text.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn format_chars_refused_in_listing_text_and_terms() {
+    use app::listings::{validate_listing, validate_listing_terms, ListingError};
+    // The brief's two named cases.
+    assert_eq!(
+        validate_listing("Wi\u{200B}dget", "fine", 1_000_000, "general", "signed-address-pool", false),
+        Err(ListingError::Title),
+        "a title containing U+200B (zero-width space) is refused"
+    );
+    assert_eq!(
+        validate_listing("Widget", "ships \u{202E}fast", 1_000_000, "general", "signed-address-pool", false),
+        Err(ListingError::Description),
+        "a description containing U+202E (right-to-left override) is refused"
+    );
+    // Ordinary non-ASCII text is NOT format characters: accents and
+    // combining marks stay allowed.
+    assert_eq!(
+        validate_listing("Café widget", "Très bien — Cafe\u{301}", 1_000_000, "general", "signed-address-pool", false),
+        Ok(())
+    );
+    // Delivery / refund terms: same rule.
+    assert_eq!(validate_listing_terms("ships in 2 days", "no refunds"), Ok(()));
+    assert_eq!(
+        validate_listing_terms("ships \u{2066}in 2 days", "no refunds"),
+        Err(ListingError::Terms)
+    );
+    assert_eq!(
+        validate_listing_terms("ships in 2 days", "refund\u{FEFF} policy"),
+        Err(ListingError::Terms)
+    );
+}
+
+#[test]
+fn normalize_form_lines_rejects_all_of_category_cf() {
+    use modules_api::{contains_format_chars, normalize_form_lines, FormInputError};
+    for (input, name) in [
+        ("a\u{202E}b", "U+202E right-to-left override"),
+        ("a\u{200B}b", "U+200B zero-width space"),
+        ("a\u{2060}b", "U+2060 word joiner"),
+        ("a\u{00AD}b", "U+00AD soft hyphen"),
+        ("a\u{E0001}b", "U+E0001 language tag"),
+        ("a\u{061C}b", "U+061C arabic letter mark"),
+        ("a\u{180E}b", "U+180E mongolian vowel separator"),
+    ] {
+        assert_eq!(
+            normalize_form_lines(input),
+            Err(FormInputError::InvisibleCharacters),
+            "{name} must be rejected"
+        );
+        assert!(contains_format_chars(input), "{name} is category Cf");
+    }
+    assert_eq!(
+        normalize_form_lines("plain address line"),
+        Ok(vec!["plain address line".to_string()])
+    );
+    assert!(!contains_format_chars("Café — naïve"));
+}
+
+#[tokio::test]
+async fn review_and_profile_text_refuse_format_chars() {
+    let Some(pool) = pool().await else { return };
+    let (buyer, _b) = make_account(&pool, "buyer", PW).await;
+    let (seller, _s) = make_account(&pool, "seller", PW).await;
+    let listing_pub = app::listings::create_listing(
+        &pool,
+        seller,
+        "BL3 review widget",
+        "a widget",
+        1_000_000,
+        "general",
+        "signed-address-pool",
+        false,
+    )
+    .await
+    .unwrap();
+    let (listing_id,): (i64,) =
+        sqlx::query_as("SELECT id FROM listings WHERE public_id = $1")
+            .bind(&listing_pub)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let order_pub = app::db::public_id("ord_");
+    sqlx::query(
+        "INSERT INTO orders (public_id, buyer_id, seller_id, listing_id, state, settlement,
+                             seller_fpr_pinned, terms_bytes, terms_sha256, total_atomic,
+                             module_pins, evidence_level, idempotency_key)
+         VALUES ($1, $2, $3, $4, 'Completed', 'direct', 'AABBCCDDEEFF00112233445566778899AABBCCDD',
+                 'terms'::bytea, 'deadbeef', 1000000, '{}'::jsonb, 'None', $5)",
+    )
+    .bind(&order_pub)
+    .bind(buyer)
+    .bind(seller)
+    .bind(listing_id)
+    .bind(format!("idem-{}", uniq()))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("bmbl-kf-{}", uniq()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let kf = app::keyfile::KeyFile::load_or_generate(&dir.join("k")).unwrap();
+    let cfg = app::reputation::Stage9Config::from_env();
+
+    // Review text carrying a direction override is refused and
+    // nothing is stored.
+    let r = app::reviews::submit_review(
+        &pool,
+        &kf,
+        &cfg,
+        &order_pub,
+        buyer,
+        5,
+        "great seller \u{202E}beware",
+    )
+    .await;
+    assert_eq!(r, Err(app::reviews::ReviewError::FormatChars));
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reviews WHERE order_id = (SELECT id FROM orders WHERE public_id = $1)")
+        .bind(&order_pub)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "no review stored");
+
+    // A clean review lands; the seller's reply gets the same rule.
+    app::reviews::submit_review(&pool, &kf, &cfg, &order_pub, buyer, 5, "great seller")
+        .await
+        .unwrap();
+    let r = app::reviews::seller_reply(&pool, &cfg, &order_pub, seller, "thanks \u{200B}buyer").await;
+    assert_eq!(r, Err(app::reviews::ReviewError::FormatChars));
+
+    // Profile text over HTTP: refused, and the stored text is
+    // unchanged; clean text is accepted.
+    let srv = test_server(&pool).await;
+    let (_bid, bname) = make_account(&pool, "buyer", PW).await;
+    let lr = login_attempt(srv.addr, &bname, PW).await;
+    let session = set_cookie_value(&lr, "session").expect("login succeeds");
+    let cookie = format!("session={session}");
+    let page = http_raw(srv.addr, "GET", "/account/security", Some(&cookie), None, None).await;
+    assert_eq!(page.status, 200);
+    let marker = "name=\"csrf\" value=\"";
+    let start = page.body.find(marker).expect("security page carries csrf") + marker.len();
+    let csrf = page.body[start..].split('"').next().unwrap().to_string();
+    let r = post_form(
+        srv.addr,
+        "/account/profile",
+        Some(&cookie),
+        &[("csrf", &csrf), ("profile_text", "hello \u{202E} world")],
+    )
+    .await;
+    assert_eq!(r.status, 400, "profile text with U+202E is refused");
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT profile_text FROM accounts WHERE id = $1")
+            .bind(_bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(stored.as_deref().unwrap_or("").is_empty(), "refused text was not stored");
+    let r = post_form(
+        srv.addr,
+        "/account/profile",
+        Some(&cookie),
+        &[("csrf", &csrf), ("profile_text", "hello world")],
+    )
+    .await;
+    assert_eq!(r.status, 302, "clean profile text is accepted");
+    srv.stop();
+}
+
+// ---------------------------------------------------------------------------
 // Task 2 (BM2): a busy hashing pool must not burn a recovery code.
 // ---------------------------------------------------------------------------
 

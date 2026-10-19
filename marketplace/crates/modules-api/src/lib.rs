@@ -217,14 +217,59 @@ pub enum FormInputError {
 
 /// Split pasted multi-line input, strip ASCII whitespace (space, tab, CR,
 /// LF) from both ends of each line, drop empty lines.
+/// Unicode general category Cf (format characters), complete range
+/// table for Unicode 15.0 — 170 code points. Includes the bidi
+/// controls (U+202A–U+202E, U+2066–U+2069), zero-width characters
+/// (U+200B–U+200F, U+2060, U+FEFF), soft hyphen (U+00AD), the
+/// Arabic letter marks, tag characters (U+E0001, U+E0020–U+E007F)
+/// and the rest. These characters are invisible or reorder the
+/// text around them, so user-supplied text that other people will
+/// READ — listing text, terms, reviews, profiles — must not carry
+/// them: what the reader sees must be what the bytes say
+/// (Modules Audit BL3, 2026-10-19).
+pub const FORMAT_CHAR_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+/// True iff `ch` is a Unicode format character (category Cf).
+pub fn is_format_char(ch: char) -> bool {
+    let cp = ch as u32;
+    FORMAT_CHAR_RANGES.iter().any(|&(lo, hi)| cp >= lo && cp <= hi)
+}
+
+/// True iff `s` contains any Unicode format character (category Cf).
+pub fn contains_format_chars(s: &str) -> bool {
+    s.chars().any(is_format_char)
+}
+
 pub fn normalize_form_lines(input: &str) -> Result<Vec<String>, FormInputError> {
     // Reject invisibles up front: NBSP, zero-width space, BOM, etc. are any
-    // non-ASCII whitespace or format characters. Ordinary non-ASCII letters
-    // are left for downstream validators to reject on their own terms.
+    // non-ASCII whitespace or format characters (all of category Cf —
+    // BL3 made this check match the claim; it previously named only
+    // four format characters). Ordinary non-ASCII letters are left
+    // for downstream validators to reject on their own terms.
     for ch in input.chars() {
-        if (ch.is_whitespace() && !ch.is_ascii_whitespace())
-            || matches!(ch, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}')
-        {
+        if (ch.is_whitespace() && !ch.is_ascii_whitespace()) || is_format_char(ch) {
             return Err(FormInputError::InvisibleCharacters);
         }
     }

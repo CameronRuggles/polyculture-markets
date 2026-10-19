@@ -2294,6 +2294,11 @@ async fn update_profile(State(st): State<AppState>, headers: HeaderMap, Form(f):
     if !sessions::csrf_matches(&csrf, &f.csrf) || f.profile_text.chars().count() > 1000 {
         return (StatusCode::FORBIDDEN, "Rejected").into_response();
     }
+    // BL3: profile text is public seller text — no Unicode format
+    // characters (category Cf: bidi overrides, zero-width, tags).
+    if modules_api::contains_format_chars(&f.profile_text) {
+        return (StatusCode::BAD_REQUEST, "Profile text contains invisible or direction-changing characters").into_response();
+    }
     let _ = db::set_profile_text(&st.pool, sess.account_id, f.profile_text.trim()).await;
     Redirect::to("/account/security").into_response()
 }
