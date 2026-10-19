@@ -153,6 +153,26 @@ pub struct BatchFile {
     pub entries: Vec<BatchEntry>,
 }
 
+/// Create `write_atomic`'s temp file with mode 0600 applied AT
+/// CREATION (`OpenOptions::mode`), so the file is owner-only from the
+/// instant it exists — not created at umask defaults and narrowed a
+/// syscall later (payment task 9 nit, fix verification 2026-10-19).
+#[cfg(unix)]
+fn create_tmp_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_tmp_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
 /// Write `bytes` to `path` atomically: write to a temp file in the
 /// SAME directory, fsync, then rename over the target. A crash never
 /// leaves a partial file at `path`.
@@ -164,13 +184,17 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .unwrap_or("out");
     let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_tmp_owner_only(&tmp)?;
         // Files written through here include the helper config, which
-        // carries the wallet RPC login. The temp file is owner-only
-        // (0600) from the moment it exists (audit L4): the previous
-        // order — write with default permissions, rename, chmod the
-        // final path afterwards — left a window in which the secret
-        // sat on disk readable by other local users.
+        // carries the wallet RPC login. The temp file is created with
+        // mode 0600 already applied (create_tmp_owner_only), so it is
+        // owner-only from the instant it exists — the earlier shape
+        // (File::create at default permissions, then chmod the open
+        // file before writing) still left the creation instant itself
+        // at umask defaults (fix verification, payment task 9 nit).
+        // The chmod stays as a guard for the one case mode-at-create
+        // cannot cover: a stale temp file with the same name already
+        // on disk, whose permissions the create mode does not reset.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -941,6 +965,35 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "helper-written files must be owner-only from creation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Payment task 9 nit (fix verification): the mode must be right
+    /// AT CREATION, not narrowed after. This stats the temp file at
+    /// the creation instant — it exists, and nothing has been written
+    /// or chmod'ed yet. The File::create control pins the contrast:
+    /// under the process umask the default creation mode is wider
+    /// (0644 at umask 022), so this test can tell the two apart.
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_owner_only_at_the_creation_instant() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_out_dir("atomic-perms-instant");
+        let tmp = dir.join(".config.json.tmp-test");
+        let f = create_tmp_owner_only(&tmp).unwrap();
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the temp file must be 0600 at the instant it exists, before any write or chmod"
+        );
+        drop(f);
+        let control = dir.join("control");
+        std::fs::File::create(&control).unwrap();
+        let cmode = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+        assert!(
+            cmode & 0o077 != 0,
+            "control: a default File::create is group/other-accessible under this umask (saw {cmode:o})"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
