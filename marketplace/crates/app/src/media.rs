@@ -185,6 +185,9 @@ fn build_worker_command(
         // (read-only, for the dynamic loader), /dev, its own binary
         // at /worker, the input at /in, and a scratch dir at /work
         // (the pipeline tmp dir) holding the output. No network.
+        // /lib64 is bound with --ro-bind-try (fix verification CM2):
+        // some distributions have no /lib64 at all, and a plain
+        // --ro-bind of a missing source fails the whole spawn.
         let scratch = out_path.parent().unwrap_or(std::path::Path::new("/"));
         let out_name = out_path.file_name().unwrap_or_default();
         let mut cmd = tokio::process::Command::new("bwrap");
@@ -193,7 +196,7 @@ fn build_worker_command(
             .arg("--tmpfs").arg("/")
             .arg("--ro-bind").arg("/usr").arg("/usr")
             .arg("--ro-bind").arg("/lib").arg("/lib")
-            .arg("--ro-bind").arg("/lib64").arg("/lib64")
+            .arg("--ro-bind-try").arg("/lib64").arg("/lib64")
             .arg("--dev").arg("/dev")
             .arg("--ro-bind").arg(worker_path).arg("/worker")
             .arg("--ro-bind").arg(in_path).arg("/in")

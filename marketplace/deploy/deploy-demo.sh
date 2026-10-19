@@ -57,12 +57,14 @@ BIN_DIR="${MARKETPLACE_BIN_DIR:-}"
 BUILD_USER="${MARKETPLACE_BUILD_USER:-${SUDO_USER:-}}"
 BUILD_WORK=""
 SQL_TMP=""
+SMOKE_DIR=""
 
 say() { printf '%s\n' "deploy-demo: $*"; }
 die() { printf '%s\n' "deploy-demo: ERROR: $*" >&2; exit 1; }
 cleanup() {
     if [ -n "$BUILD_WORK" ]; then rm -rf "$BUILD_WORK"; fi
     if [ -n "$SQL_TMP" ]; then rm -f "$SQL_TMP"; fi
+    if [ -n "$SMOKE_DIR" ]; then rm -rf "$SMOKE_DIR"; fi
 }
 trap cleanup EXIT INT TERM
 
@@ -96,6 +98,21 @@ fi
 if grep -Eq '^[[:space:]]*DEPLOY_PROFILE[[:space:]]*=[[:space:]]*production' "$EFFECTIVE_ENV"; then
     die "effective env ($EFFECTIVE_ENV) uses the production profile — this script deploys the demo only."
 fi
+
+# --- Bubblewrap: the worker sandbox ships ON (audit CM2) -------------
+# The demo env template sets MEDIA_WORKER_SANDBOX=bwrap, so the media
+# worker runs sandboxed (no network; a read-only root with only the
+# worker, its input and a per-job scratch dir). That needs bubblewrap
+# on the host — install it now, and the smoke test further down fails
+# the deploy if the sandbox does not actually confine the worker.
+# Silently shipping the worker unconfined is the failure this prevents.
+if ! command -v bwrap >/dev/null 2>&1; then
+    say "installing bubblewrap (the demo runs the media worker sandboxed)..."
+    apt-get update -qq && apt-get install -y bubblewrap \
+        || die "bubblewrap install failed — install it manually, or remove MEDIA_WORKER_SANDBOX=bwrap from the env template if this host truly cannot sandbox (the worker then runs unconfined; the threat model §T6 says what that means)."
+fi
+command -v bwrap >/dev/null 2>&1 || die "bubblewrap (bwrap) is required: the demo env enables the media worker sandbox."
+command -v curl >/dev/null 2>&1 || die "curl is required (service health check and the sandbox smoke test)."
 
 APP_BIN=""; WORKER_BIN=""
 if [ -n "$BIN_DIR" ]; then
@@ -169,6 +186,48 @@ if [ ! -f "$ENV_FILE" ]; then
 else
     say "env file $ENV_FILE already exists — left untouched"
 fi
+
+# --- Media worker sandbox smoke test (audit CM2) ------------------------
+# The shipped env turns the worker sandbox ON; prove it confines
+# BEFORE the service starts, or fail the deploy:
+#   (a) the real media-worker must sanitize a sample image inside the
+#       sandbox, run as the application user with the same bwrap shape
+#       crates/app/src/media.rs builds (media.rs uses --ro-bind-try
+#       for /lib64, which some distributions lack);
+#   (b) a probe "worker" in the same sandbox must FAIL to read a
+#       host file the app user can read outside it (and the key file,
+#       when it exists), and FAIL to open a network connection.
+SMOKE_DIR="$(mktemp -d /tmp/marketplace-smoke.XXXXXX)"
+mkdir -p "$SMOKE_DIR/job"
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' \
+    | base64 -d > "$SMOKE_DIR/sample.png"
+printf 'deploy-smoke-host-secret\n' > "$SMOKE_DIR/host-secret.txt"
+KEY_PROBE="$(grep -E '^[[:space:]]*KEY_FILE_PATH[[:space:]]*=' "$EFFECTIVE_ENV" | head -n 1 | cut -d= -f2- | tr -d '[:space:]')"
+[ -n "$KEY_PROBE" ] || KEY_PROBE="/var/lib/marketplace/marketplace.key"
+cat > "$SMOKE_DIR/probe.sh" <<EOF
+#!/usr/bin/sh
+# CM2 deploy smoke probe — runs where the media worker runs. Exit 0
+# only if the key file, a host-readable file and the network are ALL
+# unreachable from inside the sandbox.
+if cat "$KEY_PROBE" >/dev/null 2>&1; then echo "probe: KEY FILE READABLE in sandbox" >&2; exit 1; fi
+if cat "$SMOKE_DIR/host-secret.txt" >/dev/null 2>&1; then echo "probe: host file readable in sandbox" >&2; exit 1; fi
+if curl -m 3 -sf http://127.0.0.1:8080/ >/dev/null 2>&1; then echo "probe: NETWORK REACHABLE in sandbox" >&2; exit 1; fi
+cp "\$1" "\$2"
+echo 10x10
+EOF
+chown -R "$APP_USER:$APP_USER" "$SMOKE_DIR"
+SANDBOX_SHAPE="--unshare-net --die-with-parent --tmpfs / --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 --dev /dev"
+if ! su "$APP_USER" -s /bin/sh -c "bwrap $SANDBOX_SHAPE --ro-bind /usr/local/bin/media-worker /worker --ro-bind '$SMOKE_DIR/sample.png' /in --bind '$SMOKE_DIR/job' /work -- /worker /in /work/out.png" > "$SMOKE_DIR/worker.stdout" 2> "$SMOKE_DIR/worker.stderr"; then
+    cat "$SMOKE_DIR/worker.stderr" >&2 || true
+    die "sandbox smoke test FAILED: the media worker could not sanitize a sample image inside bwrap (see output above). The deploy stops here rather than shipping the worker unconfined."
+fi
+[ -s "$SMOKE_DIR/job/out.png" ] || die "sandbox smoke test FAILED: the sandboxed worker produced no output file."
+if ! su "$APP_USER" -s /bin/sh -c "bwrap $SANDBOX_SHAPE --ro-bind '$SMOKE_DIR/probe.sh' /worker --ro-bind '$SMOKE_DIR/sample.png' /in --bind '$SMOKE_DIR/job' /work -- /usr/bin/sh /worker /in /work/probe.out" > "$SMOKE_DIR/probe.stdout" 2> "$SMOKE_DIR/probe.stderr"; then
+    cat "$SMOKE_DIR/probe.stderr" >&2 || true
+    die "sandbox smoke test FAILED: the probe worker escaped confinement (see output above). The deploy stops here rather than shipping a sandbox that does not confine."
+fi
+rm -rf "$SMOKE_DIR"; SMOKE_DIR=""
+say "media worker sandbox smoke test passed (worker sanitizes inside bwrap; key file and network unreachable inside it)"
 
 # --- PostgreSQL: roles, database, migrations ---------------------------
 # The postgres superuser is used only to create the two roles and the
