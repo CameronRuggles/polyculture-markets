@@ -80,6 +80,36 @@ async fn stored_image_is_served_end_to_end() {
         .sanitize(PNG_1PX)
         .await
         .expect("media worker must accept a valid 1x1 PNG");
+    // CM1 (Media/Content/Disputes audit): media serves only while
+    // attached to a live listing, so the end-to-end path now goes
+    // through the real attachment: a published listing owns the ref.
+    let pid = std::process::id();
+    let seller_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (username, password_hash, role, status, public_id)
+         VALUES ($1, 'x', 'seller', 'active', $2) RETURNING id",
+    )
+    .bind(format!("mediaserve_seller_{pid}"))
+    .bind(format!("pub-mediaserve-{pid}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let listing_id: i64 = sqlx::query_scalar(
+        "INSERT INTO listings (seller_id, title, description, price_atomic, status, public_id,
+                                pricing_module, destination_module)
+         VALUES ($1, 'Media serve fixture', '', 1000, 'published', $2,
+                 'xmr-only', 'signed-address-pool') RETURNING id",
+    )
+    .bind(seller_id)
+    .bind(format!("pub-mediaserve-listing-{pid}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO listing_media (listing_id, sanitized_ref, width, height) VALUES ($1, $2, 1, 1)")
+        .bind(listing_id)
+        .bind(&stored_ref)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_eq!((w, h), (1, 1), "worker reports the PNG's dimensions");
     assert!(stored_ref.ends_with(".png"), "stored ref carries the png extension: {stored_ref}");
     let (stem, _ext) = stored_ref.rsplit_once('.').unwrap();
