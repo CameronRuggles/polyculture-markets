@@ -4,7 +4,12 @@
 #   test            the full marketplace workspace suite (build
 #                   --locked + cargo test) against a real Postgres
 #                   service, seller-helper's suite included as its
-#                   own job below;
+#                   own job below. The service starts EMPTY, so the
+#                   job first applies marketplace/migrations/*.sql
+#                   exactly as deploy/deploy-demo.sh does in
+#                   production (filename order, schema_migrations
+#                   bookkeeping) — the app never migrates on boot,
+#                   and no test suite creates the schema itself;
 #   security-tools  cargo audit + cargo deny for BOTH workspaces,
 #                   the Q8 Nettle crypto-backend guard, clippy;
 #   seller-helper   the standalone helper's build + tests;
@@ -71,11 +76,29 @@ jobs:
       - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nettle-dev clang pkg-config
+          sudo apt-get install -y nettle-dev clang pkg-config postgresql-client
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - name: Build (locked, all targets)
         run: cargo build --locked --workspace --all-targets
+      - name: Apply migrations (the service database starts empty)
+        # Mirrors deploy/deploy-demo.sh: plain SQL files in filename
+        # order, each recorded in schema_migrations. CI connects as
+        # the service superuser, so the deploy script's migrator-role
+        # separation does not apply here — the bookkeeping shape is
+        # kept so the CI database looks like a production one.
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+          for f in migrations/*.sql; do
+            v=$(basename "$f")
+            if [ "$(psql "$DATABASE_URL" -tAq -c "SELECT 1 FROM schema_migrations WHERE version = '$v'")" = "1" ]; then
+              continue
+            fi
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+            psql "$DATABASE_URL" -q -c "INSERT INTO schema_migrations (version) VALUES ('$v')"
+            echo "applied $v"
+          done
       - name: Full test suite
         env:
           MEDIA_DIR: ${{ runner.temp }}/marketplace-media
