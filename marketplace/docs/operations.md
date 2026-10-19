@@ -26,6 +26,8 @@ it and never reads the environment itself.)
 | `SOURCE_URL` | published source location (AGPL) | unset |
 | `DATABASE_URL` | PostgreSQL connection string | local dev default |
 | `KEY_FILE_PATH` | key file location | `./marketplace.key` |
+| `BLOB_DIR` | message ciphertext files (one `<blob_ref>.asc` per message) | `./blobs` (relative to the working directory) |
+| `MEDIA_DIR` | sanitized listing image files | `./media` (relative to the working directory) |
 
 Network rules, enforced in code:
 
@@ -79,28 +81,73 @@ with a database copy defeats the encryption-at-rest layer. Rules:
 2. Mode 0600, owned by the service account, nothing else reads it.
 3. Losing it is not recoverable by design. Test your backup (§3).
 
-## 3. Database backup and restore
+## 3. Backup and restore — all four parts
 
-Back up with `pg_dump` (compressed). Rolling 30 days (§20).
+An instance is **four** things, and a backup that misses any one of
+them is partial:
+
+1. **The database** — accounts, orders, listings, and the *rows*
+   that point at everything else.
+2. **The key file** (§2) — backed up **separately**, as its own
+   artifact, never inside the database archive.
+3. **The message blob directory** (`BLOB_DIR`) — message ciphertext
+   lives in files, one `<blob_ref>.asc` per message. The database
+   holds only the reference. **A restore without the blob dir lists
+   every conversation's messages and then 404s each download.**
+4. **The media directory** (`MEDIA_DIR`) — sanitized listing
+   images, again files the database only points at. **A restore
+   without the media dir serves every listing with its images
+   missing.**
+
+Set `BLOB_DIR` and `MEDIA_DIR` explicitly in the env file (the
+defaults are relative to the process working directory) so you
+always know which folders these are.
+
+Back up all four. Rolling 30 days (§20).
 
 ```sh
-pg_dump "$DATABASE_URL" | gzip > backup-$(date +%F).sql.gz
+pg_dump "$DATABASE_URL" | gzip > backup-db-$(date +%F).sql.gz
+cp "$KEY_FILE_PATH" backup-keyfile-$(date +%F)          # separate medium, §2
+tar czf backup-blobs-$(date +%F).tar.gz -C "$BLOB_DIR" .
+tar czf backup-media-$(date +%F).tar.gz -C "$MEDIA_DIR" .
 ```
 
-**Restore procedure — tested at the Stage 10 gate** (against a
-scratch database; the production database is never the test):
+**Restore drill — run it before you need it** (against a scratch
+database and scratch directories; the production data is never the
+test):
 
 ```sh
 createdb marketplace_restore_test
-gunzip -c backup-<date>.sql.gz | psql marketplace_restore_test
+gunzip -c backup-db-<date>.sql.gz | psql marketplace_restore_test
 psql marketplace_restore_test -c '\dt'        # tables present
-# point a scratch run at it and log in:
-DATABASE_URL=postgres://…/marketplace_restore_test KEY_FILE_PATH=/path/to/keyfile-copy ./marketplace-app
-dropdb marketplace_restore_test
+mkdir -p /tmp/restore-test/blobs /tmp/restore-test/media
+tar xzf backup-blobs-<date>.tar.gz -C /tmp/restore-test/blobs
+tar xzf backup-media-<date>.tar.gz -C /tmp/restore-test/media
+# Boot a scratch run against the restored set — database, key file,
+# blob dir and media dir all from the backup:
+DATABASE_URL=postgres://…/marketplace_restore_test \
+KEY_FILE_PATH=/path/to/backup-keyfile-<date> \
+BLOB_DIR=/tmp/restore-test/blobs MEDIA_DIR=/tmp/restore-test/media \
+./marketplace-app
 ```
 
-A restore is only complete with the key file (§2): database +
-matching key file = an instance; either alone is a partial copy.
+Then verify the restore **serves content**, not just tables:
+
+- Log in, open a conversation, and **download a message** — the
+  ciphertext must download, not 404. (This is the step that catches
+  a missing blob dir.)
+- Open a listing that has an image — **the image must load**. (This
+  catches a missing media dir.)
+
+Only then tear down:
+
+```sh
+dropdb marketplace_restore_test
+rm -rf /tmp/restore-test
+```
+
+Database + matching key file + blob dir + media dir = an instance;
+any subset is a partial copy.
 
 ## 4. Retention (spec §20)
 
@@ -148,7 +195,8 @@ claiming a purge that does not happen.
 
 ## 6. Upgrades
 
-1. Back up (§3) — database and key file, separately.
+1. Back up (§3) — database, key file, blob dir and media dir;
+   the key file separately from the rest.
 2. Re-run `deploy/deploy-demo.sh` (demo) or replace the binary and
    restart the unit (manual installs). Migrations apply in glob
    order, each at most once; there are no down-migrations — a bad
@@ -167,8 +215,10 @@ claiming a purge that does not happen.
 - [ ] `docs/unverified.md` reviewed; every open item is disclosed
       on the instance Limitations page or accepted in writing.
 - [ ] Backup restored into a scratch database and the app booted
-      against it (§3).
-- [ ] Key file backup verified present and separate (§2).
+      against it (§3), with a message download and a listing image
+      verified against the restored set.
+- [ ] Key file backup verified present and separate (§2); blob
+      dir and media dir backups verified present (§3).
 - [ ] `/limitations` values match the intended configuration.
 - [ ] For mainnet: PRE-MAINNET-CONFIRMATION-SHEET section 1 signed.
       Absent that signature, the instance stays on stagenet.
