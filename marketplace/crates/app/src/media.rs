@@ -16,6 +16,13 @@
 //!   the pipeline tmp dir, deleted when the job ends. In the sandbox
 //!   that directory alone is bound at `/work`, so a worker can never
 //!   see another job's input or output.
+//! - **Bounded admission.** At most `MAX_CONCURRENT_WORKERS` running
+//!   plus `MAX_UPLOAD_QUEUE` (4) waiting jobs are in the system at
+//!   once. Admission is taken before an upload body is written to
+//!   disk (and the HTTP handler probes it before buffering the body
+//!   at all); past the bound the answer is `MediaError::Busy` →
+//!   HTTP 503, immediately. Uploads never pile up unbounded behind
+//!   the worker semaphore.
 //! - **Optional sandbox wrapper.** When the deployment sets
 //!   `MEDIA_WORKER_SANDBOX=bwrap` and provides bubblewrap, each
 //!   worker runs inside it: no network namespace, a tmpfs root with
@@ -39,9 +46,23 @@ use tokio::sync::Semaphore;
 /// CM2: at most this many media workers run at once, process-wide.
 pub const MAX_CONCURRENT_WORKERS: usize = 2;
 
+/// CM2 (fix verification): at most this many uploads may WAIT for a
+/// worker slot. Running + waiting is therefore bounded at
+/// `MAX_CONCURRENT_WORKERS + MAX_UPLOAD_QUEUE` (6) jobs in the
+/// system; an upload beyond that is refused (`MediaError::Busy`,
+/// HTTP 503) BEFORE its body is written anywhere, instead of piling
+/// up in memory behind the worker semaphore without limit — the
+/// exact hole the verification found in the first CM2 fix.
+pub const MAX_UPLOAD_QUEUE: usize = 4;
+
 fn worker_slots() -> &'static Semaphore {
     static SLOTS: OnceLock<Semaphore> = OnceLock::new();
     SLOTS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_WORKERS))
+}
+
+fn admission_slots() -> &'static Semaphore {
+    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_WORKERS + MAX_UPLOAD_QUEUE))
 }
 
 #[derive(Clone)]
@@ -56,6 +77,10 @@ pub enum MediaError {
     TooLarge,
     Rejected,
     WorkerFailed,
+    /// The bounded upload queue is full (CM2): the upload was
+    /// refused before its body was buffered or written to disk.
+    /// Callers answer 503.
+    Busy,
 }
 
 impl MediaPipeline {
@@ -93,6 +118,16 @@ impl MediaPipeline {
         let _ = tokio::fs::rename(&from, &to).await;
     }
 
+    /// True when every admission place (running + queued) is taken.
+    /// The upload handler probes this BEFORE buffering a request body,
+    /// so a saturated pipeline refuses excess uploads without reading
+    /// them at all. (A probe, by nature racy: the hard bound is the
+    /// admission permit taken inside `sanitize_with_timeout`, which
+    /// also answers `Busy` → 503 if the last place went meanwhile.)
+    pub fn admission_saturated(&self) -> bool {
+        admission_slots().try_acquire().is_err()
+    }
+
     /// Sanitize raw upload bytes. On success returns (stored_ref, width, height).
     pub async fn sanitize(&self, bytes: &[u8]) -> Result<(String, i32, i32), MediaError> {
         self.sanitize_with_timeout(bytes, Duration::from_secs(10)).await
@@ -108,6 +143,16 @@ impl MediaPipeline {
         if bytes.len() > 5 * 1024 * 1024 {
             return Err(MediaError::TooLarge);
         }
+        // CM2 (fix verification): admission BEFORE anything is
+        // written to disk. A job holds its admission permit for its
+        // whole life (running or queued for a worker), so at most
+        // MAX_CONCURRENT_WORKERS + MAX_UPLOAD_QUEUE uploads are ever
+        // in the system; the next one is refused at once.
+        let _admission = match admission_slots().try_acquire() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Err(MediaError::Busy),
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(MediaError::WorkerFailed),
+        };
         tokio::fs::create_dir_all(&self.tmp_dir).await.map_err(|_| MediaError::WorkerFailed)?;
         tokio::fs::create_dir_all(&self.media_dir).await.map_err(|_| MediaError::WorkerFailed)?;
         let stem = crate::db::public_id("");

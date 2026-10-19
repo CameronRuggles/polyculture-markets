@@ -1773,6 +1773,13 @@ async fn listing_media(
     if l.seller_id != sess.account_id {
         return (StatusCode::FORBIDDEN, "Not your listing").into_response();
     }
+    // CM2 (fix verification): when the media pipeline is saturated
+    // (2 workers running + 4 queued), refuse BEFORE the multipart
+    // body is buffered at all. The hard bound is the admission permit
+    // inside sanitize, which answers Busy the same way below.
+    if st.media.admission_saturated() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Media worker busy — try again in a moment").into_response();
+    }
     let mut csrf_ok = false;
     let mut bytes: Option<Vec<u8>> = None;
     while let Ok(Some(field)) = mp.next_field().await {
@@ -1802,6 +1809,9 @@ async fn listing_media(
             Redirect::to("/seller").into_response()
         }
         Err(crate::media::MediaError::TooLarge) => (StatusCode::BAD_REQUEST, "Image over 5 MiB").into_response(),
+        Err(crate::media::MediaError::Busy) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "Media worker busy — try again in a moment").into_response()
+        }
         Err(crate::media::MediaError::Rejected) => {
             (StatusCode::BAD_REQUEST, "Image rejected (JPEG/PNG, max 4096x4096)").into_response()
         }
