@@ -163,13 +163,14 @@ async fn make_account(pool: &PgPool, role: &str, password: &str) -> (i64, String
 
 /// Enroll an account in TOTP at the library layer (the keyfile must be
 /// the server's, so the web layer can decrypt). Returns the secret.
-/// NOTE: enrollment confirmation must NOT consume the current step —
-/// the locked Stage 9 suite confirms and then presents the same code
-/// at the step-up gate.
+/// NOTE: enrollment confirmation CONSUMES its step (owner decision
+/// 2026-10-18, applied 2026-10-19), so this helper confirms with
+/// the PREVIOUS step's code — leaving the current step fresh for
+/// the gate presentations these tests make.
 async fn enroll(pool: &PgPool, kf: &KeyFile, account_id: i64) -> Vec<u8> {
     let b32 = moderation::totp_begin(pool, kf, account_id).await.unwrap();
     let secret = totp::base32_decode(&b32).unwrap();
-    let c = code(&secret, 0);
+    let c = code(&secret, -30);
     moderation::totp_confirm(pool, kf, account_id, &c).await.unwrap();
     assert!(moderation::totp_enrolled(pool, account_id).await.unwrap());
     secret
@@ -971,16 +972,29 @@ async fn moderator_disclosures_and_seller_approval_need_fresh_code() {
     app::orders::apply_action(&pool, &order, "dispute", buyer).await.unwrap();
     let dispute = app::disputes::dispute_for_order(&pool, order.id).await.unwrap().unwrap();
     const MARKER: &str = "ACCTSEC-DISCLOSURE-MARKER-7f3";
-    app::disputes::submit_disclosure(
-        &pool,
-        &srv.keyfile,
-        dispute.id,
-        buyer,
-        &format!("the seller said: {MARKER}"),
-        "detached-signature-placeholder",
-    )
-    .await
-    .unwrap();
+    // Plant the disclosure row directly: this test needs a stored
+    // disclosure to exercise the moderator unlock gate, not the
+    // submission path. (It previously used the library-level
+    // detached-signature submit_disclosure, retired 2026-10-19 in
+    // the verification-fix batch's owner-decided amendment pass —
+    // the unwrap disclosure is the only submission path now.)
+    {
+        let content = serde_json::json!({
+            "message": format!("the seller said: {MARKER}"),
+            "signature": "unwrap",
+        });
+        let enc = srv.keyfile.encrypt(&serde_json::to_vec(&content).unwrap());
+        sqlx::query(
+            "INSERT INTO disclosures (dispute_id, submitted_by, content_enc, signature_status)
+             VALUES ($1, $2, $3, 'unverified_claim')",
+        )
+        .bind(dispute.id)
+        .bind(buyer)
+        .bind(&enc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
 
     // A moderator (enrolled) looks at the dispute: the disclosure is
     // NOT rendered until a fresh code unlocks it for this session.

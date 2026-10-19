@@ -1396,3 +1396,31 @@ async fn global_ceiling_new_account_budget_and_registration_cap() {
 
     cleanup(&pool, &[alice, bob]).await;
 }
+
+// ---------------------------------------------------------------------------
+// Task 11a (owner decision 2026-10-18): TOTP enrollment
+// confirmation consumes its step — the same code cannot then be
+// presented at a step-up gate.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn enrollment_confirm_consumes_its_step() {
+    let Some(pool) = pool().await else { return };
+    let srv = test_server(&pool).await;
+    let (id, _u) = make_account(&pool, "buyer", PW).await;
+    let b32 = moderation::totp_begin(&pool, &srv.keyfile, id).await.unwrap();
+    let secret = totp::base32_decode(&b32).unwrap();
+    let c = code(&secret, 0);
+    moderation::totp_confirm(&pool, &srv.keyfile, id, &c).await.unwrap();
+    let err = moderation::verify_totp_gate(&pool, &srv.keyfile, id, &c)
+        .await
+        .expect_err("the enrollment code was consumed by confirmation");
+    assert!(matches!(err, ModError::TotpReplayed), "got {err:?}");
+    // The next step's code works as usual.
+    moderation::verify_totp_gate(&pool, &srv.keyfile, id, &code(&secret, 30))
+        .await
+        .unwrap();
+
+    cleanup(&pool, &[id]).await;
+    srv.stop();
+}

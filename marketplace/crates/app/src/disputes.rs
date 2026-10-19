@@ -216,56 +216,18 @@ async fn other_party_cert(
     Ok(cert)
 }
 
-/// Submit a voluntary disclosure. `message` and `signature` are
-/// form-layer normalized (Q13) by the caller contract — this function
-/// applies `normalize_form_lines` itself so the verified bytes, the
-/// stored bytes, and the displayed bytes are the same bytes.
-pub async fn submit_disclosure(
-    pool: &PgPool,
-    kf: &KeyFile,
-    dispute_id: i64,
-    submitter_id: i64,
-    message_raw: &str,
-    signature_raw: &str,
-) -> Result<String, DisputeError> {
-    let dispute = get_dispute(pool, dispute_id).await?.ok_or(DisputeError::NotFound)?;
-    if dispute.state != "open" {
-        return Err(DisputeError::BadState);
-    }
-    let order = crate::orders::order_by_public_id(pool, &order_public_id(pool, dispute.order_id).await?)
-        .await
-        .ok_or(DisputeError::NotFound)?;
-    if submitter_id != order.buyer_id && submitter_id != order.seller_id {
-        return Err(DisputeError::Forbidden);
-    }
-    let message = normalize(message_raw)?;
-    let signature = normalize(signature_raw)?;
-    if message.is_empty() || signature.is_empty() || message.len() > 65_536 || signature.len() > 16_384 {
-        return Err(DisputeError::BadInput);
-    }
-    let cert = other_party_cert(pool, dispute.order_id, submitter_id).await?;
-    let verified = cert
-        .as_deref()
-        .map(|c| crate::keys::verify_detached(c, message.as_bytes(), signature.as_bytes()))
-        .unwrap_or(false);
-    let status = if verified { "verified" } else { "unverified_claim" };
-    let content = serde_json::to_vec(&DisclosureContent { message, signature })
-        .map_err(|_| DisputeError::Db)?;
-    let enc = kf.encrypt(&content);
-    sqlx::query(
-        "INSERT INTO disclosures (dispute_id, submitted_by, content_enc, signature_status)
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(dispute_id)
-    .bind(submitter_id)
-    .bind(&enc)
-    .bind(status)
-    .execute(pool)
-    .await
-    .map_err(|_| DisputeError::Db)?;
-    Ok(status.to_string())
-}
-
+/// RETIRED (owner decision 2026-10-18; applied 2026-10-19 in the
+/// verification-fix batch's locked-suite pass): the detached-
+/// signature `submit_disclosure` that used to sit here. It verified
+/// a message/signature pair against the other party's pinned key,
+/// but conversation messages are signed INLINE — no detached
+/// signature ever exists for them, so the function could only ever
+/// be exercised by tests, never by the product (the web layer has
+/// used the unwrap path below since MM1). The library surface now
+/// matches the product: `submit_disclosure_unwrapped` is the only
+/// way in. The locked Stage 9 disclosure scenarios were amended in
+/// the same pass to run through it.
+///
 /// Submit a disclosure as ONE paste: the output of
 /// `gpg --unwrap --armor` on the original encrypted message
 /// (messaging audit MM1). The pre-MM1 form asked for plaintext plus a
@@ -393,10 +355,6 @@ pub async fn submit_disclosure_unwrapped(
     Ok(status.to_string())
 }
 
-fn normalize(raw: &str) -> Result<String, DisputeError> {
-    let lines = modules_api::normalize_form_lines(raw).map_err(|_| DisputeError::BadInput)?;
-    Ok(lines.join("\n"))
-}
 
 async fn order_public_id(pool: &PgPool, order_id: i64) -> Result<String, DisputeError> {
     sqlx::query_scalar("SELECT public_id FROM orders WHERE id = $1")

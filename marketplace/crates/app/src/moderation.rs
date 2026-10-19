@@ -292,14 +292,18 @@ pub async fn totp_begin(pool: &PgPool, kf: &KeyFile, account_id: i64) -> Result<
 /// never silently replace a live secret — the only path off is
 /// `totp_disable`, which demands a current code.
 ///
-/// NOTE (locked-suite constraint): confirmation deliberately does
-/// NOT record the accepted step in `totp_last_step`. The locked
-/// Stage 9 gate suite confirms enrollment with the current code and
-/// then presents the SAME code at the step-up gate; consuming the
-/// step here would fail that suite. The gate is therefore the first
-/// consumer of a step, and everything after enrollment (login,
-/// step-up) is replay-protected. Flagged in the fix report for an
-/// owner-decision amendment if stricter semantics are wanted.
+/// AMENDED (owner decision 2026-10-18, applied 2026-10-19 in the
+/// verification-fix batch's locked-suite pass): confirmation DOES
+/// record the accepted step in `totp_last_step` — the enrollment
+/// code is consumed like any other. The earlier text of this note
+/// recorded why it did not: the locked Stage 9 suite confirmed with
+/// the current code and then presented the SAME code at the gate,
+/// so the enrollment code could be used twice. The owner decided
+/// to close that seam; the Stage 9 suite was amended in the same
+/// pass to expect the replay refusal and use the next step at the
+/// gate. The verification is step-exact and the activation is a
+/// conditional update, so a racing confirmation of the same step
+/// also resolves to exactly one success.
 pub async fn totp_confirm(pool: &PgPool, kf: &KeyFile, account_id: i64, code: &str) -> Result<(), ModError> {
     let row: Option<(Option<Vec<u8>>, Option<OffsetDateTime>)> = sqlx::query_as(
         "SELECT totp_pending_enc, totp_enabled_at FROM accounts WHERE id = $1",
@@ -319,18 +323,22 @@ pub async fn totp_confirm(pool: &PgPool, kf: &KeyFile, account_id: i64, code: &s
     };
     let secret = kf.decrypt(&enc).ok_or(ModError::Db)?;
     let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-    if !crate::totp::verify(&secret, code, now) {
+    let Some(step) = crate::totp::verify_step(&secret, code, now) else {
         return Err(ModError::TotpInvalid);
-    }
-    sqlx::query(
+    };
+    let upd = sqlx::query(
         "UPDATE accounts SET totp_secret_enc = totp_pending_enc, totp_pending_enc = NULL,
-                totp_enabled_at = now()
-          WHERE id = $1",
+                totp_enabled_at = now(), totp_last_step = $2
+          WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)",
     )
     .bind(account_id)
+    .bind(step as i64)
     .execute(pool)
     .await
     .map_err(|_| ModError::Db)?;
+    if upd.rows_affected() == 0 {
+        return Err(ModError::TotpReplayed);
+    }
     Ok(())
 }
 

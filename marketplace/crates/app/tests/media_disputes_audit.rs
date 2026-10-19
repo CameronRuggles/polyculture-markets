@@ -89,7 +89,10 @@ async fn make_account(pool: &PgPool, role: &str) -> (i64, String) {
 async fn enroll(pool: &PgPool, kf: &KeyFile, account_id: i64) -> Vec<u8> {
     let b32 = moderation::totp_begin(pool, kf, account_id).await.unwrap();
     let secret = totp::base32_decode(&b32).unwrap();
-    let c = code(&secret, 0);
+    // Enrollment confirmation consumes its step (owner decision
+    // 2026-10-18): confirm with the previous step's code so the
+    // current step stays fresh for gate presentations.
+    let c = code(&secret, -30);
     moderation::totp_confirm(pool, kf, account_id, &c).await.unwrap();
     assert!(moderation::totp_enrolled(pool, account_id).await.unwrap());
     secret

@@ -997,7 +997,17 @@ async fn cert_refresh_accepts_new_signatures_only() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(stored, CERT_DAVE_EXTENDED.as_bytes(), "stored cert is the refresh");
+    // AMENDED (verification-fix V7, 2026-10-19): the stored
+    // certificate is the MERGE of the stored and submitted certs,
+    // not byte-equal to the submission — the old replace semantics
+    // let a stale export silently drop a revocation. What must
+    // hold now: the stored cert is still dave's key, it PASSES the
+    // upload policy (the short-expiry certificate on its own no
+    // longer does — the extension took effect), and it is not the
+    // pre-refresh bytes.
+    let info = app::keys::validate_cert(&stored).expect("the stored merged certificate validates");
+    assert_eq!(info.fingerprint, DAVE_FPR, "the refresh kept dave's key");
+    assert_ne!(stored, CERT_DAVE_SHORT.as_bytes(), "the refresh changed the stored certificate");
 
     // New key material (an added subkey): refused, stored cert kept.
     let r = refresh(CERT_DAVE_ADDED.to_string(), true).await;
@@ -1012,7 +1022,7 @@ async fn cert_refresh_accepts_new_signatures_only() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(stored2, CERT_DAVE_EXTENDED.as_bytes());
+    assert_eq!(stored2, stored, "a refused refresh leaves the stored certificate untouched");
 
     // A different key entirely: refused.
     let r = refresh(CERT_BOB.to_string(), true).await;
