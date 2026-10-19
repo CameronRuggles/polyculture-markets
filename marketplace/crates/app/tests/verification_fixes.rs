@@ -1265,3 +1265,49 @@ async fn refresh_merges_so_a_stale_copy_cannot_drop_a_revocation() {
 
     cleanup(&pool, &[alice, carol]).await;
 }
+
+// ---------------------------------------------------------------------------
+// Task 8 (V8): non-whitespace before the armor BEGIN line is
+// refused, and nothing is stored.
+// ---------------------------------------------------------------------------
+
+fn blob_file_count() -> usize {
+    let dir = app::messages::blob_dir();
+    std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn text_above_the_armor_is_refused_and_nothing_is_stored() {
+    let Some(pool) = pool().await else { return };
+    let _guard = fixture_guard(&pool).await;
+    let (alice, _a) = make_account(&pool, "buyer", PW).await;
+    let (bob, _b) = make_account(&pool, "seller", PW).await;
+    install_cert(&pool, alice, CERT_ALICE).await;
+    install_cert(&pool, bob, CERT_BOB).await;
+    let conv = app::messages::find_or_create_direct(&pool, alice, bob).await.unwrap();
+    let _msg_serial = msg_lock().lock().await;
+
+    let before = blob_file_count();
+    let pasted = format!("the usual address, thanks\n{MSG_300_UNSIGNED}");
+    let err = app::messages::send_message(&pool, conv, alice, pasted.as_bytes())
+        .await
+        .expect_err("plaintext above the armor must be refused");
+    assert!(
+        matches!(err, app::messages::SendError::Envelope(envelope::EnvelopeError::Malformed)),
+        "got {err:?}"
+    );
+    assert_eq!(blob_file_count(), before, "no blob file was written");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM encrypted_messages WHERE conversation_id = $1")
+        .bind(conv)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "no message row was stored");
+
+    // Control: the same fixture on its own is accepted.
+    app::messages::send_message(&pool, conv, alice, MSG_300_UNSIGNED.as_bytes())
+        .await
+        .unwrap();
+
+    cleanup(&pool, &[alice, bob]).await;
+}
