@@ -106,6 +106,10 @@ fn normalize_crlf(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// Wrong step-up passphrases tolerated per account before the
+/// session is revoked (verification-fix V6).
+pub const STEPUP_FAILURE_LIMIT: i32 = 5;
+
 /// Account Security Audit task 2 (AM3; also discharges payment-audit
 /// M1): the step-up for identity-changing actions. A session alone is
 /// never enough: the caller must re-prove the CURRENT PASSPHRASE,
@@ -113,12 +117,25 @@ fn normalize_crlf(text: &str) -> String {
 /// goes through the per-account scope so step-up attempts cannot
 /// starve the login gate. On success the caller performs the action
 /// and records an inbox notice (see `stepup_notice`).
+///
+/// Verification-fix V6: a WRONG PASSPHRASE is counted per account
+/// (atomically, in the database); at STEPUP_FAILURE_LIMIT the
+/// session is revoked and the account is notified — before this
+/// fix, guesses at the step-up were free except for the request
+/// throttle, so a stolen session could be used to learn the
+/// passphrase at 60 tries a minute. A successful step-up resets
+/// the count. And every refusal returns the SAME generic error:
+/// saying which factor failed told a session thief exactly what
+/// they had already guessed right. (TOTP failures keep their own
+/// counting in the shared gate and do not touch this counter.)
 async fn step_up(
     st: &AppState,
+    token: &str,
     sess: &sessions::Session,
     password: &str,
     totp_code: Option<&str>,
 ) -> Result<(), String> {
+    const GENERIC: &str = "Step-up verification failed.";
     let stored: Option<String> = sqlx::query_scalar("SELECT password_hash FROM accounts WHERE id = $1")
         .bind(sess.account_id)
         .fetch_optional(&st.pool)
@@ -126,24 +143,68 @@ async fn step_up(
         .ok()
         .flatten();
     let Some(stored) = stored else {
-        return Err("Step-up verification failed.".into());
+        return Err(GENERIC.into());
     };
     let scope = format!("acct:{}", sess.account_id);
     match st.hash_guard.verify_scoped(&scope, password, &stored).await {
         Ok(true) => {}
-        Ok(false) => return Err("Step-up verification failed: the passphrase did not verify.".into()),
+        Ok(false) => {
+            note_stepup_passphrase_failure(st, token, sess.account_id).await;
+            return Err(GENERIC.into());
+        }
         Err(HashError::Busy) => return Err("Step-up verification failed: busy, retry shortly.".into()),
-        Err(_) => return Err("Step-up verification failed.".into()),
+        Err(_) => return Err(GENERIC.into()),
     }
     if crate::moderation::totp_enrolled(&st.pool, sess.account_id).await.unwrap_or(false) {
         let Some(code) = totp_code.filter(|c| !c.trim().is_empty()) else {
-            return Err("Step-up verification failed: a TOTP code is required for this account.".into());
+            return Err(GENERIC.into());
         };
-        if let Err(e) = crate::moderation::verify_totp_gate(&st.pool, &st.keyfile, sess.account_id, code).await {
-            return Err(format!("Step-up verification failed: TOTP code refused ({e:?})."));
+        if crate::moderation::verify_totp_gate(&st.pool, &st.keyfile, sess.account_id, code).await.is_err() {
+            return Err(GENERIC.into());
         }
     }
+    // Success: the failure count starts over.
+    let _ = sqlx::query("UPDATE accounts SET stepup_fail_count = 0 WHERE id = $1 AND stepup_fail_count <> 0")
+        .bind(sess.account_id)
+        .execute(&st.pool)
+        .await;
     Ok(())
+}
+
+/// Count one wrong step-up passphrase (verification-fix V6). At
+/// the limit, revoke the session that is being misused and post
+/// the account a notice; the counter then restarts, so a later
+/// session is judged on its own failures.
+async fn note_stepup_passphrase_failure(st: &AppState, token: &str, account_id: i64) {
+    let count: Option<i32> = sqlx::query_scalar(
+        "UPDATE accounts SET stepup_fail_count = stepup_fail_count + 1
+          WHERE id = $1 RETURNING stepup_fail_count",
+    )
+    .bind(account_id)
+    .fetch_one(&st.pool)
+    .await
+    .ok();
+    if count.unwrap_or(0) >= STEPUP_FAILURE_LIMIT {
+        let _ = sqlx::query("UPDATE accounts SET stepup_fail_count = 0 WHERE id = $1")
+            .bind(account_id)
+            .execute(&st.pool)
+            .await;
+        let _ = sqlx::query(
+            "UPDATE sessions SET revoked_at = now()
+              WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(crate::sessions::hash_token(token).to_vec())
+        .execute(&st.pool)
+        .await;
+        let _ = crate::orders::notify(
+            &st.pool,
+            account_id,
+            "stepup_session_revoked",
+            "a signed-in session was revoked after 5 wrong passphrases at a security \
+             confirmation; if this was not you, your session may have been stolen",
+        )
+        .await;
+    }
 }
 
 /// The inbox notice an identity-changing action leaves behind (task
@@ -1391,6 +1452,7 @@ struct PaymentIdentityForm {
 /// the refusal redirect when the gate fails.
 async fn seller_payment_gate(
     st: &AppState,
+    token: &str,
     sess: &sessions::Session,
     password: Option<&str>,
     totp: Option<&str>,
@@ -1406,7 +1468,7 @@ async fn seller_payment_gate(
             Redirect::to("/seller?pmsg=Step-up_failed").into_response(),
         );
     };
-    match step_up(st, sess, pw, totp).await {
+    match step_up(st, token, sess, pw, totp).await {
         Ok(()) => None,
         Err(_) => Some(Redirect::to("/seller?pmsg=Step-up_failed").into_response()),
     }
@@ -1430,7 +1492,7 @@ async fn payment_identity_post(
     if authorize("POST", "/seller/payment-identity", Some(role_from_str(&role_s))) != Decision::Allow {
         return (StatusCode::FORBIDDEN, "Sellers only").into_response();
     }
-    if let Some(r) = seller_payment_gate(&st, &sess, f.password.as_deref(), f.totp.as_deref()).await {
+    if let Some(r) = seller_payment_gate(&st, &_t, &sess, f.password.as_deref(), f.totp.as_deref()).await {
         return r;
     }
     // The form field arrives through the form layer; the address value
@@ -1510,7 +1572,7 @@ async fn payment_batch_post(
     if !csrf_ok {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
-    if let Some(r) = seller_payment_gate(&st, &sess, stepup_password.as_deref(), stepup_totp.as_deref()).await {
+    if let Some(r) = seller_payment_gate(&st, &_t, &sess, stepup_password.as_deref(), stepup_totp.as_deref()).await {
         return r;
     }
     // The batch text is parsed as JSON and its string values are stored
@@ -1931,7 +1993,7 @@ async fn upload_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) else {
         return security_page_render(&st, &sess, &csrf, Some("Step-up verification failed: enter your current passphrase.".into()), vec![]).await;
     };
-    if let Err(msg) = step_up(&st, &sess, pw, f.totp.as_deref()).await {
+    if let Err(msg) = step_up(&st, &_t, &sess, pw, f.totp.as_deref()).await {
         return security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await;
     }
     if kmod::current_key(&st.pool, sess.account_id).await.ok().flatten().is_some() {
@@ -1982,7 +2044,7 @@ async fn rotate_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) else {
         return security_page_render(&st, &sess, &csrf, Some("Step-up verification failed: enter your current passphrase.".into()), vec![]).await;
     };
-    if let Err(msg) = step_up(&st, &sess, pw, f.totp.as_deref()).await {
+    if let Err(msg) = step_up(&st, &_t, &sess, pw, f.totp.as_deref()).await {
         return security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await;
     }
     let Some((cur_fpr, cur_cert, _v)) = kmod::current_key(&st.pool, sess.account_id).await.ok().flatten() else {
@@ -2066,7 +2128,7 @@ async fn refresh_key(State(st): State<AppState>, headers: HeaderMap, Form(f): Fo
     let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) else {
         return security_page_render(&st, &sess, &csrf, Some("Step-up verification failed: enter your current passphrase.".into()), vec![]).await;
     };
-    if let Err(msg) = step_up(&st, &sess, pw, f.totp.as_deref()).await {
+    if let Err(msg) = step_up(&st, &_t, &sess, pw, f.totp.as_deref()).await {
         return security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await;
     }
     let Some((_cur_fpr, cur_cert, _v)) = kmod::current_key(&st.pool, sess.account_id).await.ok().flatten() else {
@@ -3958,7 +4020,10 @@ async fn totp_begin_h(
     let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) else {
         return security_page_render(&st, &sess, &f.csrf, Some("Step-up verification failed: enter your current passphrase to start TOTP enrollment.".into()), vec![]).await;
     };
-    if let Err(msg) = step_up(&st, &sess, pw, f.totp.as_deref()).await {
+    let Some((token, _, _)) = current_session(&st, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if let Err(msg) = step_up(&st, &token, &sess, pw, f.totp.as_deref()).await {
         return security_page_render(&st, &sess, &f.csrf, Some(msg), vec![]).await;
     }
     match crate::moderation::totp_begin(&st.pool, &st.keyfile, sess.account_id).await {
@@ -4100,7 +4165,7 @@ async fn passphrase_change(
     // for that), so a stolen session + passphrase could change the
     // passphrase and keep the thief's session while signing the
     // owner out everywhere.
-    if let Err(msg) = step_up(&st, &sess, &f.current_password, f.totp.as_deref()).await {
+    if let Err(msg) = step_up(&st, &token, &sess, &f.current_password, f.totp.as_deref()).await {
         return security_page_render(&st, &sess, &f.csrf, Some(msg), vec![]).await;
     }
     let scope = format!("acct:{}", sess.account_id);
@@ -4147,7 +4212,10 @@ async fn recovery_code_issue(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if let Err(msg) = step_up(&st, &sess, &f.password, f.totp.as_deref()).await {
+    let Some((token, _, _)) = current_session(&st, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if let Err(msg) = step_up(&st, &token, &sess, &f.password, f.totp.as_deref()).await {
         return security_page_render(&st, &sess, &f.csrf, Some(msg), vec![]).await;
     }
     let code = recovery::new_recovery_code();

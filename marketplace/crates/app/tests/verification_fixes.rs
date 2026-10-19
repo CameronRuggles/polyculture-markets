@@ -418,6 +418,13 @@ fn location_of(r: &HttpResult) -> String {
     String::new()
 }
 
+/// The security page's status line (where step_up errors render).
+fn status_text(body: &str) -> String {
+    let start = body.find("<p role=\"status\">").expect("status line present") + "<p role=\"status\">".len();
+    let end = body[start..].find("</p>").expect("status line closes") + start;
+    body[start..end].to_string()
+}
+
 async fn stored_hash(pool: &PgPool, account_id: i64) -> String {
     sqlx::query_scalar::<_, String>("SELECT password_hash FROM accounts WHERE id = $1")
         .bind(account_id)
@@ -619,6 +626,91 @@ async fn passphrase_change_and_recovery_issue_require_full_stepup() {
     .await
     .unwrap();
     assert_eq!(unconsumed, 1, "one live recovery code after issuance with a code");
+
+    cleanup(&pool, &[id]).await;
+    srv.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 (V6): wrong step-up passphrases are counted; the fifth
+// revokes the session and posts a notice; the error is one generic
+// text for a wrong passphrase and a wrong code alike.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stepup_failures_counted_session_revoked_generic_error() {
+    let Some(pool) = pool().await else { return };
+    let srv = test_server(&pool).await;
+    let (id, _username) = make_account(&pool, "buyer", PW).await;
+    let secret = enroll(&pool, &srv.keyfile, id).await;
+    let token = session_for(&pool, id).await;
+    let cookie = format!("session={token}");
+    let attempt = |current: &str, code: Option<String>| {
+        let addr = srv.addr;
+        let cookie = cookie.clone();
+        let current = current.to_string();
+        async move {
+            let mut fields = vec![
+                ("csrf", CSRF),
+                ("current_password", current.as_str()),
+                ("new_password", PW2),
+            ];
+            if let Some(c) = &code {
+                fields.push(("totp", c.as_str()));
+            }
+            post_form(addr, "/account/passphrase", Some(&cookie), &fields).await
+        }
+    };
+
+    // Wrong passphrase: generic error (failure #1).
+    let r = attempt("not-the-passphrase", None).await;
+    assert_eq!(r.status, 200);
+    let err_wrong_pw = status_text(&r.body);
+    assert_eq!(err_wrong_pw, "Step-up verification failed.");
+
+    // Right passphrase, WRONG code: the IDENTICAL error text — the
+    // response must not reveal which factor failed. (A code failure
+    // is the gate's business and does not move this counter.)
+    let r = attempt(PW, Some(wrong_code(&secret))).await;
+    assert_eq!(r.status, 200);
+    let err_wrong_code = status_text(&r.body);
+    assert_eq!(
+        err_wrong_pw, err_wrong_code,
+        "wrong passphrase and wrong code must read identically"
+    );
+    let count: i32 = sqlx::query_scalar("SELECT stepup_fail_count FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "only the wrong passphrase counted");
+
+    // Four more wrong passphrases bring the count to five: the
+    // fifth revokes the session and notifies the account.
+    for _ in 0..4 {
+        let r = attempt("not-the-passphrase", None).await;
+        assert_eq!(r.status, 200, "attempts before the limit still render the form");
+    }
+    assert!(
+        has_event(&pool, id, "stepup_session_revoked").await,
+        "the account is told its session was revoked"
+    );
+    let count: i32 = sqlx::query_scalar("SELECT stepup_fail_count FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "the counter restarts after the revocation episode");
+
+    // The sixth attempt rides the revoked session: it never reaches
+    // the form — the session is gone, so it is a login redirect.
+    let r = attempt(PW, Some(code(&secret, 0))).await;
+    assert!(
+        matches!(r.status, 302 | 303) && location_of(&r) == "/login",
+        "sixth attempt is redirected to login, got {} {}",
+        r.status,
+        location_of(&r)
+    );
 
     cleanup(&pool, &[id]).await;
     srv.stop();
