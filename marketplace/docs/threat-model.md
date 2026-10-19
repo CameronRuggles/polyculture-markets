@@ -101,6 +101,20 @@ MEMORY caps are a deployment measure (systemd `MemoryMax=` on the app
 unit), not something the application enforces on its child. There is no
 seccomp profile; the worker is a separate minimal binary that only
 reads one file and writes one file, and the claim ends there.
+(Update, later on 2026-10-19 — media fix verification, CM2 closed:
+admission to the pipeline is now bounded in code — at most two workers
+running plus four uploads queued; a further upload is refused with
+HTTP 503 before its body is buffered or written to disk, so queued
+uploads no longer pile up in memory. Each job's scratch directory is
+its own, deleted when the job ends, and in the sandbox that directory
+alone is bound — a worker cannot see another job's files. And the
+shipped demo deployment now turns the sandbox ON: deploy-demo.sh
+installs bubblewrap, the demo env template sets
+`MEDIA_WORKER_SANDBOX=bwrap`, and the deploy runs the worker once
+under the sandbox on a sample image — plus a probe that must fail to
+read the key file and fail to open a socket — and aborts if either
+check fails. Deployments other than the shipped demo still opt in
+explicitly, as above.)
 
 **T7 — DoS.** Per-account throttles (built: a per-account request throttle on
 signed-in POSTs, plus messaging-layer limits — 60 messages/minute per account,
