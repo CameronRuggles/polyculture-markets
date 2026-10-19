@@ -600,6 +600,7 @@ fn alert_text(code: Option<&str>, n: Option<&str>) -> Option<String> {
         "Step-up_failed" => "Step-up verification failed: enter your current passphrase.".to_string(),
         "address_rejected" => "Primary address rejected: paste exactly one address.".to_string(),
         "identity_saved" => "Payment identity saved.".to_string(),
+        "recovery_pause" => "Payment address changes are paused for 72 hours after an account recovery.".to_string(),
         "batch_missing" => "No batch received: paste the batch JSON or choose the batch file.".to_string(),
         "batch_accepted" => {
             let n: u64 = n.and_then(|v| v.parse().ok())?;
@@ -1191,15 +1192,52 @@ async fn recover(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<R
         .bind(&hash)
         .execute(&st.pool)
         .await;
+    // Verification-fix V3 (OWNER DECISION 2026-10-19): a recovery
+    // code also clears TOTP. Before this decision, recovery reset
+    // only the passphrase and left TOTP on — and since disabling
+    // TOTP itself needs a current code, a lost authenticator meant
+    // a permanently lost account, now that sellers and moderators
+    // must enroll. The recovery code is a ~99-bit single-use secret
+    // shown once; recovery already signs out every session and
+    // flags the profile (recovered_at). If TOTP was on, it is wiped
+    // here (same column set as totp_disable) and the account is
+    // told, on this page and in its inbox. Payment changes are
+    // additionally paused for 72 hours after a recovery — see the
+    // payment-identity handler.
+    let totp_was_on = crate::moderation::totp_enrolled(&st.pool, id).await.unwrap_or(false);
+    if totp_was_on {
+        let _ = sqlx::query(
+            "UPDATE accounts SET totp_secret_enc = NULL, totp_pending_enc = NULL,
+                    totp_enabled_at = NULL, totp_last_step = NULL, totp_fail_count = 0,
+                    totp_locked_until = NULL, totp_lock_notified_at = NULL
+              WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&st.pool)
+        .await;
+        let _ = crate::orders::notify(
+            &st.pool,
+            id,
+            "security_recovery_totp_cleared",
+            "your account was recovered with a recovery code and two-factor authentication \
+             was turned off by the recovery; re-enroll from your security page",
+        )
+        .await;
+    }
     // Fresh recovery code for next time; sessions already revoked by consume.
     let code = recovery::new_recovery_code();
     let _ = db::store_recovery_code(&st.pool, id, &code).await;
+    let totp_note = if totp_was_on {
+        "<p>Two-factor authentication was turned <strong>off</strong> by this recovery — re-enroll from your security page. Payment address changes are paused for 72 hours after a recovery.</p>"
+    } else {
+        ""
+    };
     page(
         &st,
         &headers,
         "Recovered",
         format!(
-            "<h1>Passphrase reset</h1><p>All sessions were signed out.</p><p><strong>New recovery code (shown once): {}</strong></p><p><a href=\"/login\">Log in</a></p>",
+            "<h1>Passphrase reset</h1><p>All sessions were signed out.</p>{totp_note}<p><strong>New recovery code (shown once): {}</strong></p><p><a href=\"/login\">Log in</a></p>",
             esc(&code)
         ),
     )
@@ -1494,6 +1532,32 @@ async fn payment_identity_post(
     }
     if let Some(r) = seller_payment_gate(&st, &_t, &sess, f.password.as_deref(), f.totp.as_deref()).await {
         return r;
+    }
+    // Verification-fix V3 (owner decision 2026-10-19, applying
+    // decision 4's pause): for 72 hours after an account recovery,
+    // an EXISTING payment identity cannot be changed. A recovery
+    // just proved possession of a one-time code, not of the
+    // account's history; the pause gives the real owner — who gets
+    // the recovery notices — three days to react before money can
+    // be redirected. (A first identity set is not a change and is
+    // not paused; recovered_at is stamped by consume_recovery_code.)
+    let recovered_recently: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1
+                        AND recovered_at IS NOT NULL
+                        AND recovered_at > now() - interval '72 hours')",
+    )
+    .bind(sess.account_id)
+    .fetch_one(&st.pool)
+    .await
+    .unwrap_or(false);
+    if recovered_recently
+        && crate::payments::get_identity(&st.pool, sess.account_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return Redirect::to("/seller?pmsg=recovery_pause").into_response();
     }
     // The form field arrives through the form layer; the address value
     // itself is validated untrimmed by modules-api (whitespace-wrapped

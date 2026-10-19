@@ -46,7 +46,7 @@ const CSRF: &str = "verifix-csrf";
 
 // Stagenet payment fixtures shared with the neighbouring suites.
 const PRIMARY_A: &str = "55b6gZhKJ2b6EzvernZJBcPXiZym13w1CfbpDU6sR8aSGpaRbAmU4EMSH3XYXu5U1cSac7B49WRSSBbwQK9by3c7H9AdnFB";
-const PRIMARY_B: &str = "59eRK6LzzfHKDbDPjUiMnwLFvU6ZgT63VfBdTycABz2xHBi5yJZ1T5wGHYyZje1TP6Jfu1QUqCQ4SGr22G23vqJcK7nW3";
+const PRIMARY_B: &str = "57AaCDLE3GeBsgrK513QiUFePcBbSp5QYhn2Q2S1P9DsceUmeVkvBMJBQDFTfS9f21LfhXJSWNGN16mvXQmffGsA7KCVBxh";
 
 // GPG fixtures (app/tests/fixtures/gpg; public certs + ciphertexts).
 const CERT_ALICE: &str = include_str!("fixtures/gpg/cert-alice.asc");
@@ -807,4 +807,113 @@ async fn totp_gate_counters_and_replay_are_atomic() {
 
     cleanup(&pool, &[id, id2]).await;
     let _ = std::fs::remove_dir_all(&kf_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Task 5 (V3, owner decision 2026-10-19): a recovery code also
+// clears TOTP; the account is notified; payment changes pause for
+// 72 hours after the recovery.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recovery_clears_totp_and_pauses_payment_changes() {
+    let Some(pool) = pool().await else { return };
+    let srv = test_server(&pool).await;
+    let pay_cfg = app::payments::PaymentConfig::from_env("vespiary-market", modules_api::Network::Stagenet);
+    let (seller, username) = make_account(&pool, "seller", PW).await;
+    let _secret1 = enroll(&pool, &srv.keyfile, seller).await;
+    app::payments::set_primary_address(&pool, seller, PRIMARY_A, &pay_cfg)
+        .await
+        .unwrap();
+    const RECOVERY_CODE: &str = "VFIX-RECOVERY-CODE-0001";
+    app::db::store_recovery_code(&pool, seller, RECOVERY_CODE).await.unwrap();
+
+    // Recover over HTTP: passphrase reset with the code.
+    let csrf = anon_csrf(srv.addr, "/account/recover").await;
+    let r = post_form(
+        srv.addr,
+        "/account/recover",
+        Some(&format!("csrf={csrf}")),
+        &[
+            ("csrf", csrf.as_str()),
+            ("username", username.as_str()),
+            ("code", RECOVERY_CODE),
+            ("password", PW2),
+        ],
+    )
+    .await;
+    assert_eq!(r.status, 200, "recovery renders: {}", r.body);
+    assert!(r.body.contains("Passphrase reset"), "recovery succeeded");
+    assert!(
+        r.body.contains("Two-factor authentication was turned"),
+        "the recovery page says TOTP was turned off"
+    );
+
+    // TOTP is OFF: the security state says so, and login needs no code.
+    assert!(
+        !moderation::totp_enrolled(&pool, seller).await.unwrap(),
+        "recovery cleared the TOTP enrollment"
+    );
+    let r = login_attempt(srv.addr, &username, PW2, None, None).await;
+    assert!(
+        session_cookie_of(&r).is_some(),
+        "after recovery, login needs no TOTP code"
+    );
+    // The inbox notice exists.
+    assert!(
+        has_event(&pool, seller, "security_recovery_totp_cleared").await,
+        "the recovery posted a TOTP-cleared notice"
+    );
+
+    // Re-enroll (sellers need TOTP for payment changes), then try
+    // to change the payment address inside the 72-hour pause.
+    let secret2 = enroll(&pool, &srv.keyfile, seller).await;
+    let token = session_for(&pool, seller).await;
+    let cookie = format!("session={token}");
+    let change = |addr: &str, code_s: String| {
+        let http = srv.addr;
+        let cookie = cookie.clone();
+        let addr = addr.to_string();
+        async move {
+            post_form(
+                http,
+                "/seller/payment-identity",
+                Some(&cookie),
+                &[
+                    ("csrf", CSRF),
+                    ("primary_address", addr.as_str()),
+                    ("password", PW2),
+                    ("totp", code_s.as_str()),
+                ],
+            )
+            .await
+        }
+    };
+    let r = change(PRIMARY_B, code(&secret2, 0)).await;
+    assert!(
+        location_of(&r).contains("pmsg=recovery_pause"),
+        "a change inside 72h of recovery is refused: {}",
+        location_of(&r)
+    );
+    let identity = app::payments::get_identity(&pool, seller).await.unwrap().unwrap();
+    assert_eq!(identity.primary_address, PRIMARY_A, "the address did not change during the pause");
+
+    // Once the pause has run (recovered_at backdated past 72h),
+    // the same change goes through.
+    sqlx::query("UPDATE accounts SET recovered_at = now() - interval '73 hours' WHERE id = $1")
+        .bind(seller)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let r = change(PRIMARY_B, code(&secret2, 30)).await;
+    assert!(
+        location_of(&r).contains("pmsg=identity_saved"),
+        "after 72h the change is allowed: {}",
+        location_of(&r)
+    );
+    let identity = app::payments::get_identity(&pool, seller).await.unwrap().unwrap();
+    assert_eq!(identity.primary_address, PRIMARY_B);
+
+    cleanup(&pool, &[seller]).await;
+    srv.stop();
 }
