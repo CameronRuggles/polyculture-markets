@@ -167,9 +167,9 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tick.tick().await;
                 match app::retention::run_retention(&ret_pool, &ret_cfg).await {
-                    Ok(out) if out.total() > 0 => println!(
-                        "retention: deleted {} notification(s), {} session(s), {} security event(s), {} disclosure(s)",
-                        out.notifications, out.sessions, out.security_events, out.disclosures
+                    Ok(out) if out.total() > 0 || out.refunds_reopened > 0 => println!(
+                        "retention: deleted {} notification(s), {} session(s), {} security event(s), {} disclosure(s); reopened {} stale refund proposal(s)",
+                        out.notifications, out.sessions, out.security_events, out.disclosures, out.refunds_reopened
                     ),
                     Ok(_) => {}
                     Err(_) => println!("retention: error"),

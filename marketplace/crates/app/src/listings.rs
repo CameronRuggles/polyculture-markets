@@ -22,6 +22,12 @@ pub struct Listing {
     pub pricing_module: String,
     pub auto_invoice: bool,
     pub status: String,
+    /// CH1: a moderator takedown is in force (migration 0013). While
+    /// set, `status` reads 'removed' — a state only moderators can
+    /// put a listing into or take it out of — and the seller cannot
+    /// change the status at all. The seller's own removal is the
+    /// separate status 'withdrawn'.
+    pub taken_down: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,7 +75,8 @@ pub fn validate_listing(
 }
 
 const LISTING_COLS: &str = "l.id, l.public_id, l.seller_id, a.username, a.public_id, l.title, l.description,
-    l.price_atomic, l.category, l.destination_module, l.pricing_module, l.auto_invoice, l.status";
+    l.price_atomic, l.category, l.destination_module, l.pricing_module, l.auto_invoice, l.status,
+    l.taken_down_at IS NOT NULL";
 
 fn row_to_listing(r: ListingRow) -> Listing {
     Listing {
@@ -86,10 +93,11 @@ fn row_to_listing(r: ListingRow) -> Listing {
         pricing_module: r.10,
         auto_invoice: r.11,
         status: r.12,
+        taken_down: r.13,
     }
 }
 
-type ListingRow = (i64, String, i64, String, String, String, String, i64, String, String, String, bool, String);
+type ListingRow = (i64, String, i64, String, String, String, String, i64, String, String, String, bool, String, bool);
 
 pub async fn create_listing(
     pool: &PgPool,
@@ -152,7 +160,7 @@ pub async fn browse(
 ) -> Result<Vec<Listing>, sqlx::Error> {
     let rows: Vec<ListingRow> = sqlx::query_as(&format!(
         "SELECT {LISTING_COLS} FROM listings l JOIN accounts a ON a.id = l.seller_id
-         WHERE l.status = 'published'
+         WHERE l.status = 'published' AND l.taken_down_at IS NULL
            AND ($1::text IS NULL OR (l.title ILIKE '%'||$1||'%' OR l.description ILIKE '%'||$1||'%'))
            AND ($2::text IS NULL OR l.category = $2)
          ORDER BY l.created_at DESC LIMIT 20 OFFSET $3"
@@ -165,21 +173,30 @@ pub async fn browse(
     Ok(rows.into_iter().map(row_to_listing).collect())
 }
 
+/// Seller-controlled status changes. The seller's vocabulary is
+/// draft / published / paused / withdrawn — 'removed' is NOT in it:
+/// that state belongs to moderator takedowns (CH1). While a
+/// takedown is in force (`taken_down_at` set), EVERY seller status
+/// change is refused, so a takedown cannot be undone from the
+/// seller dashboard.
 pub async fn set_status(
     pool: &PgPool,
     listing_id: i64,
     seller_id: i64,
     status: &str,
 ) -> Result<bool, sqlx::Error> {
-    if !["draft", "published", "paused", "removed"].contains(&status) {
+    if !["draft", "published", "paused", "withdrawn"].contains(&status) {
         return Ok(false);
     }
-    let r = sqlx::query("UPDATE listings SET status = $3 WHERE id = $1 AND seller_id = $2")
-        .bind(listing_id)
-        .bind(seller_id)
-        .bind(status)
-        .execute(pool)
-        .await?;
+    let r = sqlx::query(
+        "UPDATE listings SET status = $3
+          WHERE id = $1 AND seller_id = $2 AND taken_down_at IS NULL",
+    )
+    .bind(listing_id)
+    .bind(seller_id)
+    .bind(status)
+    .execute(pool)
+    .await?;
     Ok(r.rows_affected() == 1)
 }
 

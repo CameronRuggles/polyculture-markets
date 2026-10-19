@@ -98,19 +98,47 @@ pub async fn dispute_for_order(pool: &PgPool, order_id: i64) -> Result<Option<Di
 
 /// Open disputes for the moderation queue.
 pub async fn open_disputes(pool: &PgPool) -> Result<Vec<(Dispute, String, String, String)>, DisputeError> {
-    let rows: Vec<(DisputeRow, String, String, String)> = sqlx::query_as(&format!(
-        "SELECT {DISPUTE_COLS}, o.public_id, ba.username, sa.username
+    // This query was broken twice over and the queue page's
+    // unwrap_or_default hid both: the shared DISPUTE_COLS list is
+    // unqualified, which made `id`/`created_at` ambiguous across
+    // this join, and the row type nested a tuple inside the row
+    // tuple, which sqlx cannot decode (it reads column 0 as a
+    // RECORD). The moderation queue therefore never actually
+    // listed a dispute. Found by the CL2 acceptance test
+    // (2026-10-19); the row is flat and fully qualified now.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        String,
+        Option<i64>,
+        OffsetDateTime,
+        Option<OffsetDateTime>,
+        String,
+        String,
+        String,
+    )> = sqlx::query_as(
+        "SELECT d.id, d.order_id, d.opened_by, d.state, d.outcome, d.outcome_state,
+                d.resolved_by, d.created_at, d.resolved_at, o.public_id, ba.username, sa.username
            FROM disputes d
            JOIN orders o ON o.id = d.order_id
            JOIN accounts ba ON ba.id = o.buyer_id
            JOIN accounts sa ON sa.id = o.seller_id
           WHERE d.state IN ('open', 'awaiting_buyer_confirmation')
-          ORDER BY d.created_at"
-    ))
+          ORDER BY d.created_at",
+    )
     .fetch_all(pool)
     .await
     .map_err(|_| DisputeError::Db)?;
-    Ok(rows.into_iter().map(|(d, oid, b, s)| (row(d), oid, b, s)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(a, b, c, d, e, f, g, h, i, oid, bu, su)| {
+            (row((a, b, c, d, e, f, g, h, i)), oid, bu, su)
+        })
+        .collect())
 }
 
 // -- disclosures --------------------------------------------------------------
@@ -384,10 +412,20 @@ pub async fn resolve(
     if order.state != "Disputed" {
         return Err(DisputeError::BadState);
     }
+    // CM3: no self-dealing. Moderators and admins can also buy and
+    // sell; a moderator who is a party to this order may not decide
+    // its dispute, in either direction.
+    if moderator_id == order.buyer_id || moderator_id == order.seller_id {
+        return Err(DisputeError::Forbidden);
+    }
     if outcome == "refund-confirmed" {
+        // CL2: the proposal moment starts the buyer's 14-day
+        // confirmation deadline (retention.rs returns an
+        // unconfirmed proposal to the moderator queue).
         sqlx::query(
             "UPDATE disputes SET outcome = $2, outcome_state = 'proposed',
-                    state = 'awaiting_buyer_confirmation', resolved_by = $3
+                    state = 'awaiting_buyer_confirmation', resolved_by = $3,
+                    refund_proposed_at = now()
               WHERE id = $1",
         )
         .bind(dispute_id)

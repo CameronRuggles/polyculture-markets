@@ -143,17 +143,21 @@ pub async fn create_order_with_config(
     if let Some(existing) = order_by_idempotency(pool, buyer_id, idempotency_key).await {
         return Ok((existing, false));
     }
-    let listing: Option<(i64, i64, String, String, String, i64, String, String, String)> = sqlx::query_as(
-        "SELECT id, seller_id, title, description, delivery_terms, price_atomic, status, destination_module, public_id
+    let listing: Option<(i64, i64, String, String, String, i64, String, String, String, bool)> = sqlx::query_as(
+        "SELECT id, seller_id, title, description, delivery_terms, price_atomic, status, destination_module, public_id,
+                taken_down_at IS NOT NULL
          FROM listings WHERE public_id = $1",
     )
     .bind(listing_public_id)
     .fetch_optional(pool)
     .await
     .map_err(|_| OrderError::NotFound)?;
-    let (listing_id, seller_id, title, description, delivery_terms, unit_price, status, dest_module, listing_pub) =
+    let (listing_id, seller_id, title, description, delivery_terms, unit_price, status, dest_module, listing_pub, taken_down) =
         listing.ok_or(OrderError::ListingNotAvailable)?;
-    if status != "published" {
+    // A taken-down listing reads status 'removed' already; the
+    // takedown flag is checked too so no future status path can
+    // make a taken-down listing orderable (CH1 defense in depth).
+    if status != "published" || taken_down {
         return Err(OrderError::ListingNotAvailable);
     }
     if seller_id == buyer_id {

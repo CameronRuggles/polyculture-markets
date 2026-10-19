@@ -493,6 +493,10 @@ pub async fn report_action(
 /// moderators resolve or dismiss flags from the moderation queue.
 /// The 'cleared' state is reserved for the automatic clearing that
 /// happens when a seller confirms payment (payments.rs).
+///
+/// CM3: a moderator who is the flagged order's buyer or seller may
+/// not decide it — the same no-self-dealing rule as dispute
+/// resolution (disputes::resolve).
 pub async fn payment_flag_action(
     pool: &PgPool,
     flag_id: i64,
@@ -504,6 +508,20 @@ pub async fn payment_flag_action(
         "resolve" => "resolved",
         _ => return Err(ModError::BadInput),
     };
+    let parties: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT o.buyer_id, o.seller_id FROM payment_review_flags f
+           JOIN orders o ON o.id = f.order_id WHERE f.id = $1",
+    )
+    .bind(flag_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ModError::Db)?;
+    let Some((buyer_id, seller_id)) = parties else {
+        return Err(ModError::NotFound);
+    };
+    if moderator_id == buyer_id || moderator_id == seller_id {
+        return Err(ModError::Forbidden);
+    }
     let upd = sqlx::query(
         "UPDATE payment_review_flags SET state = $2, closed_at = now() WHERE id = $1 AND state = 'open'",
     )
@@ -545,9 +563,46 @@ async fn log_action(
     Ok(())
 }
 
+/// CM4 role protection for the account actions below. Admin
+/// accounts are operator-console territory: no web-path action —
+/// warn or close, by anyone, including another admin or the admin
+/// themself — may touch them. Moderator accounts may only be acted
+/// on by an admin. Returns true when the (actor, target) pair is
+/// protected. Self-actions on non-admin accounts are not protected
+/// here (self-closure is the owner's own act, ruled 2026-10-16).
+async fn role_protected(pool: &PgPool, target_id: i64, actor_id: i64) -> Result<bool, ModError> {
+    let target_role: Option<String> = sqlx::query_scalar("SELECT role FROM accounts WHERE id = $1")
+        .bind(target_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ModError::Db)?;
+    let Some(target_role) = target_role else {
+        return Ok(false);
+    };
+    Ok(match target_role.as_str() {
+        "admin" => true,
+        "moderator" => {
+            if actor_id == target_id {
+                false
+            } else {
+                let actor_role: Option<String> =
+                    sqlx::query_scalar("SELECT role FROM accounts WHERE id = $1")
+                        .bind(actor_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| ModError::Db)?;
+                actor_role.as_deref() != Some("admin")
+            }
+        }
+        _ => false,
+    })
+}
+
 /// Warn an account: the warning is timestamped, audited, and shown to
 /// the account (account page + inbox). A warned account functions
 /// normally — warning is a record and a signal, not a restriction.
+/// CM4: protected-role targets (see `role_protected`) are refused
+/// and the refusal is logged.
 pub async fn warn_account(
     pool: &PgPool,
     target_id: i64,
@@ -565,6 +620,12 @@ pub async fn warn_account(
         .map_err(|_| ModError::Db)?;
     if !exists {
         return Err(ModError::NotFound);
+    }
+    if role_protected(pool, target_id, moderator_id).await? {
+        log_action(pool, moderator_id, Some(target_id), None, "warn-refused", reason)
+            .await
+            .map_err(|_| ModError::Db)?;
+        return Err(ModError::Forbidden);
     }
     sqlx::query("UPDATE accounts SET warned_at = now() WHERE id = $1")
         .bind(target_id)
@@ -601,6 +662,18 @@ pub async fn close_account(
     let Some(status) = status else {
         return Err(ModError::NotFound);
     };
+    // CM4: protected roles are refused before anything else happens
+    // — a moderator cannot close another moderator or an admin, and
+    // an admin account cannot be closed through this path at all
+    // (operator console only). The refusal is rolled back, logged,
+    // and returned as Forbidden.
+    if role_protected(pool, target_id, actor_id).await? {
+        tx.rollback().await.map_err(|_| ModError::Db)?;
+        log_action(pool, actor_id, Some(target_id), None, "close-account-refused", reason)
+            .await
+            .map_err(|_| ModError::Db)?;
+        return Err(ModError::Forbidden);
+    }
     if status == "closed" {
         return Err(ModError::AlreadyClosed);
     }
@@ -659,41 +732,68 @@ pub async fn close_account(
 
 // -- listing actions -------------------------------------------------------------------
 
-/// Remove a listing (it disappears from the catalogue; the seller is
-/// notified). Restore republishes it.
+/// Take a listing down (it disappears from the catalogue; the
+/// seller is notified) or restore it.
+///
+/// CH1: the takedown lives in its own fields — `taken_down_at` /
+/// `taken_down_by`, with the seller's own status preserved in
+/// `pre_takedown_status`. While a takedown is in force the status
+/// column reads 'removed', a state no seller action can produce or
+/// clear (listings::set_status refuses every change and no longer
+/// accepts 'removed' at all). Restore touches ONLY takedowns: it
+/// clears the takedown fields and returns the listing to its
+/// pre-takedown status — it can never republish a listing the
+/// seller withdrew ('withdrawn'), because a withdrawn listing has
+/// no takedown to clear and restoring it is refused (BadInput).
 pub async fn set_listing_removed(
     pool: &PgPool,
     listing_public_id: &str,
     moderator_id: i64,
     remove: bool,
 ) -> Result<(), ModError> {
-    let row: Option<(i64, i64, String)> = sqlx::query_as(
-        "SELECT id, seller_id, status FROM listings WHERE public_id = $1",
+    let row: Option<(i64, i64, String, bool)> = sqlx::query_as(
+        "SELECT id, seller_id, status, taken_down_at IS NOT NULL FROM listings WHERE public_id = $1",
     )
     .bind(listing_public_id)
     .fetch_optional(pool)
     .await
     .map_err(|_| ModError::Db)?;
-    let Some((listing_id, seller_id, status)) = row else {
+    let Some((listing_id, seller_id, _status, taken_down)) = row else {
         return Err(ModError::NotFound);
     };
-    let (new_status, action) = if remove {
-        if status == "removed" {
+    let action = if remove {
+        if taken_down {
             return Err(ModError::BadInput);
         }
-        ("removed", "remove-listing")
-    } else {
-        if status != "removed" {
-            return Err(ModError::BadInput);
-        }
-        ("published", "restore-listing")
-    };
-    sqlx::query("UPDATE listings SET status = $2 WHERE id = $1")
+        sqlx::query(
+            "UPDATE listings
+                SET pre_takedown_status = status, status = 'removed',
+                    taken_down_at = now(), taken_down_by = $2
+              WHERE id = $1",
+        )
         .bind(listing_id)
-        .bind(new_status)
+        .bind(moderator_id)
         .execute(pool)
         .await
         .map_err(|_| ModError::Db)?;
+        "remove-listing"
+    } else {
+        if !taken_down {
+            return Err(ModError::BadInput);
+        }
+        sqlx::query(
+            "UPDATE listings
+                SET status = COALESCE(pre_takedown_status, 'published'),
+                    pre_takedown_status = NULL,
+                    taken_down_at = NULL, taken_down_by = NULL
+              WHERE id = $1",
+        )
+        .bind(listing_id)
+        .execute(pool)
+        .await
+        .map_err(|_| ModError::Db)?;
+        "restore-listing"
+    };
     log_action(pool, moderator_id, Some(seller_id), Some(listing_id), action, "")
         .await
         .map_err(|_| ModError::Db)?;
