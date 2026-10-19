@@ -1215,3 +1215,53 @@ async fn disclosure_verified_only_for_fresh_signature_on_named_message() {
     cleanup(&pool, &[seller, buyer]).await;
     srv.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Task 7 (V7): a certificate refresh stores the MERGE of the
+// stored and submitted certificates — submitting an older export
+// cannot drop a revocation the stored copy already carries.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn refresh_merges_so_a_stale_copy_cannot_drop_a_revocation() {
+    let Some(pool) = pool().await else { return };
+    let _guard = fixture_guard(&pool).await;
+    let (alice, _a) = make_account(&pool, "buyer", PW).await;
+    let (carol, _c) = make_account(&pool, "seller", PW).await;
+    install_cert(&pool, alice, CERT_ALICE).await;
+    // Carol's stored certificate is v2: subkey 1 is REVOKED in it.
+    install_cert(&pool, carol, CERT_CAROL_V2).await;
+    let conv = app::messages::find_or_create_direct(&pool, alice, carol).await.unwrap();
+    let _msg_serial = msg_lock().lock().await;
+
+    let send_subkey1 = |pool: PgPool, conv: i64, alice: i64| async move {
+        app::messages::send_message(&pool, conv, alice, MSG_TO_CAROL_SUBKEY1.as_bytes()).await
+    };
+    // Baseline: with v2 stored the message to the revoked subkey is
+    // already refused.
+    let err = send_subkey1(pool.clone(), conv, alice).await.expect_err("revoked subkey refuses");
+    assert!(
+        matches!(err, app::messages::SendError::Envelope(envelope::EnvelopeError::WrongRecipient)),
+        "got {err:?}"
+    );
+
+    // Carol "refreshes" by submitting her OLD v1 export — the exact
+    // handler chain (validate, merge, store). v1 alone would make
+    // the subkey look alive again; the merge must keep v2's
+    // revocation.
+    app::keys::validate_refresh(CERT_CAROL_V2.as_bytes(), CERT_CAROL_V1.as_bytes())
+        .expect("v1 is a valid same-key refresh submission");
+    let merged = app::keys::merged_refresh(CERT_CAROL_V2.as_bytes(), CERT_CAROL_V1.as_bytes())
+        .expect("the merge validates");
+    app::keys::refresh_certificate(&pool, carol, &merged).await.unwrap();
+
+    let err = send_subkey1(pool.clone(), conv, alice)
+        .await
+        .expect_err("after merging a stale v1, the revoked subkey still refuses");
+    assert!(
+        matches!(err, app::messages::SendError::Envelope(envelope::EnvelopeError::WrongRecipient)),
+        "the revocation survived the refresh: got {err:?}"
+    );
+
+    cleanup(&pool, &[alice, carol]).await;
+}

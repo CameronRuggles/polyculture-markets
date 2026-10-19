@@ -2200,12 +2200,18 @@ async fn refresh_key(State(st): State<AppState>, headers: HeaderMap, Form(f): Fo
     };
     let cert = normalize_crlf(&f.cert);
     match kmod::validate_refresh(&cur_cert, cert.as_bytes()) {
-        Ok(info) => match kmod::refresh_certificate(&st.pool, sess.account_id, cert.as_bytes()).await {
-            Ok(()) => {
-                stepup_notice(&st, sess.account_id, "stepup_key_refresh", "your identity certificate was refreshed (renewed signatures, same key)").await;
-                security_page_render(&st, &sess, &csrf, Some(format!("Certificate refreshed: same key ({}), signatures renewed.", info.fingerprint)), info.warnings.clone()).await
-            }
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not store the refreshed certificate").into_response(),
+        // V7: store the MERGE of stored + submitted, never the
+        // submission alone — an older export must not be able to
+        // drop a revocation the stored copy carries.
+        Ok(info) => match kmod::merged_refresh(&cur_cert, cert.as_bytes()) {
+            Ok(merged) => match kmod::refresh_certificate(&st.pool, sess.account_id, &merged).await {
+                Ok(()) => {
+                    stepup_notice(&st, sess.account_id, "stepup_key_refresh", "your identity certificate was refreshed (renewed signatures, same key)").await;
+                    security_page_render(&st, &sess, &csrf, Some(format!("Certificate refreshed: same key ({}), signatures renewed.", info.fingerprint)), info.warnings.clone()).await
+                }
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not store the refreshed certificate").into_response(),
+            },
+            Err(msg) => security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await,
         },
         Err(msg) => security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await,
     }
