@@ -18,6 +18,13 @@
 <pre>{{ p.proof }}</pre>
 {% endif %}
 <h2>Disclosed messages</h2>
+{% if disclosures_locked %}
+<p><strong>Disclosures are locked for this session.</strong> Reading disclosed messages is a moderator action: enter a fresh TOTP code to unlock them for this session (10 minutes). Until then they are not decrypted or shown.</p>
+<form method="post" action="/disputes/{{ dispute_id }}/unlock">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
+<button type="submit">Unlock disclosures</button></form>
+{% else %}
 {% if disclosures.is_empty() %}<p>Nothing has been disclosed yet.</p>{% endif %}
 {% for d in disclosures %}
 <article>
@@ -26,6 +33,7 @@
 <pre>{{ d.message }}</pre>
 </article>
 {% endfor %}
+{% endif %}
 {% if can_disclose %}
 <h2>Disclose a message</h2>
 <p>Disclosing is voluntary and one-way. Before you submit, be sure you understand exactly what happens:</p>

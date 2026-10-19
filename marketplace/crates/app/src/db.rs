@@ -127,6 +127,46 @@ pub async fn revoke_all_sessions(pool: &PgPool, account_id: i64) -> Result<u64, 
     Ok(r.rows_affected())
 }
 
+/// Revoke every session of the account EXCEPT the one identified by
+/// `keep_token` (account-security task 8: a passphrase change ends all
+/// other sessions; the session performing the change survives).
+pub async fn revoke_other_sessions(
+    pool: &PgPool,
+    account_id: i64,
+    keep_token: &str,
+) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE sessions SET revoked_at = now()
+          WHERE account_id = $1 AND revoked_at IS NULL AND token_hash <> $2",
+    )
+    .bind(account_id)
+    .bind(hash_token(keep_token).to_vec())
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Replace the account's recovery code (task 8): every unconsumed code
+/// is burned and the new code is stored — after issuance, only the
+/// newest code can recover the account.
+pub async fn replace_recovery_code(pool: &PgPool, account_id: i64, code: &str) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE recovery_codes SET consumed_at = now()
+          WHERE account_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO recovery_codes (account_id, code_hash) VALUES ($1, $2)")
+        .bind(account_id)
+        .bind(crate::recovery::hash_code(code).to_vec())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn store_recovery_code(pool: &PgPool, account_id: i64, code: &str) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO recovery_codes (account_id, code_hash) VALUES ($1, $2)")
         .bind(account_id)

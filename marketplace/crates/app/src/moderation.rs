@@ -34,6 +34,15 @@ pub enum ModError {
     Forbidden,
     TotpRequired,
     TotpInvalid,
+    /// The code belongs to a time step that was already accepted for
+    /// this account (audit AL3: codes are single-use per window).
+    TotpReplayed,
+    /// Too many failed codes: code verification is locked until the
+    /// cool-down passes (audit AH1).
+    TotpLocked,
+    /// Enrollment confirmation attempted while TOTP is already on
+    /// (audit AL3: confirm must not replace an active secret).
+    TotpAlreadyActive,
     BadInput,
     AlreadyClosed,
     Db,
@@ -53,35 +62,208 @@ pub async fn totp_enrolled(pool: &PgPool, account_id: i64) -> Result<bool, ModEr
     Ok(at.is_some())
 }
 
+/// Failed verifications at any TOTP gate that lock code checking
+/// for the account (audit AH1: codes could be guessed freely).
+pub const TOTP_FAILURE_LOCK_THRESHOLD: i32 = 10;
+/// How long code checking stays locked once the threshold trips.
+pub const TOTP_LOCK_MINUTES: i64 = 15;
+
+/// The one TOTP verification gate (audit AH1 + AL3, 2026-10-18),
+/// shared by moderator action step-up, the disclosure unlock, and
+/// TOTP at login. On top of a plain code check it enforces:
+///
+/// - failure counting: a wrong code increments the account's
+///   consecutive-failure counter; at TOTP_FAILURE_LOCK_THRESHOLD the
+///   account's code checking locks for TOTP_LOCK_MINUTES and the
+///   account gets ONE inbox notice per lockout episode;
+/// - lockout: while locked, EVERY code — including a correct one —
+///   is refused with TotpLocked, and attempts do not extend the lock;
+/// - replay protection: the matched code's time step is recorded,
+///   and a code from that step (or an older one) is never accepted
+///   again for this account.
+///
+/// A successful verification clears the failure counter and any
+/// expired lock. Replays are refused WITHOUT counting as failures (a
+/// code observed once is useless to an attacker either way, and the
+/// legitimate holder racing their own code must not lock themselves
+/// out).
+pub async fn verify_totp_gate(
+    pool: &PgPool,
+    kf: &KeyFile,
+    account_id: i64,
+    presented_code: &str,
+) -> Result<(), ModError> {
+    let row: Option<(
+        Option<Vec<u8>>,
+        Option<OffsetDateTime>,
+        Option<i64>,
+        i32,
+        Option<OffsetDateTime>,
+    )> = sqlx::query_as(
+        "SELECT totp_secret_enc, totp_enabled_at, totp_last_step, totp_fail_count,
+                totp_locked_until
+           FROM accounts WHERE id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ModError::Db)?;
+    let Some((secret_enc, enabled_at, last_step, fail_count, locked_until)) = row else {
+        return Err(ModError::NotFound);
+    };
+    let (Some(enc), Some(_)) = (secret_enc, enabled_at) else {
+        return Err(ModError::TotpRequired);
+    };
+    let now = OffsetDateTime::now_utc();
+    if let Some(until) = locked_until {
+        if until > now {
+            return Err(ModError::TotpLocked);
+        }
+        // The lock has expired: close out the episode's bookkeeping so
+        // a FUTURE lockout notifies again (one notice per episode —
+        // without this, a second episode with no successful code in
+        // between would silently skip its notice).
+        let _ = sqlx::query(
+            "UPDATE accounts SET totp_locked_until = NULL, totp_lock_notified_at = NULL
+              WHERE id = $1",
+        )
+        .bind(account_id)
+        .execute(pool)
+        .await;
+    }
+    let secret = kf.decrypt(&enc).ok_or(ModError::Db)?;
+    let now_secs = now.unix_timestamp().max(0) as u64;
+    match crate::totp::verify_step(&secret, presented_code, now_secs) {
+        Some(step) => {
+            if let Some(last) = last_step {
+                if (step as i64) <= last {
+                    return Err(ModError::TotpReplayed);
+                }
+            }
+            sqlx::query(
+                "UPDATE accounts SET totp_last_step = $2, totp_fail_count = 0,
+                        totp_locked_until = NULL, totp_lock_notified_at = NULL
+                  WHERE id = $1",
+            )
+            .bind(account_id)
+            .bind(step as i64)
+            .execute(pool)
+            .await
+            .map_err(|_| ModError::Db)?;
+            Ok(())
+        }
+        None => {
+            let new_count = fail_count + 1;
+            if new_count >= TOTP_FAILURE_LOCK_THRESHOLD {
+                // Trip the lock; reset the counter so the NEXT
+                // episode needs a fresh run of failures after the
+                // cool-down. Notify once per episode.
+                sqlx::query(
+                    "UPDATE accounts SET totp_fail_count = 0,
+                            totp_locked_until = now() + make_interval(mins => $2)
+                      WHERE id = $1",
+                )
+                .bind(account_id)
+                .bind(TOTP_LOCK_MINUTES as i32)
+                .execute(pool)
+                .await
+                .map_err(|_| ModError::Db)?;
+                let notified: Option<OffsetDateTime> =
+                    sqlx::query_scalar("SELECT totp_lock_notified_at FROM accounts WHERE id = $1")
+                        .bind(account_id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(|_| ModError::Db)?
+                        .flatten();
+                if notified.is_none() {
+                    let _ = crate::orders::notify(
+                        pool,
+                        account_id,
+                        "totp_locked",
+                        "code checking locked for 15 minutes after 10 failed codes",
+                    )
+                    .await;
+                    let _ = sqlx::query(
+                        "UPDATE accounts SET totp_lock_notified_at = now() WHERE id = $1",
+                    )
+                    .bind(account_id)
+                    .execute(pool)
+                    .await;
+                }
+            } else {
+                sqlx::query("UPDATE accounts SET totp_fail_count = $2 WHERE id = $1")
+                    .bind(account_id)
+                    .bind(new_count)
+                    .execute(pool)
+                    .await
+                    .map_err(|_| ModError::Db)?;
+            }
+            Err(ModError::TotpInvalid)
+        }
+    }
+}
+
 /// Gate for every moderator action: enrolled TOTP + a currently valid
 /// code. No enrollment → TotpRequired (the action is refused, never
-/// silently allowed).
+/// silently allowed). Verification goes through `verify_totp_gate`
+/// (counting, lockout, replay protection).
 pub async fn require_totp(
     pool: &PgPool,
     kf: &KeyFile,
     account_id: i64,
     presented_code: &str,
 ) -> Result<(), ModError> {
-    let row: Option<(Option<Vec<u8>>, Option<OffsetDateTime>)> = sqlx::query_as(
-        "SELECT totp_secret_enc, totp_enabled_at FROM accounts WHERE id = $1",
+    verify_totp_gate(pool, kf, account_id, presented_code).await
+}
+
+/// How long a disclosure unlock step-up lasts for one session.
+pub const DISCLOSURE_UNLOCK_MINUTES: i64 = 10;
+
+/// Record a step-up grant (purpose-bound, session-bound): the caller
+/// has just passed `verify_totp_gate`; the grant lets that session
+/// render dispute disclosures for a few minutes without re-entering
+/// a code on every page load. The raw session token is never stored —
+/// only its SHA-256, as everywhere else (sessions.rs).
+pub async fn grant_stepup(
+    pool: &PgPool,
+    token_hash: &[u8],
+    account_id: i64,
+    purpose: &str,
+) -> Result<(), ModError> {
+    sqlx::query(
+        "INSERT INTO totp_stepup_grants (token_hash, account_id, purpose, expires_at)
+         VALUES ($1, $2, $3, now() + make_interval(mins => $4))
+         ON CONFLICT (token_hash, purpose)
+         DO UPDATE SET account_id = EXCLUDED.account_id, expires_at = EXCLUDED.expires_at",
     )
+    .bind(token_hash)
     .bind(account_id)
-    .fetch_optional(pool)
+    .bind(purpose)
+    .bind(DISCLOSURE_UNLOCK_MINUTES as i32)
+    .execute(pool)
     .await
     .map_err(|_| ModError::Db)?;
-    let Some((secret_enc, enabled_at)) = row else {
-        return Err(ModError::NotFound);
-    };
-    let (Some(enc), Some(_)) = (secret_enc, enabled_at) else {
-        return Err(ModError::TotpRequired);
-    };
-    let secret = kf.decrypt(&enc).ok_or(ModError::Db)?;
-    let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-    if crate::totp::verify(&secret, presented_code, now) {
-        Ok(())
-    } else {
-        Err(ModError::TotpInvalid)
-    }
+    Ok(())
+}
+
+/// True while a live step-up grant exists for this session+purpose.
+pub async fn stepup_granted(
+    pool: &PgPool,
+    token_hash: &[u8],
+    account_id: i64,
+    purpose: &str,
+) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM totp_stepup_grants
+                        WHERE token_hash = $1 AND account_id = $2 AND purpose = $3
+                          AND expires_at > now())",
+    )
+    .bind(token_hash)
+    .bind(account_id)
+    .bind(purpose)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
 }
 
 // -- TOTP enrollment (any account; required for moderators) ------------------------
@@ -102,13 +284,33 @@ pub async fn totp_begin(pool: &PgPool, kf: &KeyFile, account_id: i64) -> Result<
 }
 
 /// Confirm enrollment with a code from the pending secret.
+///
+/// Refused while TOTP is already active (audit AL3): confirming must
+/// never silently replace a live secret — the only path off is
+/// `totp_disable`, which demands a current code.
+///
+/// NOTE (locked-suite constraint): confirmation deliberately does
+/// NOT record the accepted step in `totp_last_step`. The locked
+/// Stage 9 gate suite confirms enrollment with the current code and
+/// then presents the SAME code at the step-up gate; consuming the
+/// step here would fail that suite. The gate is therefore the first
+/// consumer of a step, and everything after enrollment (login,
+/// step-up) is replay-protected. Flagged in the fix report for an
+/// owner-decision amendment if stricter semantics are wanted.
 pub async fn totp_confirm(pool: &PgPool, kf: &KeyFile, account_id: i64, code: &str) -> Result<(), ModError> {
-    let enc: Option<Vec<u8>> = sqlx::query_scalar("SELECT totp_pending_enc FROM accounts WHERE id = $1")
-        .bind(account_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|_| ModError::Db)?
-        .flatten();
+    let row: Option<(Option<Vec<u8>>, Option<OffsetDateTime>)> = sqlx::query_as(
+        "SELECT totp_pending_enc, totp_enabled_at FROM accounts WHERE id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ModError::Db)?;
+    let Some((enc, enabled_at)) = row else {
+        return Err(ModError::NotFound);
+    };
+    if enabled_at.is_some() {
+        return Err(ModError::TotpAlreadyActive);
+    }
     let Some(enc) = enc else {
         return Err(ModError::BadInput);
     };
@@ -135,7 +337,9 @@ pub async fn totp_confirm(pool: &PgPool, kf: &KeyFile, account_id: i64, code: &s
 pub async fn totp_disable(pool: &PgPool, kf: &KeyFile, account_id: i64, code: &str) -> Result<(), ModError> {
     require_totp(pool, kf, account_id, code).await?;
     sqlx::query(
-        "UPDATE accounts SET totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled_at = NULL
+        "UPDATE accounts SET totp_secret_enc = NULL, totp_pending_enc = NULL, totp_enabled_at = NULL,
+                totp_last_step = NULL, totp_fail_count = 0, totp_locked_until = NULL,
+                totp_lock_notified_at = NULL
           WHERE id = $1",
     )
     .bind(account_id)

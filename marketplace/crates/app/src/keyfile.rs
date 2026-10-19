@@ -38,28 +38,43 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 impl KeyFile {
+    /// Load an EXISTING key file, refusing when it is absent (audit
+    /// AL1): a missing file must never be silently replaced — the
+    /// replacement key makes every stored TOTP secret and disclosure
+    /// unreadable and changes every buyer token. Non-development
+    /// profiles start through this path (main.rs).
+    pub fn load_existing(path: &Path) -> std::io::Result<KeyFile> {
+        let raw = std::fs::read(path)?;
+        let master = parse_key_material(&raw).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "key file must contain 32 bytes (64 hex chars or raw)",
+            )
+        })?;
+        Ok(KeyFile { master, path: path.to_path_buf() })
+    }
+
     /// Load the key file, generating and persisting a fresh one if it
     /// does not exist. Accepts either 64 hex chars (what we write) or a
-    /// raw 32-byte file.
+    /// raw 32-byte file. New files are created with mode 0600 FROM
+    /// CREATION (audit AL1: no create-then-chmod window in which the
+    /// secret sits world-readable).
     pub fn load_or_generate(path: &Path) -> std::io::Result<KeyFile> {
         if path.exists() {
-            let raw = std::fs::read(path)?;
-            let master = parse_key_material(&raw).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "key file must contain 32 bytes (64 hex chars or raw)",
-                )
-            })?;
-            return Ok(KeyFile { master, path: path.to_path_buf() });
+            return Self::load_existing(path);
         }
         let mut master = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut master);
-        std::fs::write(path, hex::encode(master))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
+        let mut file = opts.open(path)?;
+        use std::io::Write;
+        file.write_all(hex::encode(master).as_bytes())?;
         Ok(KeyFile { master, path: path.to_path_buf() })
     }
 
@@ -193,6 +208,31 @@ mod tests {
         bad[n - 1] ^= 1;
         assert_eq!(k.decrypt(&bad), None, "tag mismatch must fail");
         assert_eq!(k.decrypt(&ct[..8]), None, "truncation must fail");
+    }
+
+    #[test]
+    fn load_existing_refuses_missing_and_generated_files_are_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "kf-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k.key");
+        // Missing: refused, and nothing is created (AL1).
+        assert!(KeyFile::load_existing(&path).is_err());
+        assert!(!path.exists());
+        // Generated: 0600 in the final state, loadable via the strict path.
+        let kf = KeyFile::load_or_generate(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "new key file must be 0600, got {mode:o}");
+        let kf2 = KeyFile::load_existing(&path).unwrap();
+        assert_eq!(kf.buyer_token(3, 4), kf2.buyer_token(3, 4));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

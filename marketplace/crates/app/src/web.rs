@@ -61,6 +61,66 @@ impl AppState {
         let secure = if self.dev_cookies { "" } else { "; Secure" };
         format!("csrf={value}; Path=/; SameSite=Strict{secure}")
     }
+
+    /// Account Security Audit task 5 (AM2 follow-through): the
+    /// per-account request throttle (`Throttles::allow_request`,
+    /// previously dead code) is wired into every signed-in POST.
+    /// Returns the 429 response when this account's burst budget is
+    /// spent; handlers call this immediately after the session is
+    /// established, before any other work.
+    fn throttle_or_429(&self, account_id: i64) -> Option<Response> {
+        if self.throttles.allow_request(account_id, OffsetDateTime::now_utc()) {
+            None
+        } else {
+            Some((StatusCode::TOO_MANY_REQUESTS, "Too many requests — slow down and retry shortly.").into_response())
+        }
+    }
+}
+
+/// Account Security Audit task 2 (AM3; also discharges payment-audit
+/// M1): the step-up for identity-changing actions. A session alone is
+/// never enough: the caller must re-prove the CURRENT PASSPHRASE,
+/// plus a current TOTP code when the account is enrolled. Hashing
+/// goes through the per-account scope so step-up attempts cannot
+/// starve the login gate. On success the caller performs the action
+/// and records an inbox notice (see `stepup_notice`).
+async fn step_up(
+    st: &AppState,
+    sess: &sessions::Session,
+    password: &str,
+    totp_code: Option<&str>,
+) -> Result<(), String> {
+    let stored: Option<String> = sqlx::query_scalar("SELECT password_hash FROM accounts WHERE id = $1")
+        .bind(sess.account_id)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten();
+    let Some(stored) = stored else {
+        return Err("Step-up verification failed.".into());
+    };
+    let scope = format!("acct:{}", sess.account_id);
+    match st.hash_guard.verify_scoped(&scope, password, &stored).await {
+        Ok(true) => {}
+        Ok(false) => return Err("Step-up verification failed: the passphrase did not verify.".into()),
+        Err(HashError::Busy) => return Err("Step-up verification failed: busy, retry shortly.".into()),
+        Err(_) => return Err("Step-up verification failed.".into()),
+    }
+    if crate::moderation::totp_enrolled(&st.pool, sess.account_id).await.unwrap_or(false) {
+        let Some(code) = totp_code.filter(|c| !c.trim().is_empty()) else {
+            return Err("Step-up verification failed: a TOTP code is required for this account.".into());
+        };
+        if let Err(e) = crate::moderation::verify_totp_gate(&st.pool, &st.keyfile, sess.account_id, code).await {
+            return Err(format!("Step-up verification failed: TOTP code refused ({e:?})."));
+        }
+    }
+    Ok(())
+}
+
+/// The inbox notice an identity-changing action leaves behind (task
+/// 2): if a session was stolen, the owner sees exactly what changed.
+async fn stepup_notice(st: &AppState, account_id: i64, event_type: &str, what: &str) {
+    let _ = crate::orders::notify(&st.pool, account_id, event_type, what).await;
 }
 
 // -- Stage 10: the shared page shell (§15) ----------------------------------
@@ -377,6 +437,7 @@ pub fn router(state: AppState) -> Router {
         .route("/orders/{id}/review", post(review_submit))
         .route("/orders/{id}/review/reply", post(review_reply))
         .route("/disputes/{id}", get(dispute_page))
+        .route("/disputes/{id}/unlock", post(dispute_unlock))
         .route("/disputes/{id}/disclosures", post(disclosure_submit))
         .route("/disputes/{id}/resolve", post(dispute_resolve))
         .route("/disputes/{id}/confirm-refund", post(dispute_confirm_refund))
@@ -392,6 +453,8 @@ pub fn router(state: AppState) -> Router {
         .route("/account/totp/begin", post(totp_begin_h))
         .route("/account/totp/confirm", post(totp_confirm_h))
         .route("/account/totp/disable", post(totp_disable_h))
+        .route("/account/passphrase", post(passphrase_change))
+        .route("/account/recovery-codes", post(recovery_code_issue))
         .route("/account/close", post(account_close_self))
         // Admin landing (contract §7 declares GET /admin ADMIN_ONLY;
         // the handler enforces the table and keeps the identical 404
@@ -673,6 +736,9 @@ async fn login_form(State(st): State<AppState>, headers: HeaderMap) -> Response 
 struct LoginForm {
     username: String,
     password: String,
+    /// Account Security Audit task 1 (AH1/AM1): the TOTP code,
+    /// required at login for any account with TOTP enrolled.
+    totp: Option<String>,
     csrf: String,
 }
 
@@ -688,13 +754,27 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
             csrf: f.csrf.clone(),
         })
     };
+    // AM1: the per-username attempt budget is checked BEFORE any
+    // hashing. A budget-exhausted name gets the generic error with no
+    // hash work and no extra delay recorded (the window ages out on
+    // its own); other usernames are unaffected.
+    if st.throttles.login_budget_exceeded(&folded) {
+        let tpl = LoginTpl {
+            error: Some("Invalid username or passphrase.".into()),
+            csrf: f.csrf.clone(),
+        };
+        return page(&st, &headers, "Log in", tpl.render().unwrap()).await;
+    }
     let row = db::account_by_username(&st.pool, &folded).await.ok().flatten();
     let Some((id, stored, _role)) = row else {
         let (d, tpl) = fail(&st);
         tokio::time::sleep(std::time::Duration::from_secs(d.whole_seconds().min(5) as u64)).await;
         return page(&st, &headers, "Log in", tpl.render().unwrap()).await;
     };
-    match st.hash_guard.verify(&f.password, &stored).await {
+    // AM2: verification is serialized per username — parallel guesses
+    // against one account queue behind a single Argon2 run instead of
+    // filling the shared hashing pool.
+    match st.hash_guard.verify_scoped(&folded, &f.password, &stored).await {
         Ok(true) => {}
         Ok(false) => {
             let (d, tpl) = fail(&st);
@@ -703,6 +783,25 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
         }
         Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
+    }
+    // Task 1 (AH1): an enrolled account needs its TOTP code at login
+    // too — the passphrase alone no longer opens a full session. The
+    // code goes through the same gate as every step-up (counting,
+    // lockout, replay protection). A missing/wrong code is a login
+    // failure like any other: generic error, failure recorded (which
+    // also feeds the budget above).
+    if crate::moderation::totp_enrolled(&st.pool, id).await.unwrap_or(false) {
+        let code_ok = match f.totp.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            Some(code) => crate::moderation::verify_totp_gate(&st.pool, &st.keyfile, id, code)
+                .await
+                .is_ok(),
+            None => false,
+        };
+        if !code_ok {
+            let (d, tpl) = fail(&st);
+            tokio::time::sleep(std::time::Duration::from_secs(d.whole_seconds().min(5) as u64)).await;
+            return page(&st, &headers, "Log in", tpl.render().unwrap()).await;
+        }
     }
     st.throttles.clear_login_failures(&folded);
     // Stage 9 (owner ruling 2026-10-16): a closed account cannot log
@@ -743,6 +842,9 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Lo
     let Some((token, sess, csrf_secret)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf_secret, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -1079,7 +1181,38 @@ async fn seller_page(
 #[derive(Deserialize)]
 struct PaymentIdentityForm {
     primary_address: String,
+    /// Step-up (task 2): current passphrase, plus a TOTP code when
+    /// the account is enrolled.
+    password: Option<String>,
+    totp: Option<String>,
     csrf: String,
+}
+
+/// The seller payment gate shared by the identity and batch handlers
+/// (tasks 1+2): TOTP enrollment is MANDATORY before a seller can set
+/// a payment identity, and every change needs the step-up. Returns
+/// the refusal redirect when the gate fails.
+async fn seller_payment_gate(
+    st: &AppState,
+    sess: &sessions::Session,
+    password: Option<&str>,
+    totp: Option<&str>,
+) -> Option<Response> {
+    if !crate::moderation::totp_enrolled(&st.pool, sess.account_id).await.unwrap_or(false) {
+        return Some(
+            Redirect::to("/seller?pmsg=Enroll in TOTP on your security page first: a payment identity cannot be set or changed without two-factor authentication.")
+                .into_response(),
+        );
+    }
+    let Some(pw) = password.filter(|p| !p.is_empty()) else {
+        return Some(
+            Redirect::to("/seller?pmsg=Step-up verification failed: enter your current passphrase.").into_response(),
+        );
+    };
+    match step_up(st, sess, pw, totp).await {
+        Ok(()) => None,
+        Err(msg) => Some(Redirect::to(&format!("/seller?pmsg={msg}")).into_response()),
+    }
 }
 
 async fn payment_identity_post(
@@ -1090,12 +1223,18 @@ async fn payment_identity_post(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
     let role_s = db::role_of(&st.pool, sess.account_id).await.ok().flatten().unwrap_or_else(|| "buyer".into());
     if authorize("POST", "/seller/payment-identity", Some(role_from_str(&role_s))) != Decision::Allow {
         return (StatusCode::FORBIDDEN, "Sellers only").into_response();
+    }
+    if let Some(r) = seller_payment_gate(&st, &sess, f.password.as_deref(), f.totp.as_deref()).await {
+        return r;
     }
     // The form field arrives through the form layer; the address value
     // itself is validated untrimmed by modules-api (whitespace-wrapped
@@ -1107,7 +1246,10 @@ async fn payment_identity_post(
         }
     };
     match crate::payments::set_primary_address(&st.pool, sess.account_id, &lines[0], &st.payments).await {
-        Ok(_) => Redirect::to("/seller?pmsg=Payment identity saved.").into_response(),
+        Ok(_) => {
+            stepup_notice(&st, sess.account_id, "stepup_payment_identity", "your primary payment address was set or changed").await;
+            Redirect::to("/seller?pmsg=Payment identity saved.").into_response()
+        }
         Err(e) => Redirect::to(&format!("/seller?pmsg=Primary address rejected: {e:?}")).into_response(),
     }
 }
@@ -1120,6 +1262,9 @@ async fn payment_batch_post(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     let role_s = db::role_of(&st.pool, sess.account_id).await.ok().flatten().unwrap_or_else(|| "buyer".into());
     if authorize("POST", "/seller/payment-batches", Some(role_from_str(&role_s))) != Decision::Allow {
         return (StatusCode::FORBIDDEN, "Sellers only").into_response();
@@ -1127,11 +1272,25 @@ async fn payment_batch_post(
     let mut csrf_ok = false;
     let mut pasted: Option<String> = None;
     let mut file_text: Option<String> = None;
+    // Step-up fields (task 2): the batch form carries the current
+    // passphrase and, when enrolled, a TOTP code.
+    let mut stepup_password: Option<String> = None;
+    let mut stepup_totp: Option<String> = None;
     while let Ok(Some(field)) = mp.next_field().await {
         match field.name() {
             Some("csrf") => {
                 if let Ok(v) = field.text().await {
                     csrf_ok = sessions::csrf_matches(&csrf, &v);
+                }
+            }
+            Some("password") => {
+                if let Ok(v) = field.text().await {
+                    stepup_password = Some(v);
+                }
+            }
+            Some("totp") => {
+                if let Ok(v) = field.text().await {
+                    stepup_totp = Some(v);
                 }
             }
             Some("batch_json") => {
@@ -1154,13 +1313,19 @@ async fn payment_batch_post(
     if !csrf_ok {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
+    if let Some(r) = seller_payment_gate(&st, &sess, stepup_password.as_deref(), stepup_totp.as_deref()).await {
+        return r;
+    }
     // The batch text is parsed as JSON and its string values are stored
     // byte-exact as parsed — nothing here trims or re-encodes them.
     let Some(text) = file_text.or(pasted) else {
         return Redirect::to("/seller?pmsg=No batch received: paste the batch JSON or choose the batch file.").into_response();
     };
     match crate::payments::upload_batch(&st.pool, sess.account_id, &text, &st.payments).await {
-        Ok(n) => Redirect::to(&format!("/seller?pmsg=Batch accepted: {n} payment address(es) added to your pool.")).into_response(),
+        Ok(n) => {
+            stepup_notice(&st, sess.account_id, "stepup_payment_batch", "a signed subaddress batch was uploaded to your pool").await;
+            Redirect::to(&format!("/seller?pmsg=Batch accepted: {n} payment address(es) added to your pool.")).into_response()
+        }
         Err(e) => Redirect::to(&format!("/seller?pmsg=Batch rejected (nothing was stored): {e:?}")).into_response(),
     }
 }
@@ -1174,6 +1339,9 @@ async fn seller_apply(State(st): State<AppState>, headers: HeaderMap, Form(f): F
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -1199,6 +1367,9 @@ async fn create_listing(State(st): State<AppState>, headers: HeaderMap, Form(f):
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -1240,6 +1411,9 @@ async fn listing_status(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -1261,6 +1435,9 @@ async fn listing_media(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     let Some(l) = lst::listing_by_public_id(&st.pool, &id).await.ok().flatten() else {
         return (StatusCode::NOT_FOUND, "No such listing").into_response();
     };
@@ -1343,6 +1520,20 @@ async fn media_serve(State(st): State<AppState>, Path(r#ref): Path<String>) -> R
 struct ModerationTpl {
     applications: Vec<(i64, String)>,
     csrf: String,
+    /// Account Security Audit task 3: shown when a decision was
+    /// refused for want of a fresh TOTP code.
+    message: Option<String>,
+    totp_enrolled: bool,
+}
+
+async fn moderation_sellers_render(st: &AppState, headers: &HeaderMap, sess: &sessions::Session, csrf: &str, message: Option<String>) -> Response {
+    let applications = lst::pending_seller_applications(&st.pool).await.unwrap_or_default();
+    let totp_enrolled = crate::moderation::totp_enrolled(&st.pool, sess.account_id)
+        .await
+        .unwrap_or(false);
+    let tpl = ModerationTpl { applications, csrf: csrf.to_string(), message, totp_enrolled };
+    let _ = sess;
+    page(st, headers, "Seller applications", tpl.render().unwrap()).await
 }
 
 async fn moderation_sellers(State(st): State<AppState>, headers: HeaderMap) -> Response {
@@ -1353,14 +1544,15 @@ async fn moderation_sellers(State(st): State<AppState>, headers: HeaderMap) -> R
     if authorize("GET", "/moderation/sellers", Some(role_from_str(&role_s))) != Decision::Allow {
         return (StatusCode::FORBIDDEN, "Moderators only").into_response();
     }
-    let applications = lst::pending_seller_applications(&st.pool).await.unwrap_or_default();
-    let tpl = ModerationTpl { applications, csrf };
-    page(&st, &headers, "Seller applications", tpl.render().unwrap()).await
+    moderation_sellers_render(&st, &headers, &sess, &csrf, None).await
 }
 
 #[derive(Deserialize)]
 struct DecideForm {
     decision: String,
+    /// Task 3 (AH1): approving or declining a seller is a moderator
+    /// action — it needs a fresh TOTP code like every other one.
+    totp: Option<String>,
     csrf: String,
 }
 
@@ -1373,12 +1565,34 @@ async fn moderation_decide(
     let Some((_t, _sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(_sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
     let role_s = db::role_of(&st.pool, _sess.account_id).await.ok().flatten().unwrap_or_else(|| "buyer".into());
     if !matches!(role_from_str(&role_s), Role::Moderator | Role::Admin) {
         return (StatusCode::FORBIDDEN, "Moderators only").into_response();
+    }
+    // Task 3 (AH1): a fresh TOTP code gates seller decisions — a
+    // moderator session alone must not be able to approve sellers.
+    let code = f.totp.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let totp_ok = match code {
+        Some(c) => crate::moderation::require_totp(&st.pool, &st.keyfile, _sess.account_id, c)
+            .await
+            .is_ok(),
+        None => false,
+    };
+    if !totp_ok {
+        return moderation_sellers_render(
+            &st,
+            &headers,
+            &_sess,
+            &csrf,
+            Some("Decision refused: a fresh TOTP code is required to approve or decline a seller. Enroll on your security page if you have not.".into()),
+        )
+        .await;
     }
     let _ = lst::decide_seller_application(&st.pool, _sess.account_id, id, f.decision == "approve").await;
     Redirect::to("/moderation/sellers").into_response()
@@ -1454,6 +1668,11 @@ async fn security_page(State(st): State<AppState>, headers: HeaderMap) -> Respon
 #[derive(Deserialize)]
 struct KeyUploadForm {
     cert: String,
+    /// Step-up (task 2, AM3): current passphrase, plus a TOTP code
+    /// when enrolled. A stolen session must not be able to plant the
+    /// key buyers will encrypt shipping details to.
+    password: Option<String>,
+    totp: Option<String>,
     csrf: String,
 }
 
@@ -1461,8 +1680,18 @@ async fn upload_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
+    }
+    // Step-up BEFORE anything else moves (task 2).
+    let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) else {
+        return security_page_render(&st, &sess, &csrf, Some("Step-up verification failed: enter your current passphrase.".into()), vec![]).await;
+    };
+    if let Err(msg) = step_up(&st, &sess, pw, f.totp.as_deref()).await {
+        return security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await;
     }
     if kmod::current_key(&st.pool, sess.account_id).await.ok().flatten().is_some() {
         return security_page_render(&st, &sess, &csrf, Some("A key is already registered. Use rotation to replace it.".into()), vec![]).await;
@@ -1471,7 +1700,10 @@ async fn upload_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
         Ok(info) => {
             let warnings = info.warnings.clone();
             match kmod::install_key(&st.pool, sess.account_id, f.cert.as_bytes(), &info, None).await {
-                Ok(()) => security_page_render(&st, &sess, &csrf, Some(format!("Key registered: {}", info.fingerprint)), warnings).await,
+                Ok(()) => {
+                    stepup_notice(&st, sess.account_id, "stepup_key_upload", "an identity key was registered on your account").await;
+                    security_page_render(&st, &sess, &csrf, Some(format!("Key registered: {}", info.fingerprint)), warnings).await
+                }
                 Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not store key (fingerprint already registered?)").into_response(),
             }
         }
@@ -1486,6 +1718,11 @@ struct RotateForm {
     sig_old: String,
     sig_new: String,
     lost: Option<String>,
+    /// Step-up (task 2, AM3): current passphrase, plus a TOTP code
+    /// when enrolled — including for the uncertified ("lost key")
+    /// path, which is exactly the path a session thief would take.
+    password: Option<String>,
+    totp: Option<String>,
     csrf: String,
 }
 
@@ -1493,8 +1730,18 @@ async fn rotate_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
+    }
+    // Step-up BEFORE anything else moves (task 2).
+    let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) else {
+        return security_page_render(&st, &sess, &csrf, Some("Step-up verification failed: enter your current passphrase.".into()), vec![]).await;
+    };
+    if let Err(msg) = step_up(&st, &sess, pw, f.totp.as_deref()).await {
+        return security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await;
     }
     let Some((cur_fpr, cur_cert, _v)) = kmod::current_key(&st.pool, sess.account_id).await.ok().flatten() else {
         return security_page_render(&st, &sess, &csrf, Some("No current key to rotate.".into()), vec![]).await;
@@ -1509,7 +1756,10 @@ async fn rotate_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     if f.lost.as_deref() == Some("true") {
         // Uncertified rotation: no statement, warning shows for 90 days (§8).
         return match kmod::install_key(&st.pool, sess.account_id, f.new_cert.as_bytes(), &info, Some((b"", None, None, false))).await {
-            Ok(()) => security_page_render(&st, &sess, &csrf, Some("Key rotated without certification. A warning will show on your profile for 90 days.".into()), info.warnings.clone()).await,
+            Ok(()) => {
+                stepup_notice(&st, sess.account_id, "stepup_key_rotation", "your identity key was rotated (uncertified)").await;
+                security_page_render(&st, &sess, &csrf, Some("Key rotated without certification. A warning will show on your profile for 90 days.".into()), info.warnings.clone()).await
+            }
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Rotation failed").into_response(),
         };
     }
@@ -1536,7 +1786,10 @@ async fn rotate_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     )
     .await
     {
-        Ok(()) => security_page_render(&st, &sess, &csrf, Some(format!("Key rotated (certified): {}", info.fingerprint)), info.warnings.clone()).await,
+        Ok(()) => {
+            stepup_notice(&st, sess.account_id, "stepup_key_rotation", "your identity key was rotated (certified)").await;
+            security_page_render(&st, &sess, &csrf, Some(format!("Key rotated (certified): {}", info.fingerprint)), info.warnings.clone()).await
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Rotation failed").into_response(),
     }
 }
@@ -1551,6 +1804,9 @@ async fn update_profile(State(st): State<AppState>, headers: HeaderMap, Form(f):
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) || f.profile_text.chars().count() > 1000 {
         return (StatusCode::FORBIDDEN, "Rejected").into_response();
     }
@@ -1567,6 +1823,9 @@ async fn revoke_session(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -1783,6 +2042,9 @@ async fn create_order_handler(State(st): State<AppState>, headers: HeaderMap, Fo
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -2021,6 +2283,9 @@ async fn order_action(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -2235,6 +2500,9 @@ async fn inbox_read_all(State(st): State<AppState>, headers: HeaderMap, Form(f):
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -2358,6 +2626,9 @@ async fn send_message_handler(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -2429,6 +2700,9 @@ async fn conversation_for_order(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -2453,6 +2727,9 @@ async fn conversation_direct(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !sessions::csrf_matches(&csrf, &f.csrf) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
@@ -2477,6 +2754,9 @@ async fn send_message_file_handler(
     let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
     if !msg::is_participant(&st.pool, id, sess.account_id).await.unwrap_or(false) {
         return (StatusCode::NOT_FOUND, "No such conversation").into_response();
     }
@@ -2543,6 +2823,10 @@ async fn guard_post(
     let Some((_t, sess, csrf)) = current_session(st, headers).await else {
         return Err(Redirect::to("/login").into_response());
     };
+    // Task 5: every signed-in POST passes the per-account throttle.
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return Err(r);
+    }
     let role = role_from_str(&db::role_of(&st.pool, sess.account_id).await.ok().flatten().unwrap_or_else(|| "buyer".into()));
     if authorize("POST", pattern, Some(role)) != Decision::Allow {
         return Err((StatusCode::FORBIDDEN, "Denied").into_response());
@@ -2635,6 +2919,10 @@ struct DisputeTpl {
     signed_message: Option<String>,
     signed_signature: Option<String>,
     disclosures: Vec<crate::disputes::DisclosureView>,
+    /// Account Security Audit task 3 (AH1): for a moderator viewer
+    /// without a live step-up grant, disclosures are not decrypted
+    /// or rendered at all — the page shows the unlock form instead.
+    disclosures_locked: bool,
     /// The buyer's submitted tx proof — populated ONLY when the
     /// viewer is a moderator or the buyer party (owner-directed
     /// visibility rule, 2026-10-18). A seller's render never carries
@@ -2657,7 +2945,7 @@ async fn dispute_page(
     Path(id): Path<i64>,
     Query(p): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
+    let Some((token, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
     let role = role_from_str(&db::role_of(&st.pool, sess.account_id).await.ok().flatten().unwrap_or_else(|| "buyer".into()));
@@ -2682,9 +2970,26 @@ async fn dispute_page(
         .await
         .ok()
         .flatten();
-    let disclosures = crate::disputes::disclosures_for(&st.pool, &st.keyfile, d.id)
-        .await
-        .unwrap_or_default();
+    // Task 3 (AH1): moderator READS of disclosures need a fresh code.
+    // Without a live step-up grant for this session, the disclosures
+    // are not even decrypted, let alone rendered. Parties to the
+    // dispute keep their existing view (the audit's finding is about
+    // moderator sessions specifically).
+    let disclosures_locked = is_moderator
+        && !crate::moderation::stepup_granted(
+            &st.pool,
+            &crate::sessions::hash_token(&token),
+            sess.account_id,
+            "disclosures",
+        )
+        .await;
+    let disclosures = if disclosures_locked {
+        Vec::new()
+    } else {
+        crate::disputes::disclosures_for(&st.pool, &st.keyfile, d.id)
+            .await
+            .unwrap_or_default()
+    };
     let totp_enrolled = crate::moderation::totp_enrolled(&st.pool, sess.account_id)
         .await
         .unwrap_or(false);
@@ -2722,6 +3027,7 @@ async fn dispute_page(
         signed_message: assignment.as_ref().map(|a| a.message.clone()),
         signed_signature: assignment.as_ref().map(|a| a.signature.clone()),
         disclosures,
+        disclosures_locked,
         is_participant,
         is_moderator,
         is_buyer: o.buyer_id == sess.account_id,
@@ -2734,6 +3040,53 @@ async fn dispute_page(
     };
     let title = format!("Dispute {}", d.id);
     page(&st, &headers, &title, tpl.render().unwrap()).await
+}
+
+#[derive(Deserialize)]
+struct UnlockForm {
+    csrf: String,
+    totp: String,
+}
+
+/// Task 3 (AH1): the moderator presents a FRESH TOTP code to unlock
+/// disclosure viewing for this session (10 minutes, session-bound —
+/// see moderation::grant_stepup). Failed attempts go through the
+/// shared gate, so they count toward the lockout.
+async fn dispute_unlock(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<UnlockForm>,
+) -> Response {
+    let Some((token, sess, csrf)) = current_session(&st, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
+    let role = role_from_str(&db::role_of(&st.pool, sess.account_id).await.ok().flatten().unwrap_or_else(|| "buyer".into()));
+    if authorize("POST", "/disputes/{id}/unlock", Some(role)) != Decision::Allow {
+        return (StatusCode::FORBIDDEN, "Denied").into_response();
+    }
+    if !sessions::csrf_matches(&csrf, &f.csrf) {
+        return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
+    }
+    match crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
+        Ok(()) => {
+            let _ = crate::moderation::grant_stepup(
+                &st.pool,
+                &crate::sessions::hash_token(&token),
+                sess.account_id,
+                "disclosures",
+            )
+            .await;
+            Redirect::to(&format!("/disputes/{id}")).into_response()
+        }
+        Err(e) => Redirect::to(&format!(
+            "/disputes/{id}?msg=Unlock refused: {e:?}. Disclosures stay locked."
+        ))
+        .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -3136,17 +3489,36 @@ async fn listing_restore(
 
 // -- TOTP enrollment + self-service closure ----------------------------------------
 
+#[derive(Deserialize)]
+struct TotpBeginForm {
+    csrf: String,
+    /// Step-up (task 2, AM3): enrollment changes the account's
+    /// second factor, so it needs the current passphrase — plus a
+    /// current code when TOTP is already on.
+    password: Option<String>,
+    totp: Option<String>,
+}
+
 async fn totp_begin_h(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Form(f): Form<CsrfOnly>,
+    Form(f): Form<TotpBeginForm>,
 ) -> Response {
     let (sess, _c) = match guard_post(&st, &headers, "/account/totp/begin", &f.csrf).await {
         Ok(v) => v,
         Err(r) => return r,
     };
+    let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) else {
+        return security_page_render(&st, &sess, &f.csrf, Some("Step-up verification failed: enter your current passphrase to start TOTP enrollment.".into()), vec![]).await;
+    };
+    if let Err(msg) = step_up(&st, &sess, pw, f.totp.as_deref()).await {
+        return security_page_render(&st, &sess, &f.csrf, Some(msg), vec![]).await;
+    }
     match crate::moderation::totp_begin(&st.pool, &st.keyfile, sess.account_id).await {
-        Ok(_) => security_page_render(&st, &sess, &f.csrf, Some("Enrollment started: enter the code from your authenticator to activate.".into()), vec![]).await,
+        Ok(_) => {
+            stepup_notice(&st, sess.account_id, "stepup_totp_enrollment", "TOTP enrollment was started on your account").await;
+            security_page_render(&st, &sess, &f.csrf, Some("Enrollment started: enter the code from your authenticator to activate.".into()), vec![]).await
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not start enrollment").into_response(),
     }
 }
@@ -3231,4 +3603,136 @@ async fn account_close_self(
         .await,
         Err(e) => notice_page(&st, &headers, "Closure failed", &format!("The account could not be closed ({e:?}).")).await,
     }
+}
+
+// -- Task 8 (AL4): passphrase change + recovery-code issuance --------------
+//
+// Before this fix, the ONLY way to change a passphrase was to burn
+// the single recovery code through /account/recover — a user who
+// merely suspected a leak had to spend their one recovery path.
+
+#[derive(Deserialize)]
+struct PassphraseChangeForm {
+    csrf: String,
+    current_password: String,
+    new_password: String,
+}
+
+async fn passphrase_change(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<PassphraseChangeForm>,
+) -> Response {
+    let (sess, _c) = match guard_post(&st, &headers, "/account/passphrase", &f.csrf).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // The current session's token: it survives the change; every
+    // OTHER session is revoked.
+    let Some((token, _, _)) = current_session(&st, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if f.new_password.len() < 12 || crate::passwords::is_common_password(&f.new_password) {
+        return security_page_render(&st, &sess, &f.csrf, Some("New passphrase must be at least 12 characters and not a common one.".into()), vec![]).await;
+    }
+    let stored: Option<String> = sqlx::query_scalar("SELECT password_hash FROM accounts WHERE id = $1")
+        .bind(sess.account_id)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten();
+    let Some(stored) = stored else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response();
+    };
+    let scope = format!("acct:{}", sess.account_id);
+    match st.hash_guard.verify_scoped(&scope, &f.current_password, &stored).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return security_page_render(&st, &sess, &f.csrf, Some("Current passphrase did not verify — passphrase unchanged.".into()), vec![]).await;
+        }
+        Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
+    }
+    let hash = match st.hash_guard.hash_scoped(&scope, &f.new_password).await {
+        Ok(h) => h,
+        Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
+    };
+    if sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+        .bind(sess.account_id)
+        .bind(&hash)
+        .execute(&st.pool)
+        .await
+        .is_err()
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response();
+    }
+    let _ = db::revoke_other_sessions(&st.pool, sess.account_id, &token).await;
+    stepup_notice(&st, sess.account_id, "security_passphrase_changed", "your passphrase was changed and all other sessions were signed out").await;
+    security_page_render(&st, &sess, &f.csrf, Some("Passphrase changed. All other sessions were signed out.".into()), vec![]).await
+}
+
+#[derive(Deserialize)]
+struct RecoveryIssueForm {
+    csrf: String,
+    password: String,
+}
+
+/// POST /account/recovery-codes — declared in the route table since
+/// §17 but never served until now (AL4). Issuing a code requires the
+/// current passphrase, burns every previous unconsumed code, and
+/// shows the new code exactly once.
+async fn recovery_code_issue(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<RecoveryIssueForm>,
+) -> Response {
+    let (sess, csrf) = match guard_post(&st, &headers, "/account/recovery-codes", &f.csrf).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let stored: Option<String> = sqlx::query_scalar("SELECT password_hash FROM accounts WHERE id = $1")
+        .bind(sess.account_id)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten();
+    let Some(stored) = stored else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response();
+    };
+    let scope = format!("acct:{}", sess.account_id);
+    match st.hash_guard.verify_scoped(&scope, &f.password, &stored).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return security_page_render(&st, &sess, &f.csrf, Some("Passphrase did not verify — no recovery code was issued.".into()), vec![]).await;
+        }
+        Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
+    }
+    let code = recovery::new_recovery_code();
+    if db::replace_recovery_code(&st.pool, sess.account_id, &code).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response();
+    }
+    stepup_notice(&st, sess.account_id, "security_recovery_code_issued", "a new recovery code was issued; previous codes no longer work").await;
+    // Render the account page with the code shown once (the register
+    // flow's presentation).
+    let (username,): (String,) = sqlx::query_as("SELECT username FROM accounts WHERE id = $1")
+        .bind(sess.account_id)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap_or_else(|_| ("?".into(),));
+    let role_s = db::role_of(&st.pool, sess.account_id).await.ok().flatten().unwrap_or_else(|| "buyer".into());
+    let (acct_status, _closed_at, warned_at) =
+        crate::moderation::account_status(&st.pool, sess.account_id)
+            .await
+            .unwrap_or(("active".into(), None, None));
+    let tpl = AccountTpl {
+        username,
+        role: role_s,
+        recovery_code: Some(code),
+        csrf,
+        warned_date: warned_at.map(|t| t.date().to_string()),
+        account_closed: acct_status == "closed",
+    };
+    page(&st, &headers, "Account", tpl.render().unwrap()).await
 }

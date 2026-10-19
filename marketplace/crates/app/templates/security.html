@@ -2,6 +2,7 @@
 {% if let Some(m) = message %}<p role="status">{{ m }}</p>{% endif %}
 {% for w in warnings %}<p role="alert">{{ w }}</p>{% endfor %}
 <h2>Identity key</h2>
+<p>Registering or rotating your key is an identity change: it requires your current passphrase, plus a TOTP code if you are enrolled (step-up). A signed-in session alone is never enough to change the key buyers encrypt to.</p>
 {% if let Some(f) = current_fingerprint %}
 <p>Current fingerprint: <code>{{ f }}</code></p>
 <h3>Rotate key</h3>
@@ -12,12 +13,16 @@
 <label>Signature by old key (.asc)<br><textarea name="sig_old" rows="5" cols="70"></textarea></label>
 <label>Signature by new key (.asc)<br><textarea name="sig_new" rows="5" cols="70"></textarea></label>
 <label><input type="checkbox" name="lost" value="true"> I lost my old key (uncertified rotation — a warning will show on your profile for 90 days)</label>
+<label>Current passphrase <input type="password" name="password" autocomplete="current-password" required></label>
+<label>TOTP code (if enrolled) <input name="totp" inputmode="numeric" autocomplete="one-time-code"></label>
 <button type="submit">Rotate</button></form>
 {% else %}
 <p>No identity key yet. Sellers must register one; buyers need one to send messages.</p>
 <form method="post" action="/account/keys">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>OpenPGP certificate (armored)<br><textarea name="cert" rows="10" cols="70" required></textarea></label>
+<label>Current passphrase <input type="password" name="password" autocomplete="current-password" required></label>
+<label>TOTP code (if enrolled) <input name="totp" inputmode="numeric" autocomplete="one-time-code"></label>
 <button type="submit">Register key</button></form>
 {% endif %}
 <h2>Sessions</h2>
@@ -28,7 +33,7 @@
 <button type="submit">Revoke</button></form>{% endif %}</p>
 {% endfor %}
 <h2>Two-factor authentication (TOTP)</h2>
-<p>Moderator accounts must enroll: every moderator action (resolving a dispute, warning or closing an account, removing a listing) requires a current code. Any account may enroll.</p>
+<p>Moderator accounts must enroll: every moderator action (resolving a dispute, reading disclosures, approving a seller, warning or closing an account, removing a listing) requires a current code. Sellers must enroll before they can set a payment identity. Enrolled accounts must also enter a code at every log in. Any account may enroll. Starting enrollment requires your current passphrase (step-up); a code is single-use — once accepted, the same code is refused everywhere until it expires.</p>
 {% if totp_enabled %}
 <p><strong>TOTP is on</strong> for this account.</p>
 <form method="post" action="/account/totp/disable">
@@ -46,8 +51,22 @@
 {% else %}
 <form method="post" action="/account/totp/begin">
 <input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Current passphrase <input type="password" name="password" autocomplete="current-password" required></label>
 <button type="submit">Start TOTP enrollment</button></form>
 {% endif %}
+<h2>Passphrase</h2>
+<p>Change your passphrase here — you do not need to spend your recovery code. Changing it signs out every OTHER session; this one stays signed in.</p>
+<form method="post" action="/account/passphrase">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Current passphrase <input type="password" name="current_password" autocomplete="current-password" required></label>
+<label>New passphrase <input type="password" name="new_password" autocomplete="new-password" required></label>
+<button type="submit">Change passphrase</button></form>
+<h2>Recovery code</h2>
+<p>Issue a new recovery code. The new code replaces every previous one — old codes stop working immediately. The new code is shown once, on the account page, after you confirm your passphrase.</p>
+<form method="post" action="/account/recovery-codes">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Current passphrase <input type="password" name="password" autocomplete="current-password" required></label>
+<button type="submit">Issue a new recovery code</button></form>
 <h2>Close this account</h2>
 <p>Closing ends this identity: you will not be able to log in again, your listings will be unpublished, unused payment addresses retired, and your reputation will stop growing. Your order and review history stays visible to people you traded with — their records depend on it. Closure cannot be undone from here. It also does not erase anything, and nothing prevents a new account being registered later.</p>
 <form method="post" action="/account/close">

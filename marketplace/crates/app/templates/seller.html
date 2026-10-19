@@ -20,14 +20,19 @@ Your seller ID: <code>{{ payment_seller_id }}</code></p>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Primary address (standard address, account 0 index 0)
 <input name="primary_address" size="100"></label>
+<label>Current passphrase <input type="password" name="password" autocomplete="current-password" required></label>
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
 <button type="submit">Save primary address</button></form>
 <p>Changing the primary address treats it as a new payment identity: all unused pool addresses are retired and a change notice shows for a set period. Order and review history is never erased.</p>
+<p><strong>Step-up required:</strong> setting or changing a payment identity, and uploading a batch, requires your current passphrase and a TOTP code. TOTP enrollment is mandatory for sellers before a payment identity can be set — enroll on your <a href="/account/security">security page</a> first.</p>
 <h3>Upload a signed subaddress batch</h3>
 <p>Generate the batch with the seller helper tool, then paste the batch JSON or choose the batch file. Uploads are all-or-nothing: one bad entry rejects the whole batch.</p>
 <form method="post" action="/seller/payment-batches" enctype="multipart/form-data">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Batch JSON <textarea name="batch_json" rows="8" cols="80"></textarea></label>
 <label>Batch file <input type="file" name="batch_file" accept="application/json,.json"></label>
+<label>Current passphrase <input type="password" name="password" autocomplete="current-password" required></label>
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
 <button type="submit">Upload batch</button></form>
 <h2>Your listings</h2>
 {% for l in listings %}

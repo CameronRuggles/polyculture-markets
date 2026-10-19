@@ -85,11 +85,20 @@ pub fn code_at(secret: &[u8], unix_secs: u64) -> String {
 /// accepting ±WINDOW steps. Comparison is over the formatted codes
 /// (fixed length, so a byte-wise fold is constant-time in the code).
 pub fn verify(secret: &[u8], presented: &str, unix_secs: u64) -> bool {
+    verify_step(secret, presented, unix_secs).is_some()
+}
+
+/// Like `verify`, but returns the time step (unix_secs / STEP_SECONDS)
+/// the presented code belongs to. The account-security gates use the
+/// step for replay protection (audit AL3): once a step has been
+/// accepted for an account, no code from that step — or an older one —
+/// is accepted again.
+pub fn verify_step(secret: &[u8], presented: &str, unix_secs: u64) -> Option<u64> {
     let presented = presented.trim();
     if presented.len() != DIGITS as usize || !presented.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+        return None;
     }
-    let mut ok = false;
+    let mut matched: Option<u64> = None;
     for w in -WINDOW..=WINDOW {
         let t = unix_secs as i64 + w * STEP_SECONDS as i64;
         if t < 0 {
@@ -100,9 +109,11 @@ pub fn verify(secret: &[u8], presented: &str, unix_secs: u64) -> bool {
         for (a, b) in expected.bytes().zip(presented.bytes()) {
             diff |= a ^ b;
         }
-        ok |= diff == 0;
+        if diff == 0 {
+            matched = Some(t as u64 / STEP_SECONDS);
+        }
     }
-    ok
+    matched
 }
 
 /// otpauth URI for manual/QR enrollment (rendered as text; no JS).

@@ -151,6 +151,12 @@ pub const ROUTES: &[RouteRule] = &[
     RouteRule { method: "POST", path: "/account/totp/confirm", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "POST", path: "/account/totp/disable", roles: AUTHENTICATED, csrf: true },
     RouteRule { method: "POST", path: "/account/close", roles: AUTHENTICATED, csrf: true },
+    // Account Security Audit (2026-10-18): passphrase change (task 8;
+    // POST /account/recovery-codes above was declared by §17 all
+    // along and is now actually served) and the moderator disclosure
+    // unlock (task 3; Moderation, like the other dispute actions).
+    RouteRule { method: "POST", path: "/account/passphrase", roles: AUTHENTICATED, csrf: true },
+    RouteRule { method: "POST", path: "/disputes/{id}/unlock", roles: MODERATION, csrf: true },
 ];
 
 #[derive(Debug, PartialEq, Eq)]

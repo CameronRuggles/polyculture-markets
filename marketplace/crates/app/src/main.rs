@@ -14,8 +14,55 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:dev@localhost/marketplace_dev".into());
+    // Account Security Audit AL2 (task 6): outside the Development
+    // profile there is NO database fallback. The old silent default
+    // (postgres:dev@localhost) meant a mistyped deployment connected
+    // to a development database — or failed later in confusing ways.
+    // Refuse to start instead.
+    let url = match std::env::var("DATABASE_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            if instance.profile != app::config::Profile::Development {
+                eprintln!(
+                    "configuration error: DATABASE_URL is not set; refusing to start outside the development profile"
+                );
+                std::process::exit(2);
+            }
+            "postgres://postgres:dev@localhost/marketplace_dev".into()
+        }
+    };
+    // Stage 9: the marketplace key file lives OUTSIDE the database
+    // (KEY_FILE_PATH, default ./marketplace.key, mode 0600). It keys
+    // buyer tokens and encrypts TOTP secrets + disclosed evidence;
+    // back it up separately from the database (docs/operations.md).
+    //
+    // Account Security Audit AL1 (task 6): outside the Development
+    // profile the key file must ALREADY exist. Silently minting a
+    // replacement (the old behaviour) makes every stored TOTP secret
+    // and disclosure undecryptable and changes every buyer token —
+    // an operator who notices only that "logins broke" has already
+    // lost the data. Refuse to start.
+    //
+    // The key file is loaded BEFORE the database pool is opened: a
+    // refused start must be deterministic (exit 2 on the missing
+    // secret itself), never a race against pool connection timing.
+    let key_path = std::env::var("KEY_FILE_PATH").unwrap_or_else(|_| "marketplace.key".into());
+    let keyfile = if instance.profile != app::config::Profile::Development {
+        match app::keyfile::KeyFile::load_existing(std::path::Path::new(&key_path)) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!(
+                    "configuration error: cannot load marketplace key file at {key_path}: {e}; \
+                     refusing to start outside the development profile (a fresh key would \
+                     orphan every stored TOTP secret and disclosure)"
+                );
+                std::process::exit(2);
+            }
+        }
+    } else {
+        app::keyfile::KeyFile::load_or_generate(std::path::Path::new(&key_path))
+            .expect("marketplace key file must be readable or creatable")
+    };
     let pool = PgPoolOptions::new().max_connections(8).connect(&url).await?;
     // Direct Payments v1: the marketplace_id is baked into every signed
     // payment message, so it must be short, stable, and permanent —
@@ -51,13 +98,6 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     }
-    // Stage 9: the marketplace key file lives OUTSIDE the database
-    // (KEY_FILE_PATH, default ./marketplace.key, mode 0600). It keys
-    // buyer tokens and encrypts TOTP secrets + disclosed evidence;
-    // back it up separately from the database (docs/operations.md).
-    let key_path = std::env::var("KEY_FILE_PATH").unwrap_or_else(|_| "marketplace.key".into());
-    let keyfile = app::keyfile::KeyFile::load_or_generate(std::path::Path::new(&key_path))
-        .expect("marketplace key file must be readable or creatable");
     let stage9 = app::reputation::Stage9Config::from_env();
     let mut retention = app::retention::RetentionConfig::from_env();
     // The disclosure retention period has ONE source of truth: the

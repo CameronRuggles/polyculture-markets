@@ -1,10 +1,13 @@
 <h1>Pending seller applications</h1>
+{% if let Some(m) = message %}<p role="alert">{{ m }}</p>{% endif %}
+{% if !totp_enrolled %}<p role="alert">You have not enrolled in TOTP. Decisions are refused until you enroll on your <a href="/account/security">security page</a>.</p>{% endif %}
+<p>Approving or declining an application is a moderator action: enter a fresh TOTP code with each decision.</p>
 {% for a in applications %}
 <p>{{ a.1 }}
 <form method="post" action="/moderation/sellers/{{ a.0 }}">
 <input type="hidden" name="csrf" value="{{ csrf }}">
+<label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>
 <button name="decision" value="approve" type="submit">Approve</button>
 <button name="decision" value="decline" type="submit">Decline</button></form></p>
 {% endfor %}
 {% if applications.is_empty() %}<p>None pending.</p>{% endif %}
-
