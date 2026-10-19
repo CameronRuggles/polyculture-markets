@@ -256,11 +256,11 @@ async fn recover_attempt(
     code: &str,
     password: &str,
 ) -> HttpResult {
-    let csrf = anon_csrf(addr, "/recover").await;
+    let csrf = anon_csrf(addr, "/account/recover").await;
     let cookie = format!("csrf={csrf}");
     post_form(
         addr,
-        "/recover",
+        "/account/recover",
         Some(&cookie),
         &[
             ("csrf", &csrf),
@@ -435,6 +435,10 @@ async fn publish_requires_payment_identity_and_unused_pool() {
     assert_eq!(listing_status_of(&pool, &pub_id).await, "draft");
 
     // Identity + one unused pool entry: publishing succeeds.
+    // (The destination address is unique per run: the destinations
+    // table enforces global no-reuse, so a fixed fixture address
+    // would collide with this test's own earlier runs.)
+    let subaddr = format!("bmbl-sub-{}", uniq());
     let (batch_id,): (i64,) = sqlx::query_as(
         "INSERT INTO payment_batches (seller_id, marketplace_id, network, entry_count)
          VALUES ($1, 'vespiary-market', 'stagenet', 1) RETURNING id",
@@ -447,7 +451,7 @@ async fn publish_requires_payment_identity_and_unused_pool() {
         "INSERT INTO destinations (address, seller_id, source)
          VALUES ($1, $2, 'pool') RETURNING id",
     )
-    .bind(SUBADDR)
+    .bind(&subaddr)
     .bind(seller)
     .fetch_one(&pool)
     .await
@@ -459,7 +463,7 @@ async fn publish_requires_payment_identity_and_unused_pool() {
     .bind(batch_id)
     .bind(seller)
     .bind(dest_id)
-    .bind(SUBADDR)
+    .bind(&subaddr)
     .execute(&pool)
     .await
     .unwrap();
@@ -551,7 +555,6 @@ async fn every_authz_rule_names_a_served_route() {
 }
 
 const PRIMARY: &str = "55b6gZhKJ2b6EzvernZJBcPXiZym13w1CfbpDU6sR8aSGpaRbAmU4EMSH3XYXu5U1cSac7B49WRSSBbwQK9by3c7H9AdnFB";
-const SUBADDR: &str = "85ecAyh9QuvfaDyaPRTVnwgc2QxjTByx2GM2haFsn8wrEu2vSVn7QctGiKQdpP5vNPeB2Fzbg8Sb78mqA22Qc2GaHdYhWsY";
 
 // ---------------------------------------------------------------------------
 // Task 5 (BL3): Unicode format characters (category Cf) are
@@ -722,7 +725,8 @@ async fn review_and_profile_text_refuse_format_chars() {
         &[("csrf", &csrf), ("profile_text", "hello world")],
     )
     .await;
-    assert_eq!(r.status, 302, "clean profile text is accepted");
+    assert_eq!(r.status, 303, "clean profile text is accepted (redirect)");
+    assert_eq!(location_of(&r), "/account/security");
     srv.stop();
 }
 
