@@ -1205,20 +1205,21 @@ async fn recover(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<R
     let Some((id, _stored, _role)) = db::account_by_username(&st.pool, &folded).await.ok().flatten() else {
         return err(&st, &headers, &f.csrf, "Recovery failed.").await; // same message as a bad code: no account oracle
     };
-    match db::consume_recovery_code(&st.pool, id, &f.code).await {
-        Ok(true) => {}
-        _ => return err(&st, &headers, &f.csrf, "Recovery failed.").await,
-    }
+    // Modules Audit BM2 (2026-10-19): hash the new passphrase
+    // FIRST. The pre-fix order consumed the recovery code and only
+    // then hashed — a Busy hashing pool at that moment (which BM1
+    // could arrange on demand) burned the user's only code and
+    // left the account unrecoverable. Now a Busy answer here costs
+    // nothing: the code has not been touched. The spend itself is
+    // a single transaction (`db::complete_recovery`): consume the
+    // code, set the hash, revoke sessions, mark recovered, store
+    // the fresh code — and the V3 TOTP clear — commit together or
+    // not at all.
     let hash = match st.hash_guard.hash(&f.password).await {
         Ok(h) => h,
         Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy").into_response(),
         Err(_) => return err(&st, &headers, &f.csrf, "Recovery failed.").await,
     };
-    let _ = sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
-        .bind(id)
-        .bind(&hash)
-        .execute(&st.pool)
-        .await;
     // Verification-fix V3 (OWNER DECISION 2026-10-19): a recovery
     // code also clears TOTP. Before this decision, recovery reset
     // only the passphrase and left TOTP on — and since disabling
@@ -1226,22 +1227,18 @@ async fn recover(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<R
     // a permanently lost account, now that sellers and moderators
     // must enroll. The recovery code is a ~99-bit single-use secret
     // shown once; recovery already signs out every session and
-    // flags the profile (recovered_at). If TOTP was on, it is wiped
-    // here (same column set as totp_disable) and the account is
+    // flags the profile (recovered_at). The wipe itself happens
+    // inside complete_recovery's transaction (same column set as
+    // totp_disable); when it reports TOTP was on, the account is
     // told, on this page and in its inbox. Payment changes are
     // additionally paused for 72 hours after a recovery — see the
     // payment-identity handler.
-    let totp_was_on = crate::moderation::totp_enrolled(&st.pool, id).await.unwrap_or(false);
+    let code = recovery::new_recovery_code();
+    let totp_was_on = match db::complete_recovery(&st.pool, id, &f.code, &hash, &code).await {
+        Ok(Some(was_on)) => was_on,
+        _ => return err(&st, &headers, &f.csrf, "Recovery failed.").await,
+    };
     if totp_was_on {
-        let _ = sqlx::query(
-            "UPDATE accounts SET totp_secret_enc = NULL, totp_pending_enc = NULL,
-                    totp_enabled_at = NULL, totp_last_step = NULL, totp_fail_count = 0,
-                    totp_locked_until = NULL, totp_lock_notified_at = NULL
-              WHERE id = $1",
-        )
-        .bind(id)
-        .execute(&st.pool)
-        .await;
         let _ = crate::orders::notify(
             &st.pool,
             id,
@@ -1251,9 +1248,6 @@ async fn recover(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<R
         )
         .await;
     }
-    // Fresh recovery code for next time; sessions already revoked by consume.
-    let code = recovery::new_recovery_code();
-    let _ = db::store_recovery_code(&st.pool, id, &code).await;
     let totp_note = if totp_was_on {
         "<p>Two-factor authentication was turned <strong>off</strong> by this recovery — re-enroll from your security page. Payment address changes are paused for 72 hours after a recovery.</p>"
     } else {
@@ -1567,7 +1561,7 @@ async fn payment_identity_post(
     // account's history; the pause gives the real owner — who gets
     // the recovery notices — three days to react before money can
     // be redirected. (A first identity set is not a change and is
-    // not paused; recovered_at is stamped by consume_recovery_code.)
+    // not paused; recovered_at is stamped by db::complete_recovery.)
     let recovered_recently: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1
                         AND recovered_at IS NOT NULL

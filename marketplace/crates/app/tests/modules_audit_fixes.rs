@@ -337,6 +337,71 @@ async fn taken_username_registration_refused_without_hashing() {
     srv.stop();
 }
 
+// ---------------------------------------------------------------------------
+// Task 2 (BM2): a busy hashing pool must not burn a recovery code.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn busy_pool_recovery_attempt_leaves_the_code_valid() {
+    let Some(pool) = pool().await else { return };
+    let srv = test_server(&pool).await;
+    let (id, username) = make_account(&pool, "buyer", PW).await;
+    let code = "BM2TK-AAAAA-BBBBB-CCCCC";
+    app::db::store_recovery_code(&pool, id, code).await.unwrap();
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Fill the shared hashing pool: four verifies held in flight.
+    let before = srv.hash_guard.hash_op_count();
+    let mut holds = Vec::new();
+    for _ in 0..4 {
+        let g = srv.hash_guard.clone();
+        let s = stored.clone();
+        holds.push(tokio::spawn(async move { g.verify(PW, &s).await }));
+    }
+    for _ in 0..200 {
+        if srv.hash_guard.hash_op_count() >= before + 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        srv.hash_guard.hash_op_count() >= before + 4,
+        "all four verifies are hashing"
+    );
+
+    // The recovery attempt cannot hash, so it is refused Busy —
+    // and, the BM2 point, the code is NOT spent: on the pre-fix
+    // order (consume first, hash second) this same attempt burned
+    // the code and the retry below answered "Recovery failed."
+    let r = recover_attempt(srv.addr, &username, code, "bmbl-recovered-passphrase-1").await;
+    assert_eq!(r.status, 503, "recovery with a full pool answers Busy");
+
+    for h in holds {
+        let _ = h.await.unwrap();
+    }
+
+    // Once the pool frees, the SAME code works.
+    let r = recover_attempt(srv.addr, &username, code, "bmbl-recovered-passphrase-1").await;
+    assert_eq!(r.status, 200, "the same code recovers once the pool frees");
+    assert!(
+        r.body.contains("Passphrase reset"),
+        "recovery completes: {}",
+        &r.body[..r.body.len().min(200)]
+    );
+
+    // And the new passphrase is live.
+    let r = login_attempt(srv.addr, &username, "bmbl-recovered-passphrase-1").await;
+    assert!(
+        set_cookie_value(&r, "session").is_some(),
+        "login with the recovered passphrase succeeds"
+    );
+    srv.stop();
+}
+
 #[tokio::test]
 async fn registration_budget_refuses_before_hashing() {
     let Some(pool) = pool().await else { return };

@@ -208,6 +208,80 @@ pub async fn consume_recovery_code(
     Ok(true)
 }
 
+/// Modules Audit BM2 (2026-10-19): the full recovery, in ONE
+/// transaction, called only AFTER the new passphrase has been
+/// hashed. The pre-fix handler consumed the code first (via
+/// `consume_recovery_code`) and hashed second — so a Busy hashing
+/// pool, which BM1 could arrange on demand, burned the user's
+/// only recovery code and left the account unrecoverable. Here
+/// the code is spent in the same commit that sets the new hash,
+/// revokes every session, marks the account recovered, applies
+/// the V3 TOTP clear (owner decision 2026-10-19) and stores the
+/// fresh code: any failure before the commit leaves the old code
+/// valid. Returns `Ok(None)` when the code does not match (nothing
+/// was changed), `Ok(Some(totp_was_on))` on success.
+pub async fn complete_recovery(
+    pool: &PgPool,
+    account_id: i64,
+    code: &str,
+    new_password_hash: &str,
+    new_code: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let r = sqlx::query(
+        "UPDATE recovery_codes SET consumed_at = now()
+         WHERE account_id = $1 AND code_hash = $2 AND consumed_at IS NULL",
+    )
+    .bind(account_id)
+    .bind(crate::recovery::hash_code(code).to_vec())
+    .execute(&mut *tx)
+    .await?;
+    if r.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let totp_was_on: bool = sqlx::query_scalar(
+        "SELECT totp_enabled_at IS NOT NULL FROM accounts WHERE id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+        .bind(account_id)
+        .bind(new_password_hash)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE account_id = $1 AND revoked_at IS NULL")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE accounts SET recovered_at = now() WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    if totp_was_on {
+        // V3: recovery clears TOTP (same column set as
+        // totp_disable); the handler posts the inbox notice after
+        // the commit.
+        sqlx::query(
+            "UPDATE accounts SET totp_secret_enc = NULL, totp_pending_enc = NULL,
+                    totp_enabled_at = NULL, totp_last_step = NULL, totp_fail_count = 0,
+                    totp_locked_until = NULL, totp_lock_notified_at = NULL
+              WHERE id = $1",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("INSERT INTO recovery_codes (account_id, code_hash) VALUES ($1, $2)")
+        .bind(account_id)
+        .bind(crate::recovery::hash_code(new_code).to_vec())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(totp_was_on))
+}
+
 pub async fn public_id_of(pool: &PgPool, account_id: i64) -> Result<Option<String>, sqlx::Error> {
     let row: Option<(String,)> = sqlx::query_as("SELECT public_id FROM accounts WHERE id = $1")
         .bind(account_id)
