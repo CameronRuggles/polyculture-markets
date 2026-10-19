@@ -4072,6 +4072,8 @@ struct PassphraseChangeForm {
     csrf: String,
     current_password: String,
     new_password: String,
+    /// Verification-fix V2: the step-up's second factor.
+    totp: Option<String>,
 }
 
 async fn passphrase_change(
@@ -4091,24 +4093,17 @@ async fn passphrase_change(
     if f.new_password.len() < 12 || crate::passwords::is_common_password(&f.new_password) {
         return security_page_render(&st, &sess, &f.csrf, Some("New passphrase must be at least 12 characters and not a common one.".into()), vec![]).await;
     }
-    let stored: Option<String> = sqlx::query_scalar("SELECT password_hash FROM accounts WHERE id = $1")
-        .bind(sess.account_id)
-        .fetch_optional(&st.pool)
-        .await
-        .ok()
-        .flatten();
-    let Some(stored) = stored else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response();
-    };
-    let scope = format!("acct:{}", sess.account_id);
-    match st.hash_guard.verify_scoped(&scope, &f.current_password, &stored).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return security_page_render(&st, &sess, &f.csrf, Some("Current passphrase did not verify — passphrase unchanged.".into()), vec![]).await;
-        }
-        Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
+    // Verification-fix V2: changing the passphrase is an identity
+    // change and takes the FULL step-up — current passphrase plus a
+    // TOTP code when enrolled. Before this fix it asked for the
+    // passphrase alone (the account-audit brief's task 8 asked only
+    // for that), so a stolen session + passphrase could change the
+    // passphrase and keep the thief's session while signing the
+    // owner out everywhere.
+    if let Err(msg) = step_up(&st, &sess, &f.current_password, f.totp.as_deref()).await {
+        return security_page_render(&st, &sess, &f.csrf, Some(msg), vec![]).await;
     }
+    let scope = format!("acct:{}", sess.account_id);
     let hash = match st.hash_guard.hash_scoped(&scope, &f.new_password).await {
         Ok(h) => h,
         Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
@@ -4132,12 +4127,17 @@ async fn passphrase_change(
 struct RecoveryIssueForm {
     csrf: String,
     password: String,
+    /// Verification-fix V2: the step-up's second factor.
+    totp: Option<String>,
 }
 
 /// POST /account/recovery-codes — declared in the route table since
-/// §17 but never served until now (AL4). Issuing a code requires the
-/// current passphrase, burns every previous unconsumed code, and
-/// shows the new code exactly once.
+/// §17 but never served until now (AL4). Issuing a code burns every
+/// previous unconsumed code and shows the new code exactly once.
+/// Verification-fix V2: issuance takes the FULL step-up (passphrase
+/// plus a TOTP code when enrolled) — a fresh code is a recovery
+/// path, so issuing one on the passphrase alone would let a stolen
+/// session burn the owner's code and take the account for good.
 async fn recovery_code_issue(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -4147,23 +4147,8 @@ async fn recovery_code_issue(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let stored: Option<String> = sqlx::query_scalar("SELECT password_hash FROM accounts WHERE id = $1")
-        .bind(sess.account_id)
-        .fetch_optional(&st.pool)
-        .await
-        .ok()
-        .flatten();
-    let Some(stored) = stored else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response();
-    };
-    let scope = format!("acct:{}", sess.account_id);
-    match st.hash_guard.verify_scoped(&scope, &f.password, &stored).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return security_page_render(&st, &sess, &f.csrf, Some("Passphrase did not verify — no recovery code was issued.".into()), vec![]).await;
-        }
-        Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
+    if let Err(msg) = step_up(&st, &sess, &f.password, f.totp.as_deref()).await {
+        return security_page_render(&st, &sess, &f.csrf, Some(msg), vec![]).await;
     }
     let code = recovery::new_recovery_code();
     if db::replace_recovery_code(&st.pool, sess.account_id, &code).await.is_err() {

@@ -68,12 +68,14 @@
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Current passphrase <input type="password" name="current_password" autocomplete="current-password" required></label>
 <label>New passphrase <input type="password" name="new_password" autocomplete="new-password" required></label>
+<label>TOTP code (if enrolled) <input name="totp" inputmode="numeric" autocomplete="one-time-code"></label>
 <button type="submit">Change passphrase</button></form>
 <h2>Recovery code</h2>
-<p>Issue a new recovery code. The new code replaces every previous one — old codes stop working immediately. The new code is shown once, on the account page, after you confirm your passphrase.</p>
+<p>Issue a new recovery code. The new code replaces every previous one — old codes stop working immediately. The new code is shown once, on the account page, after you confirm your passphrase (plus a TOTP code if you are enrolled).</p>
 <form method="post" action="/account/recovery-codes">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Current passphrase <input type="password" name="password" autocomplete="current-password" required></label>
+<label>TOTP code (if enrolled) <input name="totp" inputmode="numeric" autocomplete="one-time-code"></label>
 <button type="submit">Issue a new recovery code</button></form>
 <h2>Close this account</h2>
 <p>Closing ends this identity: you will not be able to log in again, your listings will be unpublished, unused payment addresses retired, and your reputation will stop growing. Your order and review history stays visible to people you traded with — their records depend on it. Closure cannot be undone from here. It also does not erase anything, and nothing prevents a new account being registered later.</p>

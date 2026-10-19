@@ -418,6 +418,14 @@ fn location_of(r: &HttpResult) -> String {
     String::new()
 }
 
+async fn stored_hash(pool: &PgPool, account_id: i64) -> String {
+    sqlx::query_scalar::<_, String>("SELECT password_hash FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn has_event(pool: &PgPool, account_id: i64, event_type: &str) -> bool {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM notifications WHERE account_id = $1 AND event_type = $2)",
@@ -517,6 +525,100 @@ async fn login_budget_burst_flood_and_device_cookie() {
         "the device-cookie browser logs in despite the spent budget"
     );
     assert!(!srv.throttles.login_budget_exceeded(&username), "success cleared the failures");
+
+    cleanup(&pool, &[id]).await;
+    srv.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Task 2 (V2): passphrase change and recovery-code issuance take
+// the full step-up — on an enrolled account the right passphrase
+// with NO code changes nothing and issues no code.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn passphrase_change_and_recovery_issue_require_full_stepup() {
+    let Some(pool) = pool().await else { return };
+    let srv = test_server(&pool).await;
+    let (id, _username) = make_account(&pool, "buyer", PW).await;
+    let secret = enroll(&pool, &srv.keyfile, id).await;
+    let token = session_for(&pool, id).await;
+    let cookie = format!("session={token}");
+    let stored_before = stored_hash(&pool, id).await;
+
+    // Right passphrase, NO code: the passphrase does not change.
+    let r = post_form(
+        srv.addr,
+        "/account/passphrase",
+        Some(&cookie),
+        &[("csrf", CSRF), ("current_password", PW), ("new_password", PW2)],
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert!(
+        r.body.contains("Step-up verification failed"),
+        "no code on an enrolled account must refuse the change: {}",
+        r.body
+    );
+    assert_eq!(stored_hash(&pool, id).await, stored_before, "passphrase unchanged without a code");
+
+    // Right passphrase, NO code: no recovery code is issued.
+    let r = post_form(
+        srv.addr,
+        "/account/recovery-codes",
+        Some(&cookie),
+        &[("csrf", CSRF), ("password", PW)],
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("Step-up verification failed"), "issuance refused without a code");
+    let unconsumed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_codes WHERE account_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unconsumed, 0, "no recovery code was issued");
+
+    // With a code, the passphrase change goes through (and the new
+    // passphrase verifies against the stored hash).
+    let r = post_form(
+        srv.addr,
+        "/account/passphrase",
+        Some(&cookie),
+        &[
+            ("csrf", CSRF),
+            ("current_password", PW),
+            ("new_password", PW2),
+            ("totp", &code(&secret, 0)),
+        ],
+    )
+    .await;
+    assert!(r.body.contains("Passphrase changed."), "change with a code succeeds: {}", r.body);
+    let stored_after = stored_hash(&pool, id).await;
+    assert_ne!(stored_after, stored_before);
+    let guard = HashGuard::new(2);
+    assert!(guard.verify(PW2, &stored_after).await.unwrap(), "new passphrase verifies");
+    assert!(!guard.verify(PW, &stored_after).await.unwrap(), "old passphrase is gone");
+
+    // With a code, a recovery code is issued (exactly one live code).
+    let r = post_form(
+        srv.addr,
+        "/account/recovery-codes",
+        Some(&cookie),
+        &[("csrf", CSRF), ("password", PW2), ("totp", &code(&secret, 30))],
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let unconsumed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recovery_codes WHERE account_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unconsumed, 1, "one live recovery code after issuance with a code");
 
     cleanup(&pool, &[id]).await;
     srv.stop();
