@@ -63,9 +63,25 @@ pub const MAX_FAILURE_ENTRIES: usize = 4096;
 /// Hard cap on per-account request buckets.
 const MAX_BUCKET_ENTRIES: usize = 100_000;
 
+/// Modules Audit BM1 (2026-10-19): a per-instance REGISTRATION
+/// budget. Registration is anonymous; the account cap (when set)
+/// bounds the total, but nothing bounded the RATE, and every
+/// attempt cost a full Argon2 run. The handler now checks this
+/// budget (and the username) BEFORE hashing, and registration
+/// hashing runs on its own one-slot pool (see passwords.rs).
+/// 120 completed registrations per hour per instance is far above
+/// any plausible organic signup rate for this deployment shape,
+/// and far below a flood.
+pub const REGISTRATION_BUDGET: usize = 120;
+/// The registration-budget window.
+pub const REGISTRATION_WINDOW: Duration = Duration::hours(1);
+
 pub struct Throttles {
     buckets: Mutex<HashMap<i64, TokenBucket>>,
     login_failures: Mutex<HashMap<String, FailureEntry>>,
+    /// Timestamps of completed registrations inside the window
+    /// (BM1's per-instance registration budget).
+    registrations: Mutex<Vec<OffsetDateTime>>,
 }
 
 impl Throttles {
@@ -73,6 +89,7 @@ impl Throttles {
         Throttles {
             buckets: Mutex::new(HashMap::new()),
             login_failures: Mutex::new(HashMap::new()),
+            registrations: Mutex::new(Vec::new()),
         }
     }
 
@@ -90,6 +107,23 @@ impl Throttles {
         map.entry(account_id)
             .or_insert_with(|| TokenBucket::new(60.0, 60.0, now))
             .allow(now)
+    }
+
+    /// BM1: has this instance's registration budget been spent
+    /// inside the current window? Checked BEFORE any hashing.
+    pub fn registration_budget_exceeded(&self, now: OffsetDateTime) -> bool {
+        let mut regs = self.registrations.lock().unwrap();
+        let cutoff = now - REGISTRATION_WINDOW;
+        regs.retain(|t| *t > cutoff);
+        regs.len() >= REGISTRATION_BUDGET
+    }
+
+    /// BM1: record one completed registration against the budget.
+    pub fn record_registration(&self, now: OffsetDateTime) {
+        let mut regs = self.registrations.lock().unwrap();
+        let cutoff = now - REGISTRATION_WINDOW;
+        regs.retain(|t| *t > cutoff);
+        regs.push(now);
     }
 
     /// Exponential login delay: failure n -> min(2^n, 300) seconds.

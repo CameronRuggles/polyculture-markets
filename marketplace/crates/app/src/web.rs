@@ -875,7 +875,27 @@ async fn register(
         Ok(Admission::Admitted) => {}
         _ => return (StatusCode::FORBIDDEN, "Registration is not open").into_response(),
     }
-    let hash = match st.hash_guard.hash(&f.password).await {
+    // Modules Audit BM1 (2026-10-19): the username-taken check and
+    // the per-instance registration budget are decided BEFORE any
+    // hashing. Previously the handler hashed first and only learned
+    // the username was taken from the INSERT's unique violation —
+    // so resubmitting an existing username cost a full Argon2 run
+    // every time, created nothing, and (through the then-shared
+    // pool) could starve every login. The unique constraint remains
+    // as the race backstop below.
+    if db::account_by_username(&st.pool, &folded).await.ok().flatten().is_some() {
+        let tpl = RegisterTpl {
+            error: Some("That username is taken.".into()),
+            csrf: f.csrf.clone(),
+        };
+        return page(&st, &headers, "Register", tpl.render().unwrap()).await;
+    }
+    if st.throttles.registration_budget_exceeded(OffsetDateTime::now_utc()) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response();
+    }
+    // BM1: registration hashes on its OWN one-slot pool, never the
+    // pool logins, step-ups and recoveries need (passwords.rs).
+    let hash = match st.hash_guard.hash_registration(&f.password).await {
         Ok(h) => h,
         Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
@@ -890,6 +910,7 @@ async fn register(
             return page(&st, &headers, "Register", tpl.render().unwrap()).await;
         }
     };
+    st.throttles.record_registration(OffsetDateTime::now_utc());
     let code = recovery::new_recovery_code();
     let _ = db::store_recovery_code(&st.pool, id, &code).await;
     // Log the new account in (session rotation on privilege change = fresh token).
@@ -1013,7 +1034,10 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
     if !exempt && st.throttles.login_budget_exceeded(&folded) {
         return page(&st, &headers, "Log in", generic_tpl(&f.csrf).render().unwrap()).await;
     }
-    match st.hash_guard.verify_guarded(&guard, &f.password, &stored).await {
+    // BM1: the login path waits briefly for a hashing slot rather
+    // than failing at once — a momentary burst of legitimate
+    // verifications must not 503 a correct login.
+    match st.hash_guard.verify_guarded_wait(&guard, &f.password, &stored).await {
         Ok(true) => {}
         Ok(false) => {
             let (d, n) = st.throttles.record_login_failure_counted(&folded);
