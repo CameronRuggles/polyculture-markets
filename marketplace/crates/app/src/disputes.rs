@@ -229,6 +229,85 @@ pub async fn submit_disclosure(
     Ok(status.to_string())
 }
 
+/// Submit a disclosure as ONE paste: the output of
+/// `gpg --unwrap --armor` on the original encrypted message
+/// (messaging audit MM1). The pre-MM1 form asked for plaintext plus a
+/// detached signature, but these messages are signed INLINE — no
+/// detached signature ever exists, so the old form could never
+/// verify anything. Here the server verifies the embedded signature
+/// itself, with Sequoia, against the OTHER party's order-pinned
+/// certificate, and extracts the plaintext. An unwrapped message
+/// whose signature is absent, foreign, or bad is stored as an
+/// unverified claim holding the extracted plaintext — parity with the
+/// old form's treatment of an unverifiable signature.
+///
+/// The paste itself is stored as the disclosure's `signature` field
+/// (the proof artifact a moderator re-checks offline); the extracted
+/// plaintext is the displayed `message`. Returns the signature status
+/// ("verified" / "unverified_claim").
+pub async fn submit_disclosure_unwrapped(
+    pool: &PgPool,
+    kf: &KeyFile,
+    dispute_id: i64,
+    submitter_id: i64,
+    unwrapped_raw: &str,
+) -> Result<String, DisputeError> {
+    // Cap parity with the old pair (64 KiB message + 16 KiB
+    // signature): one paste may carry both.
+    if unwrapped_raw.is_empty() || unwrapped_raw.len() > 81_920 {
+        return Err(DisputeError::BadInput);
+    }
+    // Browsers submit CRLF; normalize before parsing (MH1) so the
+    // stored paste is byte-identical to what was verified.
+    let pasted = unwrapped_raw.replace("\r\n", "\n").replace('\r', "\n");
+    let dispute = get_dispute(pool, dispute_id)
+        .await?
+        .ok_or(DisputeError::NotFound)?;
+    if dispute.state != "open" {
+        return Err(DisputeError::BadState);
+    }
+    let order = crate::orders::order_by_public_id(pool, &order_public_id(pool, dispute.order_id).await?)
+        .await
+        .ok_or(DisputeError::NotFound)?;
+    if submitter_id != order.buyer_id && submitter_id != order.seller_id {
+        return Err(DisputeError::Forbidden);
+    }
+    let cert = other_party_cert(pool, dispute.order_id, submitter_id).await?;
+    let Some(extracted) = cert
+        .as_deref()
+        .and_then(|c| crate::keys::extract_unwrapped_message(c, pasted.as_bytes()))
+    else {
+        // No pinned cert, or the paste is not a readable message.
+        return Err(DisputeError::BadInput);
+    };
+    if extracted.plaintext.len() > 65_536 {
+        return Err(DisputeError::BadInput);
+    }
+    let status = if extracted.verified {
+        "verified"
+    } else {
+        "unverified_claim"
+    };
+    let content = serde_json::to_vec(&DisclosureContent {
+        message: extracted.plaintext,
+        signature: pasted,
+    })
+    .map_err(|_| DisputeError::Db)?;
+    let enc = kf.encrypt(&content);
+    sqlx::query(
+        "INSERT INTO disclosures (dispute_id, submitted_by, content_enc, signature_status)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(dispute_id)
+    .bind(submitter_id)
+    .bind(&enc)
+    .bind(status)
+    .execute(pool)
+    .await
+    .map_err(|_| DisputeError::Db)?;
+    Ok(status.to_string())
+}
+
 fn normalize(raw: &str) -> Result<String, DisputeError> {
     let lines = modules_api::normalize_form_lines(raw).map_err(|_| DisputeError::BadInput)?;
     Ok(lines.join("\n"))

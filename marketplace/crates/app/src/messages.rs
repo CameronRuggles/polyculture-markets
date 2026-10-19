@@ -218,15 +218,39 @@ async fn retired_shown(pool: &PgPool, conversation_id: i64, recipient_id: i64) -
     .await?;
     Ok(rows
         .iter()
-        .filter_map(|(cert,)| KeyRef::from_cert(cert))
+        // Retired-key recognition stays UNFILTERED (MM3): a retired
+        // certificate may since have expired, or had a subkey revoked
+        // by a refresh, and a message encrypted to it must still be
+        // recognised as RecipientKeyRetired, not reclassified.
+        .filter_map(|(cert,)| KeyRef::from_cert_unfiltered(cert))
         .collect())
 }
+
+/// Messaging abuse bounds (messaging audit MM4). Retention expires
+/// message blobs at 90 days, but volume must also be bounded at write
+/// time: without limits, any account could fill the disk with 64 KiB
+/// ciphertexts. The checks are aggregate-before-insert, so a
+/// determined racer can overshoot by a small factor — acceptable for
+/// a disk-exhaustion bound. The per-account request throttle (wired
+/// in the account-security batch) is a separate, coarser bound.
+pub const MSG_RATE_PER_MINUTE: i64 = 60;
+pub const MSG_DAILY_BUDGET_BYTES: i64 = 16 * 1024 * 1024;
+pub const MSG_CONVERSATION_MAX_MESSAGES: i64 = 1_000;
+pub const MSG_CONVERSATION_MAX_BYTES: i64 = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum SendError {
     NoKey,            // sender or recipient has no registered key
     Envelope(EnvelopeError),
     TooLarge,
+    /// The recipient has blocked the sender's direct messages (MM4).
+    Blocked,
+    /// More than MSG_RATE_PER_MINUTE sends in the last minute (MM4).
+    RateLimited,
+    /// The sender's rolling 24-hour byte budget is spent (MM4).
+    BudgetExceeded,
+    /// The conversation reached its message/byte cap (MM4).
+    ConversationFull,
     Db,
 }
 
@@ -269,6 +293,60 @@ pub async fn send_message(
     else {
         return Err(SendError::Db);
     };
+    let order_id: Option<i64> =
+        sqlx::query_scalar("SELECT order_id FROM conversations WHERE id = $1")
+            .bind(conversation_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|_| SendError::Db)?;
+    if order_id.is_none() {
+        // Direct conversations can be blocked (MM4); order
+        // conversations never are — trading counterparties must stay
+        // reachable for the life of the order.
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_blocks \
+             WHERE blocker_id = $1 AND blocked_id = $2)",
+        )
+        .bind(recipient_id)
+        .bind(sender_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|_| SendError::Db)?;
+        if blocked {
+            return Err(SendError::Blocked);
+        }
+    }
+    // Abuse bounds (MM4): per-sender rate and rolling daily byte
+    // budget, then the per-conversation volume cap.
+    let (sent_last_minute, sent_last_day): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM encrypted_messages \
+                  WHERE sender_id = $1 AND received_at > now() - interval '1 minute'), \
+                (SELECT COALESCE(SUM(length), 0) FROM encrypted_messages \
+                  WHERE sender_id = $1 AND received_at > now() - interval '24 hours')",
+    )
+    .bind(sender_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| SendError::Db)?;
+    if sent_last_minute >= MSG_RATE_PER_MINUTE {
+        return Err(SendError::RateLimited);
+    }
+    if sent_last_day + ciphertext.len() as i64 > MSG_DAILY_BUDGET_BYTES {
+        return Err(SendError::BudgetExceeded);
+    }
+    let (conv_count, conv_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(length), 0) FROM encrypted_messages \
+         WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| SendError::Db)?;
+    if conv_count >= MSG_CONVERSATION_MAX_MESSAGES
+        || conv_bytes + ciphertext.len() as i64 > MSG_CONVERSATION_MAX_BYTES
+    {
+        return Err(SendError::ConversationFull);
+    }
     let sender_key = crate::keys::current_key(pool, sender_id).await.map_err(|_| SendError::Db)?.ok_or(SendError::NoKey)?;
     let recipient_key = crate::keys::current_key(pool, recipient_id).await.map_err(|_| SendError::Db)?.ok_or(SendError::NoKey)?;
     let ctx = EnvelopeContext {
@@ -308,4 +386,108 @@ pub async fn send_message(
     .map_err(|_| SendError::Db)?;
     let _ = crate::orders::notify(pool, recipient_id, "message_received", &conversation_id.to_string()).await;
     Ok(())
+}
+
+/// ML1: the fingerprint pinned for `other_id` by the order behind an
+/// order conversation. Seller side: the order's `seller_fpr_pinned`.
+/// Buyer side: the buyer's key whose validity interval covers the
+/// order's creation — the same rule disputes use to find the buyer's
+/// pinned certificate. Display and warning logic compare this against
+/// the CURRENT key; nothing here consults key_rotations.
+pub async fn order_pinned_fingerprint(
+    pool: &PgPool,
+    order_id: i64,
+    other_id: i64,
+) -> Option<String> {
+    let order = crate::orders::order_by_internal_id(pool, order_id).await?;
+    if other_id == order.seller_id {
+        return Some(order.seller_fpr_pinned.clone());
+    }
+    if other_id == order.buyer_id {
+        return sqlx::query_scalar(
+            "SELECT fingerprint FROM identity_keys
+             WHERE account_id = $1 AND created_at <= $2
+               AND (retired_at IS NULL OR retired_at > $2)
+             ORDER BY version DESC LIMIT 1",
+        )
+        .bind(order.buyer_id)
+        .bind(order.created_at)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Direct-conversation blocks (MM4, migration 0012)
+// ---------------------------------------------------------------------------
+
+/// Record that `blocker` refuses direct conversations with
+/// `blocked`. Idempotent. Blocks govern DIRECT conversations only:
+/// order conversations stay reachable regardless (send_message
+/// never consults this table for them).
+pub async fn block_account(
+    pool: &PgPool,
+    blocker_id: i64,
+    blocked_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO conversation_blocks (blocker_id, blocked_id) VALUES ($1, $2)
+         ON CONFLICT (blocker_id, blocked_id) DO NOTHING",
+    )
+    .bind(blocker_id)
+    .bind(blocked_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn unblock_account(
+    pool: &PgPool,
+    blocker_id: i64,
+    blocked_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM conversation_blocks WHERE blocker_id = $1 AND blocked_id = $2")
+        .bind(blocker_id)
+        .bind(blocked_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// True when a block exists in either direction between the two
+/// accounts (used when OPENING a direct conversation: a block by
+/// either side closes the door both ways).
+pub async fn block_exists_either_way(
+    pool: &PgPool,
+    a: i64,
+    b: i64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM conversation_blocks \
+         WHERE (blocker_id = $1 AND blocked_id = $2) \
+            OR (blocker_id = $2 AND blocked_id = $1))",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+}
+
+/// The accounts `account_id` has blocked: (account_id, public_id,
+/// username), newest first.
+pub async fn blocked_accounts(
+    pool: &PgPool,
+    account_id: i64,
+) -> Result<Vec<(i64, String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT a.id, a.public_id, a.username FROM conversation_blocks b
+         JOIN accounts a ON a.id = b.blocked_id
+         WHERE b.blocker_id = $1 ORDER BY b.created_at DESC",
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await
 }

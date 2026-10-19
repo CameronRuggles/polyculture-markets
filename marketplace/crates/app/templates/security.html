@@ -5,6 +5,14 @@
 <p>Registering or rotating your key is an identity change: it requires your current passphrase, plus a TOTP code if you are enrolled (step-up). A signed-in session alone is never enough to change the key buyers encrypt to.</p>
 {% if let Some(f) = current_fingerprint %}
 <p>Current fingerprint: <code>{{ f }}</code></p>
+<h3>Refresh certificate</h3>
+<p>If you renewed the SAME key's signatures — extended its expiry, or revoked the key or a subkey — re-export the certificate (<code>gpg --armor --export</code>) and paste it here. A refresh cannot add or remove keys or change the fingerprint; for a new key, use rotation below.</p>
+<form method="post" action="/account/keys/refresh">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Refreshed certificate (armored)<br><textarea name="cert" rows="8" cols="70"></textarea></label>
+<label>Current passphrase <input type="password" name="password" autocomplete="current-password" required></label>
+<label>TOTP code (if enrolled) <input name="totp" inputmode="numeric" autocomplete="one-time-code"></label>
+<button type="submit">Refresh certificate</button></form>
 <h3>Rotate key</h3>
 <form method="post" action="/account/keys/rotate">
 <input type="hidden" name="csrf" value="{{ csrf }}">

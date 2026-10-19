@@ -5,4 +5,12 @@
 {% if c.unread > 0 %} · <strong>{{ c.unread }} new</strong>{% endif %} · since {{ c.last_at }}</p>
 {% endfor %}
 {% if conversations.is_empty() %}<p>No conversations yet. Open one from an order page or a seller's profile.</p>{% endif %}
+<h2>Blocked accounts</h2>
+{% for b in blocked %}
+<p>{{ b.username }} ({{ b.public_id }})
+<form method="post" action="/conversations/blocks/{{ b.public_id }}">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Unblock</button></form></p>
+{% endfor %}
+{% if blocked.is_empty() %}<p>You have not blocked anyone. Blocking an account stops it opening direct conversations with you and sending you direct messages; it never affects order conversations.</p>{% endif %}
 

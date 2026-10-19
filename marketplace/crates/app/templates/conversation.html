@@ -5,7 +5,24 @@
 Encrypt locally to both keys: your own, and {{ other_name }}'s current key
 <code>{{ other_fingerprint }}</code> — <a href="/sellers/{{ other_public_id }}/key.asc">download it</a>
 and verify the fingerprint against a copy you trust.</p>
-<p>Example: <code>gpg --encrypt --armor --recipient YOURKEY --recipient {{ other_fingerprint }}</code></p>
+<p>Example: <code>gpg --armor --sign --encrypt --recipient {{ other_fingerprint }} --recipient YOURKEY</code></p>
+{% if let Some(pinned) = pinned_fingerprint %}
+<p>For this order, {{ other_name }}'s key was pinned as <code>{{ pinned }}</code> when the order was created.</p>
+{% if pinned_differs %}
+<p role="alert">Warning: {{ other_name }}'s current key differs from the key pinned on this order. Messages encrypted to the current key are still accepted, but before trusting anything sensitive, compare the pinned fingerprint above against the key you actually hold — the check that matters happens in your own keyring, not on this page.</p>
+{% endif %}
+{% endif %}
+{% if is_direct %}
+{% if blocked_by_me %}
+<p>You have blocked direct messages from {{ other_name }}. You can unblock from your <a href="/conversations">conversations list</a>.</p>
+{% else %}
+<form method="post" action="/conversations/{{ conv_id }}/block">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<button type="submit">Block direct messages from {{ other_name }}</button>
+</form>
+<p>Blocking stops {{ other_name }} sending you direct messages or opening new direct conversations with you. It does not affect order conversations, and {{ other_name }} is not told.</p>
+{% endif %}
+{% endif %}
 {% for m in messages %}
 <p>{% if m.1 == me %}<strong>You</strong>{% else %}<strong>{{ other_name }}</strong>{% endif %} · {{ m.3 }} ·
 {{ m.2 }} bytes · <a href="/conversations/{{ conv_id }}/messages/{{ m.0 }}/download">Download ciphertext (.asc)</a></p>

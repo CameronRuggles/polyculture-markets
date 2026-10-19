@@ -77,6 +77,18 @@ impl AppState {
     }
 }
 
+/// Messaging Audit task 1 (MH1): browsers submit textarea content
+/// with CRLF line endings, and several consumers of armored or
+/// statement text are byte-exact (the armor parser's blank-line rule,
+/// the rotation statement's character whitelist, detached-signature
+/// verification over the statement). Normalize every form-supplied
+/// armored input to LF at the handler boundary, before parsing,
+/// verifying, or storing — stored bytes are then exactly the bytes
+/// that were verified.
+fn normalize_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Account Security Audit task 2 (AM3; also discharges payment-audit
 /// M1): the step-up for identity-changing actions. A session alone is
 /// never enough: the caller must re-prove the CURRENT PASSPHRASE,
@@ -412,6 +424,7 @@ pub fn router(state: AppState) -> Router {
         .route("/account/security", get(security_page))
         .route("/account/keys", post(upload_key))
         .route("/account/keys/rotate", post(rotate_key))
+        .route("/account/keys/refresh", post(refresh_key))
         .route("/account/profile", post(update_profile))
         .route("/account/sessions/{id}/revoke", post(revoke_session))
         .route("/sellers/{id}", get(seller_profile))
@@ -433,6 +446,8 @@ pub fn router(state: AppState) -> Router {
         .route("/conversations/{id}/messages/{mid}/download", get(message_download))
         .route("/conversations/for-order/{oid}", post(conversation_for_order))
         .route("/conversations/direct/{aid}", post(conversation_direct))
+        .route("/conversations/{id}/block", post(conversation_block))
+        .route("/conversations/blocks/{id}", post(conversation_unblock))
         // Stage 9: reviews, disputes, reports, moderation, TOTP, closure.
         .route("/orders/{id}/review", post(review_submit))
         .route("/orders/{id}/review/reply", post(review_reply))
@@ -1696,10 +1711,11 @@ async fn upload_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     if kmod::current_key(&st.pool, sess.account_id).await.ok().flatten().is_some() {
         return security_page_render(&st, &sess, &csrf, Some("A key is already registered. Use rotation to replace it.".into()), vec![]).await;
     }
-    match kmod::validate_cert(f.cert.as_bytes()) {
+    let cert = normalize_crlf(&f.cert);
+    match kmod::validate_cert(cert.as_bytes()) {
         Ok(info) => {
             let warnings = info.warnings.clone();
-            match kmod::install_key(&st.pool, sess.account_id, f.cert.as_bytes(), &info, None).await {
+            match kmod::install_key(&st.pool, sess.account_id, cert.as_bytes(), &info, None).await {
                 Ok(()) => {
                     stepup_notice(&st, sess.account_id, "stepup_key_upload", "an identity key was registered on your account").await;
                     security_page_render(&st, &sess, &csrf, Some(format!("Key registered: {}", info.fingerprint)), warnings).await
@@ -1746,7 +1762,14 @@ async fn rotate_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     let Some((cur_fpr, cur_cert, _v)) = kmod::current_key(&st.pool, sess.account_id).await.ok().flatten() else {
         return security_page_render(&st, &sess, &csrf, Some("No current key to rotate.".into()), vec![]).await;
     };
-    let info = match kmod::validate_cert(f.new_cert.as_bytes()) {
+    // MH1: statement and signatures are verified byte-exact, and the
+    // statement parser admits LF only — normalize the browser's CRLF
+    // first, so what is stored is exactly what was verified.
+    let new_cert = normalize_crlf(&f.new_cert);
+    let statement = normalize_crlf(&f.statement);
+    let sig_old = normalize_crlf(&f.sig_old);
+    let sig_new = normalize_crlf(&f.sig_new);
+    let info = match kmod::validate_cert(new_cert.as_bytes()) {
         Ok(i) => i,
         Err(e) => return security_page_render(&st, &sess, &csrf, Some(format!("New key rejected: {e:?}")), vec![]).await,
     };
@@ -1755,7 +1778,7 @@ async fn rotate_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     }
     if f.lost.as_deref() == Some("true") {
         // Uncertified rotation: no statement, warning shows for 90 days (§8).
-        return match kmod::install_key(&st.pool, sess.account_id, f.new_cert.as_bytes(), &info, Some((b"", None, None, false))).await {
+        return match kmod::install_key(&st.pool, sess.account_id, new_cert.as_bytes(), &info, Some((b"", None, None, false))).await {
             Ok(()) => {
                 stepup_notice(&st, sess.account_id, "stepup_key_rotation", "your identity key was rotated (uncertified)").await;
                 security_page_render(&st, &sess, &csrf, Some("Key rotated without certification. A warning will show on your profile for 90 days.".into()), info.warnings.clone()).await
@@ -1765,24 +1788,24 @@ async fn rotate_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
     }
     // Certified rotation: statement must bind account, both fingerprints, this instance.
     let public_id = db::public_id_of(&st.pool, sess.account_id).await.ok().flatten().unwrap_or_default();
-    let stmt = match kmod::parse_rotation_statement(&f.statement, &st.marketplace_id) {
+    let stmt = match kmod::parse_rotation_statement(&statement, &st.marketplace_id) {
         Some(s) => s,
         None => return security_page_render(&st, &sess, &csrf, Some("Rotation statement is malformed.".into()), vec![]).await,
     };
     if stmt.account_id != public_id || stmt.old_fingerprint != cur_fpr || stmt.new_fingerprint != info.fingerprint {
         return security_page_render(&st, &sess, &csrf, Some("Rotation statement does not match this account and these keys.".into()), vec![]).await;
     }
-    let ok_old = kmod::verify_detached(&cur_cert, f.statement.as_bytes(), f.sig_old.as_bytes());
-    let ok_new = kmod::verify_detached(f.new_cert.as_bytes(), f.statement.as_bytes(), f.sig_new.as_bytes());
+    let ok_old = kmod::verify_detached(&cur_cert, statement.as_bytes(), sig_old.as_bytes());
+    let ok_new = kmod::verify_detached(new_cert.as_bytes(), statement.as_bytes(), sig_new.as_bytes());
     if !ok_old || !ok_new {
         return security_page_render(&st, &sess, &csrf, Some("Both signatures must verify (old key and new key).".into()), vec![]).await;
     }
     match kmod::install_key(
         &st.pool,
         sess.account_id,
-        f.new_cert.as_bytes(),
+        new_cert.as_bytes(),
         &info,
-        Some((f.statement.as_bytes(), Some(f.sig_old.as_bytes()), Some(f.sig_new.as_bytes()), true)),
+        Some((statement.as_bytes(), Some(sig_old.as_bytes()), Some(sig_new.as_bytes()), true)),
     )
     .await
     {
@@ -1791,6 +1814,48 @@ async fn rotate_key(State(st): State<AppState>, headers: HeaderMap, Form(f): For
             security_page_render(&st, &sess, &csrf, Some(format!("Key rotated (certified): {}", info.fingerprint)), info.warnings.clone()).await
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Rotation failed").into_response(),
+    }
+}
+
+/// Messaging Audit task 5 (MM3): certificate refresh. Upload was
+/// refused once any key existed, and rotation refuses the same
+/// fingerprint — so a certificate could never be refreshed at all,
+/// and a revocation or expiry extension could never take effect.
+/// A refresh replaces the stored certificate for the SAME primary
+/// key when only signatures changed (validate_refresh enforces:
+/// same fingerprint, same key set, same user IDs, still policy-
+/// valid). Step-up applies: the refreshed certificate decides whose
+/// subkeys senders will encrypt to.
+async fn refresh_key(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<KeyUploadForm>) -> Response {
+    let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
+    if !sessions::csrf_matches(&csrf, &f.csrf) {
+        return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
+    }
+    // Step-up BEFORE anything else moves (task 2 pattern).
+    let Some(pw) = f.password.as_deref().filter(|p| !p.is_empty()) else {
+        return security_page_render(&st, &sess, &csrf, Some("Step-up verification failed: enter your current passphrase.".into()), vec![]).await;
+    };
+    if let Err(msg) = step_up(&st, &sess, pw, f.totp.as_deref()).await {
+        return security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await;
+    }
+    let Some((_cur_fpr, cur_cert, _v)) = kmod::current_key(&st.pool, sess.account_id).await.ok().flatten() else {
+        return security_page_render(&st, &sess, &csrf, Some("No current key to refresh. Register a key first.".into()), vec![]).await;
+    };
+    let cert = normalize_crlf(&f.cert);
+    match kmod::validate_refresh(&cur_cert, cert.as_bytes()) {
+        Ok(info) => match kmod::refresh_certificate(&st.pool, sess.account_id, cert.as_bytes()).await {
+            Ok(()) => {
+                stepup_notice(&st, sess.account_id, "stepup_key_refresh", "your identity certificate was refreshed (renewed signatures, same key)").await;
+                security_page_render(&st, &sess, &csrf, Some(format!("Certificate refreshed: same key ({}), signatures renewed.", info.fingerprint)), info.warnings.clone()).await
+            }
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not store the refreshed certificate").into_response(),
+        },
+        Err(msg) => security_page_render(&st, &sess, &csrf, Some(msg), vec![]).await,
     }
 }
 
@@ -2514,18 +2579,35 @@ async fn inbox_read_all(State(st): State<AppState>, headers: HeaderMap, Form(f):
 
 use crate::messages as msg;
 
+pub struct BlockedView {
+    pub public_id: String,
+    pub username: String,
+}
+
 #[derive(Template)]
 #[template(path = "conversations.html")]
 struct ConversationsTpl {
     conversations: Vec<msg::Conversation>,
+    blocked: Vec<BlockedView>,
+    csrf: String,
 }
 
 async fn conversations_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let Some((_t, sess, _c)) = current_session(&st, &headers).await else {
+    let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
         return Redirect::to("/login").into_response();
     };
     let conversations = msg::list_for(&st.pool, sess.account_id).await.unwrap_or_default();
-    let tpl = ConversationsTpl { conversations };
+    let blocked = msg::blocked_accounts(&st.pool, sess.account_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_id, public_id, username)| BlockedView { public_id, username })
+        .collect();
+    let tpl = ConversationsTpl {
+        conversations,
+        blocked,
+        csrf,
+    };
     page(&st, &headers, "Conversations", tpl.render().unwrap()).await
 }
 
@@ -2544,6 +2626,15 @@ struct ConversationTpl {
     other_public_id: String,
     other_name: String,
     other_fingerprint: String,
+    /// ML1: for order conversations, the counterparty fingerprint
+    /// the ORDER pinned at creation, and whether the current key
+    /// differs from it (computed from the pin itself — independent
+    /// of any key_rotations bookkeeping).
+    pinned_fingerprint: Option<String>,
+    pinned_differs: bool,
+    /// MM4: direct conversations carry the block control.
+    is_direct: bool,
+    blocked_by_me: bool,
     messages: Vec<(i64, i64, i32, String)>,
     message: Option<String>,
     me: i64,
@@ -2580,6 +2671,33 @@ async fn conversation_render(
     .fetch_one(&st.pool)
     .await
     .unwrap_or(false);
+    // ML1: order conversations show the ORDER's pinned fingerprint
+    // for the counterparty, and warn whenever the current key differs
+    // from the pin — derived from the pin comparison alone, so a key
+    // swap that left no key_rotations row still warns.
+    let order_id: Option<i64> = sqlx::query_scalar("SELECT order_id FROM conversations WHERE id = $1")
+        .bind(conv_id)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap_or_default();
+    let pinned_fingerprint = match order_id {
+        Some(oid) => msg::order_pinned_fingerprint(&st.pool, oid, other_id).await,
+        None => None,
+    };
+    let pinned_differs = matches!(
+        (&pinned_fingerprint, &other_fingerprint),
+        (Some(p), cur) if *p != *cur
+    );
+    let is_direct = order_id.is_none();
+    let blocked_by_me = is_direct
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM conversation_blocks WHERE blocker_id = $1 AND blocked_id = $2)",
+        )
+        .bind(sess.account_id)
+        .bind(other_id)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap_or(false);
     let title = format!("Conversation with {other_name}");
     let tpl = ConversationTpl {
         conv_id,
@@ -2587,6 +2705,10 @@ async fn conversation_render(
         other_public_id,
         other_name,
         other_fingerprint,
+        pinned_fingerprint,
+        pinned_differs,
+        is_direct,
+        blocked_by_me,
         messages,
         message,
         me: sess.account_id,
@@ -2641,6 +2763,10 @@ async fn send_message_handler(
         Ok(()) => Redirect::to(&format!("/conversations/{id}")).into_response(),
         Err(msg::SendError::NoKey) => conversation_render(&st, &sess, &csrf, id, Some("Both parties need a registered identity key before messaging.".into())).await,
         Err(msg::SendError::TooLarge) => conversation_render(&st, &sess, &csrf, id, Some("Message exceeds the 64 KiB limit.".into())).await,
+        Err(msg::SendError::Blocked) => conversation_render(&st, &sess, &csrf, id, Some("The other party has blocked direct messages from you. Blocking never applies to order conversations.".into())).await,
+        Err(msg::SendError::RateLimited) => conversation_render(&st, &sess, &csrf, id, Some("You are sending messages too quickly — at most 60 per minute. Wait a moment and try again.".into())).await,
+        Err(msg::SendError::BudgetExceeded) => conversation_render(&st, &sess, &csrf, id, Some("You have reached the daily message budget (16 MiB of ciphertext in 24 hours).".into())).await,
+        Err(msg::SendError::ConversationFull) => conversation_render(&st, &sess, &csrf, id, Some("This conversation has reached its size limit (1,000 messages / 16 MiB).".into())).await,
         Err(msg::SendError::Envelope(e)) => {
             let kid = if e == modules_api::EnvelopeError::ExtraRecipient {
                 extra_key_id(&st, id, sess.account_id, f.ciphertext.as_bytes()).await
@@ -2739,10 +2865,73 @@ async fn conversation_direct(
     if other_id == sess.account_id {
         return (StatusCode::BAD_REQUEST, "Cannot message yourself").into_response();
     }
+    // MM4: a block by either side closes the direct door both ways.
+    if msg::block_exists_either_way(&st.pool, sess.account_id, other_id).await.unwrap_or(false) {
+        return (StatusCode::FORBIDDEN, "Direct messages are not available with this account.").into_response();
+    }
     match msg::find_or_create_direct(&st.pool, sess.account_id, other_id).await {
         Ok(cid) => Redirect::to(&format!("/conversations/{cid}")).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Could not open conversation").into_response(),
     }
+}
+
+/// MM4: block the other participant of a DIRECT conversation. Order
+/// conversations cannot be blocked — a trading counterparty must stay
+/// reachable for the life of the order.
+async fn conversation_block(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(f): Form<CsrfOnly>,
+) -> Response {
+    let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
+    if !sessions::csrf_matches(&csrf, &f.csrf) {
+        return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
+    }
+    if !msg::is_participant(&st.pool, id, sess.account_id).await.unwrap_or(false) {
+        return (StatusCode::NOT_FOUND, "No such conversation").into_response();
+    }
+    let order_id: Option<i64> = sqlx::query_scalar("SELECT order_id FROM conversations WHERE id = $1")
+        .bind(id)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap_or_default();
+    if order_id.is_some() {
+        return (StatusCode::BAD_REQUEST, "Order conversations cannot be blocked.").into_response();
+    }
+    let Some((other_id, _name)) = msg::other_participant(&st.pool, id, sess.account_id).await.ok().flatten() else {
+        return (StatusCode::NOT_FOUND, "No such conversation").into_response();
+    };
+    let _ = msg::block_account(&st.pool, sess.account_id, other_id).await;
+    Redirect::to("/conversations").into_response()
+}
+
+/// MM4: remove one of my blocks (from the conversations list). The
+/// path parameter is the BLOCKED account's public id.
+async fn conversation_unblock(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(aid): Path<String>,
+    Form(f): Form<CsrfOnly>,
+) -> Response {
+    let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
+    if !sessions::csrf_matches(&csrf, &f.csrf) {
+        return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
+    }
+    if let Some((other_id, ..)) = db::account_by_public_id(&st.pool, &aid).await.ok().flatten() {
+        let _ = msg::unblock_account(&st.pool, sess.account_id, other_id).await;
+    }
+    Redirect::to("/conversations").into_response()
 }
 
 async fn send_message_file_handler(
@@ -2786,6 +2975,10 @@ async fn send_message_file_handler(
     match msg::send_message(&st.pool, id, sess.account_id, &bytes).await {
         Ok(()) => Redirect::to(&format!("/conversations/{id}")).into_response(),
         Err(msg::SendError::TooLarge) => conversation_render(&st, &sess, &csrf, id, Some("Message exceeds the 64 KiB limit.".into())).await,
+        Err(msg::SendError::Blocked) => conversation_render(&st, &sess, &csrf, id, Some("The other party has blocked direct messages from you. Blocking never applies to order conversations.".into())).await,
+        Err(msg::SendError::RateLimited) => conversation_render(&st, &sess, &csrf, id, Some("You are sending messages too quickly — at most 60 per minute. Wait a moment and try again.".into())).await,
+        Err(msg::SendError::BudgetExceeded) => conversation_render(&st, &sess, &csrf, id, Some("You have reached the daily message budget (16 MiB of ciphertext in 24 hours).".into())).await,
+        Err(msg::SendError::ConversationFull) => conversation_render(&st, &sess, &csrf, id, Some("This conversation has reached its size limit (1,000 messages / 16 MiB).".into())).await,
         Err(msg::SendError::NoKey) => conversation_render(&st, &sess, &csrf, id, Some("Both parties need a registered identity key before messaging.".into())).await,
         Err(msg::SendError::Envelope(e)) => {
             let kid = if e == modules_api::EnvelopeError::ExtraRecipient {
@@ -3092,8 +3285,11 @@ async fn dispute_unlock(
 #[derive(Deserialize)]
 struct DisclosureForm {
     csrf: String,
-    message: String,
-    signature: String,
+    /// MM1: ONE paste — the output of `gpg --unwrap --armor` on the
+    /// original encrypted message. The old form asked for plaintext
+    /// plus a detached signature, but messages are signed inline, so
+    /// no detached signature ever exists; see disputes.rs.
+    unwrapped: String,
 }
 
 async fn disclosure_submit(
@@ -3106,15 +3302,16 @@ async fn disclosure_submit(
         Ok(v) => v,
         Err(r) => return r,
     };
-    match crate::disputes::submit_disclosure(&st.pool, &st.keyfile, id, sess.account_id, &f.message, &f.signature).await {
+    match crate::disputes::submit_disclosure_unwrapped(&st.pool, &st.keyfile, id, sess.account_id, &f.unwrapped).await {
         Ok(status) => {
             let note = if status == "verified" {
                 "Disclosure recorded: signature verified against the other party's pinned key."
             } else {
-                "Disclosure recorded as an unverified claim (signature did not verify against the other party's pinned key)."
+                "Disclosure recorded as an unverified claim (no signature from the other party's pinned key verified)."
             };
             Redirect::to(&format!("/disputes/{id}?msg={note}")).into_response()
         }
+        Err(crate::disputes::DisputeError::BadInput) => Redirect::to(&format!("/disputes/{id}?msg=That paste held no readable message: decrypt the message with gpg --unwrap --armor and paste the whole output.")).into_response(),
         Err(e) => Redirect::to(&format!("/disputes/{id}?msg=Disclosure not accepted: {e:?}")).into_response(),
     }
 }

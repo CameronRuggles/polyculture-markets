@@ -38,15 +38,14 @@
 <h2>Disclose a message</h2>
 <p>Disclosing is voluntary and one-way. Before you submit, be sure you understand exactly what happens:</p>
 <ul>
-<li>Moderators will see the <strong>plaintext</strong> you paste below, together with the detached signature.</li>
-<li>The marketplace checks the signature against the <strong>other party's</strong> pinned key. If it verifies, the message is labelled evidence; anything else is labelled an unverified claim.</li>
+<li>Decrypt the message on your own device and paste <strong>the whole output of <code>gpg --unwrap --armor</code></strong> below — one paste. The marketplace reads the plaintext out of it and checks the embedded signature against the <strong>other party's</strong> pinned key. If it verifies, the message is labelled evidence; an unwrapped message without their signature is labelled an unverified claim.</li>
+<li>Moderators will see the plaintext the marketplace extracts.</li>
 <li>Disclosed content is stored (encrypted at rest) until <strong>{{ retention_days }} days after this dispute is resolved</strong>, then deleted.</li>
-<li>Only disclose messages from this order's conversation. Decrypt locally and paste; the server never receives your conversation ciphertext for moderation.</li>
+<li>Only disclose messages from this order's conversation. The server never receives your conversation ciphertext for moderation — only what you paste here.</li>
 </ul>
 <form method="post" action="/disputes/{{ dispute_id }}/disclosures">
 <input type="hidden" name="csrf" value="{{ csrf }}">
-<label>Message plaintext<br><textarea name="message" rows="6" cols="70" required></textarea></label>
-<label>Detached signature (armored)<br><textarea name="signature" rows="6" cols="70" required></textarea></label>
+<label>Output of <code>gpg --unwrap --armor the-message.asc</code><br><textarea name="unwrapped" rows="10" cols="70" required></textarea></label>
 <button type="submit">Disclose to moderators</button></form>
 {% endif %}
 {% if awaiting_buyer %}

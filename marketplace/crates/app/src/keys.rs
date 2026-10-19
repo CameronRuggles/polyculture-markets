@@ -3,7 +3,7 @@
 //! Nettle backend (decision log Q8); the server never sees a private key.
 
 use sequoia_openpgp::parse::stream::{
-    DetachedVerifierBuilder, MessageLayer, MessageStructure, VerificationHelper,
+    DetachedVerifierBuilder, MessageLayer, MessageStructure, VerificationHelper, VerifierBuilder,
 };
 use sequoia_openpgp::parse::Parse;
 use sequoia_openpgp::policy::StandardPolicy;
@@ -349,6 +349,150 @@ pub async fn latest_uncertified_rotation(pool: &PgPool, account_id: i64) -> Resu
     Ok(match row {
         Some((false, date)) => Some(date),
         _ => None,
+    })
+}
+
+// -- certificate refresh (messaging audit MM3) -------------------------------
+
+/// Validate a same-fingerprint certificate refresh: the submitter
+/// re-exports the SAME certificate after renewing its signatures —
+/// an expiry extension, a revocation (of the cert or a subkey), a new
+/// self-signature. Key material and user IDs must be identical to
+/// the stored certificate; anything else is a rotation. The
+/// refreshed certificate must also pass the ordinary upload policy
+/// (`validate_cert`): a refresh that kills the last encryption subkey
+/// is refused here and belongs on the rotation path.
+pub fn validate_refresh(old_cert: &[u8], new_cert: &[u8]) -> Result<CertInfo, String> {
+    let new_info = validate_cert(new_cert).map_err(|e| {
+        let why = match e {
+            KeyError::Malformed => "not a parseable certificate",
+            KeyError::PolicyInvalid => "expired or revoked under the standard policy",
+            KeyError::NoEncryptionSubkey => "no living encryption subkey",
+            KeyError::NoSigningKey => "no signing-capable key",
+        };
+        format!("The refreshed certificate is not usable: {why}.")
+    })?;
+    let old = Cert::from_bytes(old_cert)
+        .map_err(|_| "The stored certificate could not be parsed.".to_string())?;
+    let new = Cert::from_bytes(new_cert)
+        .map_err(|_| "That is not a parseable OpenPGP certificate.".to_string())?;
+    if old.fingerprint() != new.fingerprint() {
+        return Err(
+            "That certificate has a different fingerprint. Replacing the key itself \
+             is a rotation, not a refresh — use the rotation form."
+                .to_string(),
+        );
+    }
+    let key_set = |c: &Cert| -> std::collections::BTreeSet<String> {
+        c.keys()
+            .map(|k| format!("{:X}", k.key().fingerprint()))
+            .collect()
+    };
+    if key_set(&old) != key_set(&new) {
+        return Err(
+            "That certificate carries a different set of keys. A refresh may only \
+             renew signatures (revocations, expiry) — new key material is a rotation."
+                .to_string(),
+        );
+    }
+    let uid_set = |c: &Cert| -> std::collections::BTreeSet<String> {
+        c.userids()
+            .map(|u| String::from_utf8_lossy(u.userid().value()).into_owned())
+            .collect()
+    };
+    if uid_set(&old) != uid_set(&new) {
+        return Err(
+            "That certificate carries different user IDs. A refresh may only renew \
+             signatures (revocations, expiry)."
+                .to_string(),
+        );
+    }
+    Ok(new_info)
+}
+
+/// Store a validated refresh: the current key row keeps its version
+/// and fingerprint; only the certificate bytes change (the fuller
+/// signature set supersedes the stored one).
+pub async fn refresh_certificate(
+    pool: &PgPool,
+    account_id: i64,
+    new_cert: &[u8],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE identity_keys SET certificate = $2
+         WHERE account_id = $1 AND status = 'current'",
+    )
+    .bind(account_id)
+    .bind(new_cert)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// -- disclosure unwrap (messaging audit MM1) ---------------------------------
+
+/// A message recovered from a `gpg --unwrap --armor` paste: the
+/// plaintext the server extracted, and whether an embedded signature
+/// verified against the expected certificate. An unwrapped paste can
+/// carry a signature made by anyone (or none); only a signature that
+/// checks out against the OTHER party's order-pinned certificate
+/// makes it evidence.
+pub struct UnwrappedMessage {
+    pub plaintext: String,
+    pub verified: bool,
+}
+
+struct UnwrapHelper {
+    cert: Cert,
+    good: usize,
+    bad: usize,
+}
+
+impl VerificationHelper for UnwrapHelper {
+    fn get_certs(
+        &mut self,
+        _ids: &[sequoia_openpgp::KeyHandle],
+    ) -> sequoia_openpgp::Result<Vec<Cert>> {
+        Ok(vec![self.cert.clone()])
+    }
+    fn check(&mut self, structure: MessageStructure) -> sequoia_openpgp::Result<()> {
+        // Never fail the stream on a bad signature: the plaintext is
+        // still extracted and the disclosure is stored as an
+        // unverified claim (the same standing a bad detached signature
+        // had under the pre-MM1 form). Only the counts are recorded.
+        for layer in structure {
+            if let MessageLayer::SignatureGroup { results } = layer {
+                for r in results {
+                    match r {
+                        Ok(_) => self.good += 1,
+                        Err(_) => self.bad += 1,
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Read a `gpg --unwrap --armor` paste as a (possibly signed) message
+/// against the expected certificate, extracting the plaintext with
+/// Sequoia. Returns None when the paste is not a readable OpenPGP
+/// message at all. `verified` is true only when at least one
+/// signature was present and every signature result was good.
+pub fn extract_unwrapped_message(cert_bytes: &[u8], pasted: &[u8]) -> Option<UnwrappedMessage> {
+    use std::io::Read as _;
+    let cert = Cert::from_bytes(cert_bytes).ok()?;
+    let policy = StandardPolicy::new();
+    let mut verifier = VerifierBuilder::from_bytes(pasted)
+        .ok()?
+        .with_policy(&policy, None, UnwrapHelper { cert, good: 0, bad: 0 })
+        .ok()?;
+    let mut out = Vec::new();
+    verifier.read_to_end(&mut out).ok()?;
+    let helper = verifier.into_helper();
+    Some(UnwrappedMessage {
+        plaintext: String::from_utf8_lossy(&out).into_owned(),
+        verified: helper.good > 0 && helper.bad == 0,
     })
 }
 
