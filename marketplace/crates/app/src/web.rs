@@ -3260,6 +3260,7 @@ struct DisputeTpl {
     assigned_address: Option<String>,
     signed_message: Option<String>,
     signed_signature: Option<String>,
+    signed_primary_address: Option<String>,
     disclosures: Vec<crate::disputes::DisclosureView>,
     /// Account Security Audit task 3 (AH1): for a moderator viewer
     /// without a live step-up grant, disclosures are not decrypted
@@ -3373,6 +3374,7 @@ async fn dispute_page(
         assigned_address: assignment.as_ref().map(|a| a.address.clone()),
         signed_message: assignment.as_ref().map(|a| a.message.clone()),
         signed_signature: assignment.as_ref().map(|a| a.signature.clone()),
+        signed_primary_address: assignment.as_ref().map(|a| a.primary_address.clone()),
         disclosures,
         disclosures_locked,
         is_participant,

@@ -10,6 +10,8 @@
 <li>Terms SHA-256: <code>{{ terms_hash }}</code></li>
 {% if let Some(a) = assigned_address %}<li>Assigned payment address (paid directly by the buyer): <code>{{ a }}</code></li>{% endif %}
 {% if let Some(m) = signed_message %}<li>Seller's wallet-signed message for this address: <code>{{ m }}</code></li>{% endif %}
+{% if let Some(p) = signed_primary_address %}<li>Seller's primary address (verify the signature against this address):<br><textarea readonly rows="3" cols="80">{{ p }}</textarea></li>{% endif %}
+{% if let Some(s) = signed_signature %}<li>Signature (copy exactly):<br><textarea readonly rows="3" cols="80">{{ s }}</textarea></li>{% endif %}
 </ul>
 {% if let Some(p) = buyer_proof %}
 <h2>Buyer-submitted payment proof</h2>
