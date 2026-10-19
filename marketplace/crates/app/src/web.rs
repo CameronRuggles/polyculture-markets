@@ -3122,6 +3122,7 @@ async fn send_message_handler(
         Err(msg::SendError::RateLimited) => conversation_render(&st, &sess, &csrf, id, Some("You are sending messages too quickly — at most 60 per minute. Wait a moment and try again.".into())).await,
         Err(msg::SendError::BudgetExceeded) => conversation_render(&st, &sess, &csrf, id, Some("You have reached the daily message budget (16 MiB of ciphertext in 24 hours).".into())).await,
         Err(msg::SendError::ConversationFull) => conversation_render(&st, &sess, &csrf, id, Some("This conversation has reached its size limit (1,000 messages / 16 MiB).".into())).await,
+        Err(msg::SendError::StorageCeiling) => (StatusCode::SERVICE_UNAVAILABLE, "Message storage is temporarily unavailable — the instance storage limit is reached. Try again later.").into_response(),
         Err(msg::SendError::Envelope(e)) => {
             let kid = if e == modules_api::EnvelopeError::ExtraRecipient {
                 extra_key_id(&st, id, sess.account_id, f.ciphertext.as_bytes()).await
@@ -3334,6 +3335,7 @@ async fn send_message_file_handler(
         Err(msg::SendError::RateLimited) => conversation_render(&st, &sess, &csrf, id, Some("You are sending messages too quickly — at most 60 per minute. Wait a moment and try again.".into())).await,
         Err(msg::SendError::BudgetExceeded) => conversation_render(&st, &sess, &csrf, id, Some("You have reached the daily message budget (16 MiB of ciphertext in 24 hours).".into())).await,
         Err(msg::SendError::ConversationFull) => conversation_render(&st, &sess, &csrf, id, Some("This conversation has reached its size limit (1,000 messages / 16 MiB).".into())).await,
+        Err(msg::SendError::StorageCeiling) => (StatusCode::SERVICE_UNAVAILABLE, "Message storage is temporarily unavailable — the instance storage limit is reached. Try again later.").into_response(),
         Err(msg::SendError::NoKey) => conversation_render(&st, &sess, &csrf, id, Some("Both parties need a registered identity key before messaging.".into())).await,
         Err(msg::SendError::Envelope(e)) => {
             let kid = if e == modules_api::EnvelopeError::ExtraRecipient {

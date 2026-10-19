@@ -109,6 +109,12 @@ pub struct InstanceConfig {
     pub dev_cookies: bool,
     /// REGISTRATIONS_OPEN.
     pub registrations_open: bool,
+    /// ACCOUNT_CAP — the most accounts this instance will ever
+    /// register (verification-fix V9: this reaches InstanceConfig
+    /// from the environment like every other instance limit; before
+    /// this fix the web layer's cap was hard-wired to None — off —
+    /// in main). None = no cap.
+    pub account_cap: Option<u64>,
     /// SOURCE_URL — where this instance's source code lives (AGPL).
     /// Shown on the /source page and in the footer when set.
     pub source_url: Option<String>,
@@ -180,6 +186,13 @@ impl InstanceConfig {
             Some(v) if !v.is_empty() => Some(v),
             _ => None,
         };
+        let account_cap = match get("ACCOUNT_CAP") {
+            None => None,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => return Err(ConfigError::InvalidValue("ACCOUNT_CAP")),
+            },
+        };
 
         Ok(InstanceConfig {
             profile,
@@ -189,6 +202,7 @@ impl InstanceConfig {
             bind_addr,
             dev_cookies,
             registrations_open,
+            account_cap,
             source_url,
             version: env!("CARGO_PKG_VERSION"),
         })
@@ -214,6 +228,24 @@ mod tests {
         let map: HashMap<String, String> =
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         InstanceConfig::resolve(&|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn account_cap_comes_from_the_environment() {
+        // V9: unset = no cap; a number = the cap; junk fails closed.
+        assert_eq!(resolve(&[]).unwrap().account_cap, None);
+        assert_eq!(
+            resolve(&[("ACCOUNT_CAP", "500")]).unwrap().account_cap,
+            Some(500)
+        );
+        assert_eq!(
+            resolve(&[("ACCOUNT_CAP", "lots")]).unwrap_err(),
+            ConfigError::InvalidValue("ACCOUNT_CAP")
+        );
+        assert_eq!(
+            resolve(&[("ACCOUNT_CAP", "-5")]).unwrap_err(),
+            ConfigError::InvalidValue("ACCOUNT_CAP")
+        );
     }
 
     #[test]

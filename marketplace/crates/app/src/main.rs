@@ -123,7 +123,9 @@ async fn main() -> anyhow::Result<()> {
         hash_guard: app::passwords::HashGuard::new(4),
         throttles: Arc::new(app::throttle::Throttles::new()),
         registrations_open: instance.registrations_open,
-        account_cap: None,
+        // Verification-fix V9: the cap is an operator setting
+        // (ACCOUNT_CAP), no longer hard-wired off.
+        account_cap: instance.account_cap,
         dev_cookies: instance.dev_cookies,
         media: app::media::MediaPipeline::from_env(),
         marketplace_id,

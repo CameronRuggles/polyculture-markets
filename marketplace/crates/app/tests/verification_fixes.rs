@@ -1311,3 +1311,88 @@ async fn text_above_the_armor_is_refused_and_nothing_is_stored() {
 
     cleanup(&pool, &[alice, bob]).await;
 }
+
+// ---------------------------------------------------------------------------
+// Task 9 (V9): a global daily storage ceiling, a smaller budget
+// for new accounts, and a registration cap settable from the
+// environment.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn global_ceiling_new_account_budget_and_registration_cap() {
+    let Some(pool) = pool().await else { return };
+    let _guard = fixture_guard(&pool).await;
+    let _msg_serial = msg_lock().lock().await;
+    let (alice, _a) = make_account(&pool, "buyer", PW).await;
+    let (bob, _b) = make_account(&pool, "seller", PW).await;
+    install_cert(&pool, alice, CERT_ALICE).await;
+    install_cert(&pool, bob, CERT_BOB).await;
+    let conv = app::messages::find_or_create_direct(&pool, alice, bob).await.unwrap();
+
+    // (a) With the global ceiling set low, even an established-shape
+    // send is refused once the instance is at the ceiling.
+    std::env::set_var("MSG_GLOBAL_DAILY_CEILING_BYTES", "100");
+    let err = app::messages::send_message(&pool, conv, alice, MSG_300_UNSIGNED.as_bytes())
+        .await
+        .expect_err("past the global ceiling, storage is refused");
+    assert!(
+        matches!(err, app::messages::SendError::StorageCeiling),
+        "got {err:?}"
+    );
+    std::env::remove_var("MSG_GLOBAL_DAILY_CEILING_BYTES");
+
+    // (b) A fresh account (no completed order) hits its smaller
+    // 1 MiB budget long before the ordinary 16 MiB one: plant just
+    // over 1 MiB of history, then one more real message is refused.
+    let two_hours_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 7200;
+    let filler = vec![b'x'; 40_000];
+    for _ in 0..27 {
+        plant_message(&pool, conv, alice, bob, "CED0A0143425A8E0", &filler, two_hours_ago).await;
+    }
+    let err = app::messages::send_message(&pool, conv, alice, MSG_300_UNSIGNED.as_bytes())
+        .await
+        .expect_err("a new account past its smaller budget is refused");
+    assert!(
+        matches!(err, app::messages::SendError::BudgetExceeded),
+        "got {err:?}"
+    );
+
+    // (c) The registration cap reaches the web layer from config:
+    // with cap Some(0) the instance is full.
+    let capped = test_server_with_cap(&pool, Some(0)).await;
+    let page = http_raw(capped.addr, "GET", "/register", None, None, None).await;
+    assert_eq!(page.status, 200);
+    let cookie_hdr = page
+        .headers
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("set-cookie: csrf="))
+        .map(|l| l.split(':').nth(1).unwrap().trim().split(';').next().unwrap().to_string())
+        .expect("csrf cookie set");
+    let marker = "name=\"csrf\" value=\"";
+    let start = page.body.find(marker).expect("hidden csrf field") + marker.len();
+    let field = page.body[start..].split('"').next().unwrap().to_string();
+    let r = post_form(
+        capped.addr,
+        "/register",
+        Some(&cookie_hdr),
+        &[
+            ("csrf", field.as_str()),
+            ("username", "capped-out-user"),
+            ("password", "capped-correct-passphrase-1"),
+        ],
+    )
+    .await;
+    assert_eq!(r.status, 403, "a full instance refuses registration outright");
+    assert!(
+        r.body.contains("Registration is not open"),
+        "the refusal is the admission cap, not a CSRF failure: {}",
+        r.body.chars().take(200).collect::<String>()
+    );
+    capped.stop();
+
+    cleanup(&pool, &[alice, bob]).await;
+}

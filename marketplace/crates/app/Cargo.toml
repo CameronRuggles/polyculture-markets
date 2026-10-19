@@ -36,3 +36,6 @@ unicode-normalization = "0.1"
 sequoia-openpgp = { version = "2.4.1", features = ["compression"] }
 envelope = { path = "../envelope" }
 anyhow = "1"
+# Verification-fix V9: statvfs for the message blob volume's
+# free-disk floor (already in the locked tree transitively).
+libc = "0.2"

@@ -50,6 +50,7 @@ dependencies = [
  "envelope",
  "hex",
  "hmac",
+ "libc",
  "modules-api",
  "nettle",
  "rand",
