@@ -29,6 +29,23 @@ pub struct HashGuard {
     /// been used at least once and not yet been swept. Bounded by
     /// opportunistic sweeping in `scope_lock`.
     scopes: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// Total Argon2 runs performed (hashes + verifications). An ops
+    /// counter: it makes the login budget's "refused BEFORE hashing"
+    /// property observable (verification-fix V1's acceptance test
+    /// counts hashes across a parallel guessing burst).
+    hash_ops: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// A held per-scope lock (see `HashGuard::scope_guard`). While a
+/// caller holds this, no other scoped hash for the same scope runs —
+/// the login handler holds it across its budget re-check, the
+/// password verification, and the failure recording, so the three
+/// are atomic against parallel attempts on the same username
+/// (verification-fix V1: checking the budget before queueing on the
+/// lock let a burst through, because every queued request had
+/// already passed the check).
+pub struct ScopeGuard {
+    _guard: OwnedMutexGuard<()>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -47,7 +64,32 @@ impl HashGuard {
         HashGuard {
             sem: Arc::new(Semaphore::new(permits)),
             scopes: Arc::new(Mutex::new(HashMap::new())),
+            hash_ops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Total Argon2 runs performed through this guard so far.
+    pub fn hash_op_count(&self) -> u64 {
+        self.hash_ops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Take the per-scope lock and HOLD it (the caller decides when
+    /// it drops). Pair with `verify_guarded` for the verification
+    /// itself.
+    pub async fn scope_guard(&self, scope: &str) -> ScopeGuard {
+        ScopeGuard { _guard: self.scope_lock(scope).await }
+    }
+
+    /// `verify` while the caller holds the scope's `ScopeGuard`:
+    /// the global semaphore still applies; the per-scope
+    /// serialization is the caller's held guard, not re-acquired.
+    pub async fn verify_guarded(
+        &self,
+        _guard: &ScopeGuard,
+        password: &str,
+        stored: &str,
+    ) -> Result<bool, HashError> {
+        self.verify(password, stored).await
     }
 
     /// The lock serializing all hashing for one scope. The returned
@@ -70,11 +112,13 @@ impl HashGuard {
 
     pub async fn hash(&self, password: &str) -> Result<String, HashError> {
         let _permit = self.sem.try_acquire().map_err(|_| HashError::Busy)?;
+        self.hash_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         hash_inner(password).await
     }
 
     pub async fn verify(&self, password: &str, stored: &str) -> Result<bool, HashError> {
         let _permit = self.sem.try_acquire().map_err(|_| HashError::Busy)?;
+        self.hash_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         verify_inner(password, stored).await
     }
 
@@ -135,6 +179,19 @@ mod tests {
         assert!(h.starts_with("$argon2id$"));
         assert!(g.verify("correct horse battery staple", &h).await.unwrap());
         assert!(!g.verify("wrong", &h).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn scope_guard_and_op_counter() {
+        let g = HashGuard::new(2);
+        let h = g.hash("correct horse battery staple").await.unwrap();
+        assert_eq!(g.hash_op_count(), 1);
+        let guard = g.scope_guard("alice").await;
+        assert!(g.verify_guarded(&guard, "correct horse battery staple", &h).await.unwrap());
+        assert_eq!(g.hash_op_count(), 2, "guarded verifies count as hash ops");
+        drop(guard);
+        // A second guard for the same scope is available after the drop.
+        let _g2 = g.scope_guard("alice").await;
     }
 
     #[tokio::test]

@@ -62,6 +62,22 @@ impl AppState {
         let secure = if self.dev_cookies { "" } else { "; Secure" };
         format!("csrf={value}; Path=/; SameSite=Strict{secure}")
     }
+    fn device_cookie_name(&self) -> &'static str {
+        if self.dev_cookies { "device" } else { "__Host-device" }
+    }
+    /// The device cookie set on a successful login (verification-fix
+    /// V1): `{public_id}.{mac}` — see `KeyFile::device_cookie_mac`
+    /// and `device_cookie_exempt`. One year, so a browser the owner
+    /// actually uses stays exempt from the stranger budget across
+    /// the failure window many times over.
+    fn set_device_cookie(&self, account_id: i64, public_id: &str) -> String {
+        let secure = if self.dev_cookies { "" } else { "; Secure" };
+        let mac = hex::encode(self.keyfile.device_cookie_mac(account_id));
+        format!(
+            "{}={public_id}.{mac}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000{secure}",
+            self.device_cookie_name()
+        )
+    }
 
     /// Account Security Audit task 5 (AM2 follow-through): the
     /// per-account request throttle (`Throttles::allow_request`,
@@ -858,48 +874,105 @@ struct LoginForm {
     csrf: String,
 }
 
+/// Verification-fix V1: true when this request's device cookie
+/// proves the browser has logged into THIS account before (OWASP's
+/// device-cookie pattern; the MAC is `KeyFile::device_cookie_mac`).
+/// Such a browser is exempt from the per-username failure budget —
+/// the budget's job is to stop STRANGERS guessing, and before this
+/// fix an attacker who spent a public username's budget locked the
+/// owner out too. A forged or foreign cookie verifies for nobody:
+/// the named public id must be the account's, and the MAC is
+/// compared in constant time. (Tor Browser drops cookies on close,
+/// so the exemption mainly protects non-Tor and persistent-profile
+/// browsers; it never weakens the passphrase/TOTP checks.)
+fn device_cookie_exempt(st: &AppState, headers: &HeaderMap, account_id: i64, public_id: &str) -> bool {
+    let Some(raw) = cookie_value(headers, st.device_cookie_name()) else {
+        return false;
+    };
+    let Some((pid, mac_hex)) = raw.split_once('.') else {
+        return false;
+    };
+    if pid != public_id {
+        return false;
+    }
+    let Ok(mac) = hex::decode(mac_hex) else {
+        return false;
+    };
+    let expected = st.keyfile.device_cookie_mac(account_id);
+    if mac.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in mac.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<LoginForm>) -> Response {
     if cookie_value(&headers, "csrf").as_deref() != Some(f.csrf.as_str()) {
         return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
     }
     let folded = usernames::fold_username(&f.username);
-    let fail = |st: &AppState| {
-        let d = st.throttles.record_login_failure(&folded);
-        (d, LoginTpl {
-            error: Some("Invalid username or passphrase.".into()),
-            csrf: f.csrf.clone(),
-        })
+    let generic_tpl = |csrf: &str| LoginTpl {
+        error: Some("Invalid username or passphrase.".into()),
+        csrf: csrf.into(),
     };
-    // AM1: the per-username attempt budget is checked BEFORE any
-    // hashing. A budget-exhausted name gets the generic error with no
-    // hash work and no extra delay recorded (the window ages out on
-    // its own); other usernames are unaffected.
-    if st.throttles.login_budget_exceeded(&folded) {
-        let tpl = LoginTpl {
-            error: Some("Invalid username or passphrase.".into()),
-            csrf: f.csrf.clone(),
-        };
-        return page(&st, &headers, "Log in", tpl.render().unwrap()).await;
-    }
     let row = db::account_by_username(&st.pool, &folded).await.ok().flatten();
     let Some((id, stored, _role)) = row else {
-        let (d, tpl) = fail(&st);
+        // No such account. The failure is still recorded (it feeds
+        // the address-less noise budget) — and since verification-fix
+        // V1 eviction never removes an at/over-budget entry, a flood
+        // of these can no longer launder a real account's count.
+        let (d, _n) = st.throttles.record_login_failure_counted(&folded);
         tokio::time::sleep(std::time::Duration::from_secs(d.whole_seconds().min(5) as u64)).await;
-        return page(&st, &headers, "Log in", tpl.render().unwrap()).await;
+        return page(&st, &headers, "Log in", generic_tpl(&f.csrf).render().unwrap()).await;
     };
+    let public_id = db::public_id_of(&st.pool, id).await.ok().flatten().unwrap_or_default();
+    let exempt = device_cookie_exempt(&st, &headers, id, &public_id);
+    // AM1 + verification-fix V1: the budget's AUTHORITATIVE check
+    // happens under the per-username hash lock, and a failure is
+    // recorded before the lock is released. (The pre-lock check that
+    // AM1 shipped let a parallel burst through: every queued request
+    // had already passed it, so only hashing speed bounded the
+    // guesses.) A cheap non-authoritative pre-check still sheds load
+    // when the budget is plainly spent.
+    if !exempt && st.throttles.login_budget_exceeded(&folded) {
+        return page(&st, &headers, "Log in", generic_tpl(&f.csrf).render().unwrap()).await;
+    }
     // AM2: verification is serialized per username — parallel guesses
     // against one account queue behind a single Argon2 run instead of
-    // filling the shared hashing pool.
-    match st.hash_guard.verify_scoped(&folded, &f.password, &stored).await {
+    // filling the shared hashing pool. The guard is HELD across the
+    // budget re-check, the verification, and the failure recording.
+    let guard = st.hash_guard.scope_guard(&folded).await;
+    if !exempt && st.throttles.login_budget_exceeded(&folded) {
+        return page(&st, &headers, "Log in", generic_tpl(&f.csrf).render().unwrap()).await;
+    }
+    match st.hash_guard.verify_guarded(&guard, &f.password, &stored).await {
         Ok(true) => {}
         Ok(false) => {
-            let (d, tpl) = fail(&st);
+            let (d, n) = st.throttles.record_login_failure_counted(&folded);
+            drop(guard);
+            if n == crate::throttle::LOGIN_FAILURE_BUDGET {
+                // The failure that spends the budget tells the
+                // account (V1): if these attempts are not yours,
+                // someone is guessing at your passphrase.
+                let _ = crate::orders::notify(
+                    &st.pool,
+                    id,
+                    "login_budget_tripped",
+                    "the login failure budget for your username was used up by failed attempts; \
+                     if these were not you, someone is guessing at your passphrase",
+                )
+                .await;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(d.whole_seconds().min(5) as u64)).await;
-            return page(&st, &headers, "Log in", tpl.render().unwrap()).await;
+            return page(&st, &headers, "Log in", generic_tpl(&f.csrf).render().unwrap()).await;
         }
         Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
     }
+    drop(guard);
     // Task 1 (AH1): an enrolled account needs its TOTP code at login
     // too — the passphrase alone no longer opens a full session. The
     // code goes through the same gate as every step-up (counting,
@@ -914,9 +987,9 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
             None => false,
         };
         if !code_ok {
-            let (d, tpl) = fail(&st);
+            let (d, _n) = st.throttles.record_login_failure_counted(&folded);
             tokio::time::sleep(std::time::Duration::from_secs(d.whole_seconds().min(5) as u64)).await;
-            return page(&st, &headers, "Log in", tpl.render().unwrap()).await;
+            return page(&st, &headers, "Log in", generic_tpl(&f.csrf).render().unwrap()).await;
         }
     }
     st.throttles.clear_login_failures(&folded);
@@ -942,11 +1015,16 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
     if db::create_session(&st.pool, &token, &csrf_secret, &sess).await.is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response();
     }
-    (
-        [(header::SET_COOKIE, st.set_cookie(&token))],
-        Redirect::to("/account"),
-    )
-        .into_response()
+    // Verification-fix V1: a successful login also (re)sets the
+    // device cookie, so THIS browser is budget-exempt from now on.
+    let mut hm = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&st.set_cookie(&token)) {
+        hm.append(header::SET_COOKIE, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&st.set_device_cookie(id, &public_id)) {
+        hm.append(header::SET_COOKIE, v);
+    }
+    (hm, Redirect::to("/account")).into_response()
 }
 
 #[derive(Deserialize)]
