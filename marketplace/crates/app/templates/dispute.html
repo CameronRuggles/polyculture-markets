@@ -2,7 +2,7 @@
 {% if let Some(m) = message %}<p role="alert">{{ m }}</p>{% endif %}
 <p>Listing: {{ listing_title }} · Total: {{ total_xmr }} XMR</p>
 <p>Buyer: {{ buyer_username }} · Seller: {{ seller_username }}</p>
-<p>State: <strong>{{ dispute_state }}</strong>{% if let Some(o) = outcome %} · Outcome: {{ o }}{% endif %}</p>
+<p>State: <strong>{{ dispute_state }}</strong>{% if let Some(o) = outcome %} · Outcome: {{ o }}{% endif %}{% if let Some(m) = decided_by %} · Decided by moderator <strong>{{ m }}</strong>{% endif %}</p>
 <h2>What moderators can see</h2>
 <p>Moderators see the public order record below and anything a party voluntarily discloses. They cannot browse your conversation — messages are end-to-end encrypted and the server holds only ciphertext.</p>
 <ul>

@@ -52,8 +52,8 @@
 <button type="submit">Look up listing</button></form>
 {% if let Some(l) = listing_hit %}
 <article>
-<p><a href="/listings/{{ l.public_id }}">{{ l.title }}</a> · status {{ l.status }} · seller {{ l.seller_name }}</p>
-{% if l.status == "removed" %}
+<p><a href="/listings/{{ l.public_id }}">{{ l.title }}</a> · status {{ l.status }}{% if l.taken_down %} (taken down by a moderator){% endif %} · seller {{ l.seller_name }}</p>
+{% if l.taken_down %}
 <form method="post" action="/moderation/listings/{{ l.public_id }}/restore">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>TOTP code <input name="totp" inputmode="numeric" autocomplete="one-time-code" required></label>

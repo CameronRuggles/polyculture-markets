@@ -8,8 +8,9 @@ use crate::authz::{authorize, Decision, Role};
 use crate::passwords::{HashError, HashGuard};
 use crate::{db, recovery, sessions, usernames};
 use askama::Template;
-use axum::extract::{Form, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Form, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -475,7 +476,107 @@ pub fn router(state: AppState) -> Router {
         // the handler enforces the table and keeps the identical 404
         // for everyone else).
         .route("/admin", get(admin_page))
+        // CL3: security headers on EVERY response (see below).
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// CL3 (Media/Content/Disputes audit): every response — pages,
+/// redirects, errors, media — carries the same security headers.
+/// The site ships no JavaScript and loads no external subresources,
+/// so the CSP can be strict: only same-origin images and the shell's
+/// inline styles are allowed; framing is refused outright;
+/// Referrer-Policy keeps order/listing URLs (which can identify
+/// what someone is disputing) from leaking to any linked host.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
+    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    res
+}
+
+/// CL1: alert text is NEVER taken from the request. Redirects carry
+/// a short `msg`/`pmsg` CODE; pages render only the fixed string
+/// below for a known code. Free text in a crafted link therefore
+/// cannot make the site's alert box say anything — an unknown code
+/// renders nothing at all. (Before this, anyone could send a buyer
+/// a link to their own order whose alert read, in the site's voice,
+/// whatever the sender typed.) The one dynamic value, `n`, is a
+/// bare count rendered only when it parses as a plain integer.
+/// Three disclosure codes are the outcome phrases themselves
+/// ("signature verified", "unverified claim", "no readable
+/// message") — still exact-match keys to fixed strings; the phrase
+/// spellings keep the messaging batch's acceptance assertions,
+/// which pin those outcome words in the redirect, without
+/// weakening the table-only rendering rule.
+fn alert_text(code: Option<&str>, n: Option<&str>) -> Option<String> {
+    let text = match code? {
+        // Seller payment panel (pmsg).
+        "TOTP_required" => "Enroll in TOTP on your security page first: a payment identity cannot be set or changed without two-factor authentication.".to_string(),
+        "Step-up_failed" => "Step-up verification failed: enter your current passphrase.".to_string(),
+        "address_rejected" => "Primary address rejected: paste exactly one address.".to_string(),
+        "identity_saved" => "Payment identity saved.".to_string(),
+        "batch_missing" => "No batch received: paste the batch JSON or choose the batch file.".to_string(),
+        "batch_accepted" => {
+            let n: u64 = n.and_then(|v| v.parse().ok())?;
+            format!("Batch accepted: {n} payment address(es) added to your pool.")
+        }
+        "batch_rejected" => "Batch rejected (nothing was stored).".to_string(),
+        "listing_taken_down" => "This listing was removed by a moderator. You cannot change its status until a moderator restores it.".to_string(),
+        // Order page (msg).
+        "proof_recorded" => "Payment proof recorded. It is carried unverified: the seller and moderators check it in their own wallets.".to_string(),
+        "proof_rejected" => "Proof not accepted.".to_string(),
+        "report_recorded" => "Your payment report is recorded on your word alone — weaker protection than a transaction proof.".to_string(),
+        "report_rejected" => "Report not accepted.".to_string(),
+        "payment_confirmed" => "Payment confirmed for this order.".to_string(),
+        "confirmation_refused" => "Confirmation not allowed.".to_string(),
+        "declaration_recorded" => "Declaration recorded.".to_string(),
+        "declaration_refused" => "Declaration not allowed.".to_string(),
+        "payment_marked" => "Payment marked: seller confirmed payment.".to_string(),
+        "mark_paid_refused" => "Mark-paid not allowed.".to_string(),
+        "invoice_required" => "Accepting requires an issued invoice. Invoices arrive with the payment stages.".to_string(),
+        "action_refused" => "Action not allowed.".to_string(),
+        "review_saved" => "Review saved.".to_string(),
+        "review_rejected" => "Review not saved.".to_string(),
+        "reply_posted" => "Reply posted.".to_string(),
+        "reply_rejected" => "Reply not posted.".to_string(),
+        // Dispute page (msg).
+        "unlock_refused" => "Unlock refused. Disclosures stay locked.".to_string(),
+        "signature verified" => "Disclosure recorded: signature verified against the other party's pinned key.".to_string(),
+        "unverified claim" => "Disclosure recorded as an unverified claim (no signature from the other party's pinned key verified).".to_string(),
+        "no readable message" => "That paste held no readable message: decrypt the message with gpg --unwrap --armor and paste the whole output.".to_string(),
+        "disclosure_rejected" => "Disclosure not accepted.".to_string(),
+        "mod_action_refused" => "Moderator action refused. Enroll in TOTP on your security page first.".to_string(),
+        "outcome_recorded" => "Outcome recorded.".to_string(),
+        "resolve_failed" => "Resolve failed.".to_string(),
+        "resolve_self_dealing" => "Resolve refused: you are a party to this order, so another moderator must decide it.".to_string(),
+        "refund_confirmed" => "Refund confirmed; the dispute is resolved.".to_string(),
+        "confirmation_failed" => "Confirmation failed.".to_string(),
+        // Moderation surfaces (msg).
+        "report_updated" => "Report updated.".to_string(),
+        "report_failed" => "Report action failed.".to_string(),
+        "flag_updated" => "Flag updated.".to_string(),
+        "flag_failed" => "Flag action failed.".to_string(),
+        "flag_self_dealing" => "Flag decision refused: you are a party to this order, so another moderator must decide it.".to_string(),
+        "warning_recorded" => "Warning recorded.".to_string(),
+        "warn_failed" => "Warn failed.".to_string(),
+        "warn_protected" => "That account's role is protected: it cannot be warned from here.".to_string(),
+        "account_closed" => "Account closed. Its listings are unpublished and its history remains for counterparties.".to_string(),
+        "closure_failed" => "Closure failed.".to_string(),
+        "closure_protected" => "That account's role is protected: it cannot be closed from here.".to_string(),
+        "mod_refused" => "Action refused.".to_string(),
+        "listing_updated" => "Listing updated.".to_string(),
+        "listing_failed" => "Listing action failed.".to_string(),
+        _ => return None,
+    };
+    Some(text)
 }
 
 // -- helpers -----------------------------------------------------------------
@@ -980,6 +1081,8 @@ pub struct ListingView {
     pub category: String,
     pub seller_name: String,
     pub status: String,
+    /// CH1: a moderator takedown is in force on this listing.
+    pub taken_down: bool,
 }
 
 fn view_of(l: &lst::Listing) -> ListingView {
@@ -991,6 +1094,7 @@ fn view_of(l: &lst::Listing) -> ListingView {
         category: l.category.clone(),
         seller_name: l.seller_name.clone(),
         status: l.status.clone(),
+        taken_down: l.taken_down,
     }
 }
 
@@ -1185,7 +1289,7 @@ async fn seller_page(
         payment_unused,
         payment_low: identity.is_some() && payment_unused <= st.payments.low_pool_threshold,
         payment_changed,
-        payment_message: p.get("pmsg").cloned(),
+        payment_message: alert_text(p.get("pmsg").map(String::as_str), p.get("n").map(String::as_str)),
         csrf,
     };
     page(&st, &headers, "Sell", tpl.render().unwrap()).await
@@ -1215,18 +1319,18 @@ async fn seller_payment_gate(
 ) -> Option<Response> {
     if !crate::moderation::totp_enrolled(&st.pool, sess.account_id).await.unwrap_or(false) {
         return Some(
-            Redirect::to("/seller?pmsg=Enroll in TOTP on your security page first: a payment identity cannot be set or changed without two-factor authentication.")
+            Redirect::to("/seller?pmsg=TOTP_required")
                 .into_response(),
         );
     }
     let Some(pw) = password.filter(|p| !p.is_empty()) else {
         return Some(
-            Redirect::to("/seller?pmsg=Step-up verification failed: enter your current passphrase.").into_response(),
+            Redirect::to("/seller?pmsg=Step-up_failed").into_response(),
         );
     };
     match step_up(st, sess, pw, totp).await {
         Ok(()) => None,
-        Err(msg) => Some(Redirect::to(&format!("/seller?pmsg={msg}")).into_response()),
+        Err(_) => Some(Redirect::to("/seller?pmsg=Step-up_failed").into_response()),
     }
 }
 
@@ -1257,15 +1361,15 @@ async fn payment_identity_post(
     let lines = match modules_api::normalize_form_lines(&f.primary_address) {
         Ok(v) if v.len() == 1 => v,
         _ => {
-            return Redirect::to("/seller?pmsg=Primary address rejected: paste exactly one address.").into_response()
+            return Redirect::to("/seller?pmsg=address_rejected").into_response()
         }
     };
     match crate::payments::set_primary_address(&st.pool, sess.account_id, &lines[0], &st.payments).await {
         Ok(_) => {
             stepup_notice(&st, sess.account_id, "stepup_payment_identity", "your primary payment address was set or changed").await;
-            Redirect::to("/seller?pmsg=Payment identity saved.").into_response()
+            Redirect::to("/seller?pmsg=identity_saved").into_response()
         }
-        Err(e) => Redirect::to(&format!("/seller?pmsg=Primary address rejected: {e:?}")).into_response(),
+        Err(_) => Redirect::to("/seller?pmsg=address_rejected").into_response(),
     }
 }
 
@@ -1334,14 +1438,14 @@ async fn payment_batch_post(
     // The batch text is parsed as JSON and its string values are stored
     // byte-exact as parsed — nothing here trims or re-encodes them.
     let Some(text) = file_text.or(pasted) else {
-        return Redirect::to("/seller?pmsg=No batch received: paste the batch JSON or choose the batch file.").into_response();
+        return Redirect::to("/seller?pmsg=batch_missing").into_response();
     };
     match crate::payments::upload_batch(&st.pool, sess.account_id, &text, &st.payments).await {
         Ok(n) => {
             stepup_notice(&st, sess.account_id, "stepup_payment_batch", "a signed subaddress batch was uploaded to your pool").await;
-            Redirect::to(&format!("/seller?pmsg=Batch accepted: {n} payment address(es) added to your pool.")).into_response()
+            Redirect::to(&format!("/seller?pmsg=batch_accepted&n={n}")).into_response()
         }
-        Err(e) => Redirect::to(&format!("/seller?pmsg=Batch rejected (nothing was stored): {e:?}")).into_response(),
+        Err(_) => Redirect::to("/seller?pmsg=batch_rejected").into_response(),
     }
 }
 
@@ -1435,6 +1539,12 @@ async fn listing_status(
     let Some(l) = lst::listing_by_public_id(&st.pool, &id).await.ok().flatten() else {
         return (StatusCode::NOT_FOUND, "No such listing").into_response();
     };
+    // CH1: while a moderator takedown is in force the seller cannot
+    // change the status at all (set_status enforces this too; the
+    // explicit branch gives the honest message).
+    if l.taken_down && l.seller_id == sess.account_id {
+        return Redirect::to("/seller?pmsg=listing_taken_down").into_response();
+    }
     match lst::set_status(&st.pool, l.id, sess.account_id, &f.status).await {
         Ok(true) => Redirect::to("/seller").into_response(),
         _ => (StatusCode::FORBIDDEN, "Not your listing").into_response(),
@@ -1495,7 +1605,11 @@ async fn listing_media(
     }
 }
 
-async fn media_serve(State(st): State<AppState>, Path(r#ref): Path<String>) -> Response {
+async fn media_serve(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(r#ref): Path<String>,
+) -> Response {
     // Refs are server-generated as `<32 hex>.<png|jpg>` (media.rs
     // sanitize); validate the stem as hex and the extension separately.
     // The earlier check ran the hex test over the WHOLE ref including
@@ -1514,7 +1628,41 @@ async fn media_serve(State(st): State<AppState>, Path(r#ref): Path<String>) -> R
     if !ok {
         return (StatusCode::NOT_FOUND, "No").into_response();
     }
-    match tokio::fs::read(st.media.path_of(&r#ref)).await {
+    // CM1: an image is public only while its listing is live
+    // (published and not taken down). In every other state — draft,
+    // paused, withdrawn, taken down, or not attached to any listing
+    // at all — only the listing's seller and moderators may fetch
+    // it. Everything else gets the same 404 as a missing ref, so
+    // the route is not an oracle for which refs exist.
+    let owner: Option<(i64, String, bool)> = sqlx::query_as(
+        "SELECT l.seller_id, l.status, l.taken_down_at IS NOT NULL
+           FROM listing_media m JOIN listings l ON l.id = m.listing_id
+          WHERE m.sanitized_ref = $1",
+    )
+    .bind(&r#ref)
+    .fetch_optional(&st.pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((seller_id, status, taken_down)) = owner else {
+        return (StatusCode::NOT_FOUND, "No").into_response();
+    };
+    let live = status == "published" && !taken_down;
+    if !live {
+        let allowed = match current_session(&st, &headers).await {
+            Some((_, sess, _)) => {
+                sess.account_id == seller_id
+                    || matches!(session_role(&st, sess.account_id).await, Role::Moderator | Role::Admin)
+            }
+            None => false,
+        };
+        if !allowed {
+            return (StatusCode::NOT_FOUND, "No").into_response();
+        }
+    }
+    // A quarantined file (its listing is taken down) still serves
+    // to the seller/moderators who passed the check above.
+    match tokio::fs::read(st.media.existing_path_of(&r#ref)).await {
         Ok(bytes) => {
             let ct = if r#ref.ends_with(".png") { "image/png" } else { "image/jpeg" };
             (
@@ -2320,7 +2468,7 @@ async fn order_page(
         proof_open,
         manual_reported,
         can_declare,
-        message: p.get("msg").cloned(),
+        message: alert_text(p.get("msg").map(String::as_str), None),
         csrf,
         review,
         can_review,
@@ -2374,30 +2522,28 @@ async fn order_action(
         .await
         {
             Ok(_) => Redirect::to(&format!(
-                "/orders/{id}?msg={}",
-                "Payment proof recorded. It is carried unverified: the seller and moderators check it in their own wallets."
+                "/orders/{id}?msg=proof_recorded"
             ))
             .into_response(),
-            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Proof not accepted: {e:?}")).into_response(),
+            Err(_) => Redirect::to(&format!("/orders/{id}?msg=proof_rejected")).into_response(),
         };
     }
     if action == "manual-report" {
         // The buyer's manual "I paid" fallback (BuyerReported).
         return match crate::payments::submit_manual_report(&st.pool, &o, sess.account_id).await {
             Ok(_) => Redirect::to(&format!(
-                "/orders/{id}?msg={}",
-                "Your payment report is recorded on your word alone — weaker protection than a transaction proof."
+                "/orders/{id}?msg=report_recorded"
             ))
             .into_response(),
-            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Report not accepted: {e:?}")).into_response(),
+            Err(_) => Redirect::to(&format!("/orders/{id}?msg=report_rejected")).into_response(),
         };
     }
     if action == "confirm-payment" {
         // Per-order seller confirmation bound to the subaddress
         // (design update #2.1); identical wording for every Paid path.
         return match crate::payments::confirm_payment(&st.pool, &o, sess.account_id, &st.payments).await {
-            Ok(_) => Redirect::to(&format!("/orders/{id}?msg={}", "Payment confirmed for this order.")).into_response(),
-            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Confirmation not allowed: {e:?}")).into_response(),
+            Ok(_) => Redirect::to(&format!("/orders/{id}?msg=payment_confirmed")).into_response(),
+            Err(_) => Redirect::to(&format!("/orders/{id}?msg=confirmation_refused")).into_response(),
         };
     }
     if action == "declare-not-received" {
@@ -2405,8 +2551,8 @@ async fn order_action(
         // confirmation wording is identical whether or not a proof
         // is on file — the seller learns nothing from it.
         return match crate::payments::declare_not_received(&st.pool, &o, sess.account_id, &st.payments).await {
-            Ok(_) => Redirect::to(&format!("/orders/{id}?msg={}", "Declaration recorded.")).into_response(),
-            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Declaration not allowed: {e:?}")).into_response(),
+            Ok(_) => Redirect::to(&format!("/orders/{id}?msg=declaration_recorded")).into_response(),
+            Err(_) => Redirect::to(&format!("/orders/{id}?msg=declaration_refused")).into_response(),
         };
     }
     if action == "mark-paid" {
@@ -2414,18 +2560,17 @@ async fn order_action(
         // SellerAttestation claim through the DirectV1 module; the
         // core performs the Paid transition (payments::mark_paid).
         return match crate::payments::mark_paid(&st.pool, &o, sess.account_id, &st.payments).await {
-            Ok(_) => Redirect::to(&format!("/orders/{id}?msg={}", "Payment marked: seller confirmed payment.")).into_response(),
-            Err(e) => Redirect::to(&format!("/orders/{id}?msg=Mark-paid not allowed: {e:?}")).into_response(),
+            Ok(_) => Redirect::to(&format!("/orders/{id}?msg=payment_marked")).into_response(),
+            Err(_) => Redirect::to(&format!("/orders/{id}?msg=mark_paid_refused")).into_response(),
         };
     }
     match ord::apply_action(&st.pool, &o, &action, sess.account_id).await {
         Ok(_) => Redirect::to(&format!("/orders/{id}")).into_response(),
         Err(ord::OrderError::InvoiceRequired) => Redirect::to(&format!(
-            "/orders/{id}?msg={}",
-            "Accepting requires an issued invoice. Invoices arrive with the payment stages."
+            "/orders/{id}?msg=invoice_required"
         ))
         .into_response(),
-        Err(e) => Redirect::to(&format!("/orders/{id}?msg=Action not allowed: {e:?}")).into_response(),
+        Err(_) => Redirect::to(&format!("/orders/{id}?msg=action_refused")).into_response(),
     }
 }
 
@@ -2730,7 +2875,7 @@ async fn conversation_page(
     if !msg::is_participant(&st.pool, id, sess.account_id).await.unwrap_or(false) {
         return (StatusCode::NOT_FOUND, "No such conversation").into_response();
     }
-    conversation_render(&st, &sess, &csrf, id, p.get("msg").cloned()).await
+    conversation_render(&st, &sess, &csrf, id, alert_text(p.get("msg").map(String::as_str), None)).await
 }
 
 #[derive(Deserialize)]
@@ -3065,8 +3210,8 @@ async fn review_submit(
     };
     let score: i32 = f.score.parse().unwrap_or(0);
     match crate::reviews::submit_review(&st.pool, &st.keyfile, &st.stage9, &id, sess.account_id, score, &f.text).await {
-        Ok(()) => Redirect::to(&format!("/orders/{id}?msg={}", "Review saved.")).into_response(),
-        Err(e) => Redirect::to(&format!("/orders/{id}?msg=Review not saved: {e:?}")).into_response(),
+        Ok(()) => Redirect::to(&format!("/orders/{id}?msg=review_saved")).into_response(),
+        Err(_) => Redirect::to(&format!("/orders/{id}?msg=review_rejected")).into_response(),
     }
 }
 
@@ -3087,8 +3232,8 @@ async fn review_reply(
         Err(r) => return r,
     };
     match crate::reviews::seller_reply(&st.pool, &st.stage9, &id, sess.account_id, &f.text).await {
-        Ok(()) => Redirect::to(&format!("/orders/{id}?msg={}", "Reply posted.")).into_response(),
-        Err(e) => Redirect::to(&format!("/orders/{id}?msg=Reply not posted: {e:?}")).into_response(),
+        Ok(()) => Redirect::to(&format!("/orders/{id}?msg=reply_posted")).into_response(),
+        Err(_) => Redirect::to(&format!("/orders/{id}?msg=reply_rejected")).into_response(),
     }
 }
 
@@ -3101,6 +3246,10 @@ struct DisputeTpl {
     dispute_id: i64,
     dispute_state: String,
     outcome: Option<String>,
+    /// CM3: the moderator who recorded the outcome (proposed or
+    /// final), named for both parties — a decision is attributable
+    /// to the person who made it.
+    decided_by: Option<String>,
     order_public_id: String,
     listing_title: String,
     buyer_username: String,
@@ -3203,11 +3352,16 @@ async fn dispute_page(
     } else {
         None
     };
+    let decided_by = match d.resolved_by {
+        Some(mid) => Some(db::username_of_id(&st.pool, mid).await),
+        None => None,
+    };
     let tpl = DisputeTpl {
         csrf,
         dispute_id: d.id,
         dispute_state: d.state.clone(),
         outcome: d.outcome.clone(),
+        decided_by,
         order_public_id: o.public_id.clone(),
         listing_title: o.listing_title.clone(),
         buyer_username,
@@ -3228,7 +3382,7 @@ async fn dispute_page(
         show_resolve: is_moderator && d.state == "open",
         awaiting_buyer: d.state == "awaiting_buyer_confirmation",
         retention_days: st.stage9.disclosure_retention_days,
-        message: p.get("msg").cloned(),
+        message: alert_text(p.get("msg").map(String::as_str), None),
         totp_enrolled,
     };
     let title = format!("Dispute {}", d.id);
@@ -3275,8 +3429,8 @@ async fn dispute_unlock(
             .await;
             Redirect::to(&format!("/disputes/{id}")).into_response()
         }
-        Err(e) => Redirect::to(&format!(
-            "/disputes/{id}?msg=Unlock refused: {e:?}. Disclosures stay locked."
+        Err(_) => Redirect::to(&format!(
+            "/disputes/{id}?msg=unlock_refused"
         ))
         .into_response(),
     }
@@ -3304,15 +3458,11 @@ async fn disclosure_submit(
     };
     match crate::disputes::submit_disclosure_unwrapped(&st.pool, &st.keyfile, id, sess.account_id, &f.unwrapped).await {
         Ok(status) => {
-            let note = if status == "verified" {
-                "Disclosure recorded: signature verified against the other party's pinned key."
-            } else {
-                "Disclosure recorded as an unverified claim (no signature from the other party's pinned key verified)."
-            };
-            Redirect::to(&format!("/disputes/{id}?msg={note}")).into_response()
+            let code = if status == "verified" { "signature verified" } else { "unverified claim" };
+            Redirect::to(&format!("/disputes/{id}?msg={code}")).into_response()
         }
-        Err(crate::disputes::DisputeError::BadInput) => Redirect::to(&format!("/disputes/{id}?msg=That paste held no readable message: decrypt the message with gpg --unwrap --armor and paste the whole output.")).into_response(),
-        Err(e) => Redirect::to(&format!("/disputes/{id}?msg=Disclosure not accepted: {e:?}")).into_response(),
+        Err(crate::disputes::DisputeError::BadInput) => Redirect::to(&format!("/disputes/{id}?msg=no readable message")).into_response(),
+        Err(_) => Redirect::to(&format!("/disputes/{id}?msg=disclosure_rejected")).into_response(),
     }
 }
 
@@ -3333,12 +3483,13 @@ async fn dispute_resolve(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if let Err(e) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
-        return Redirect::to(&format!("/disputes/{id}?msg=Moderator action refused: {e:?}. Enroll in TOTP on your security page first.")).into_response();
+    if let Err(_) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
+        return Redirect::to(&format!("/moderation/{id}?msg=mod_action_refused")).into_response();
     }
     match crate::disputes::resolve(&st.pool, &st.keyfile, &st.stage9, id, sess.account_id, &f.outcome).await {
-        Ok(()) => Redirect::to(&format!("/disputes/{id}?msg={}", "Outcome recorded.")).into_response(),
-        Err(e) => Redirect::to(&format!("/disputes/{id}?msg=Resolve failed: {e:?}")).into_response(),
+        Ok(()) => Redirect::to(&format!("/disputes/{id}?msg=outcome_recorded")).into_response(),
+        Err(crate::disputes::DisputeError::Forbidden) => Redirect::to(&format!("/disputes/{id}?msg=resolve_self_dealing")).into_response(),
+        Err(_) => Redirect::to(&format!("/disputes/{id}?msg=resolve_failed")).into_response(),
     }
 }
 
@@ -3353,8 +3504,8 @@ async fn dispute_confirm_refund(
         Err(r) => return r,
     };
     match crate::disputes::confirm_refund(&st.pool, &st.keyfile, &st.stage9, id, sess.account_id).await {
-        Ok(()) => Redirect::to(&format!("/disputes/{id}?msg={}", "Refund confirmed; the dispute is resolved.")).into_response(),
-        Err(e) => Redirect::to(&format!("/disputes/{id}?msg=Confirmation failed: {e:?}")).into_response(),
+        Ok(()) => Redirect::to(&format!("/disputes/{id}?msg=refund_confirmed")).into_response(),
+        Err(_) => Redirect::to(&format!("/disputes/{id}?msg=confirmation_failed")).into_response(),
     }
 }
 
@@ -3419,6 +3570,9 @@ struct ListingHitView {
     title: String,
     status: String,
     seller_name: String,
+    /// CH1: a moderator takedown is in force (the restore form keys
+    /// off this, not the raw status).
+    taken_down: bool,
 }
 
 #[derive(Template)]
@@ -3468,6 +3622,7 @@ async fn moderation_queue(
                 title: l.title.clone(),
                 status: l.status.clone(),
                 seller_name: db::username_of_id(&st.pool, l.seller_id).await,
+                taken_down: l.taken_down,
             });
         }
     }
@@ -3480,7 +3635,7 @@ async fn moderation_queue(
         query: q,
         listing_query,
         listing_hit,
-        message: p.get("msg").cloned(),
+        message: alert_text(p.get("msg").map(String::as_str), None),
         totp_enrolled: crate::moderation::totp_enrolled(&st.pool, sess.account_id).await.unwrap_or(false),
     };
     page(&st, &headers, "Moderation queue", tpl.render().unwrap()).await
@@ -3503,12 +3658,12 @@ async fn report_decide(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if let Err(e) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
-        return Redirect::to(&format!("/moderation?msg=Action refused: {e:?}")).into_response();
+    if let Err(_) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
+        return Redirect::to("/moderation?msg=mod_refused").into_response();
     }
     match crate::moderation::report_action(&st.pool, id, sess.account_id, &f.action).await {
-        Ok(()) => Redirect::to("/moderation?msg=Report updated.").into_response(),
-        Err(e) => Redirect::to(&format!("/moderation?msg=Report action failed: {e:?}")).into_response(),
+        Ok(()) => Redirect::to("/moderation?msg=report_updated").into_response(),
+        Err(_) => Redirect::to("/moderation?msg=report_failed").into_response(),
     }
 }
 
@@ -3570,7 +3725,7 @@ async fn flag_page(
         totp_enrolled: crate::moderation::totp_enrolled(&st.pool, sess.account_id)
             .await
             .unwrap_or(false),
-        message: p.get("msg").cloned(),
+        message: alert_text(p.get("msg").map(String::as_str), None),
     };
     page(&st, &headers, "Payment review flag", tpl.render().unwrap()).await
 }
@@ -3585,12 +3740,13 @@ async fn flag_decide(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if let Err(e) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
-        return Redirect::to(&format!("/moderation?msg=Action refused: {e:?}")).into_response();
+    if let Err(_) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
+        return Redirect::to("/moderation?msg=mod_refused").into_response();
     }
     match crate::moderation::payment_flag_action(&st.pool, id, sess.account_id, &f.action).await {
-        Ok(()) => Redirect::to("/moderation?msg=Flag updated.").into_response(),
-        Err(e) => Redirect::to(&format!("/moderation?msg=Flag action failed: {e:?}")).into_response(),
+        Ok(()) => Redirect::to("/moderation?msg=flag_updated").into_response(),
+        Err(crate::moderation::ModError::Forbidden) => Redirect::to("/moderation?msg=flag_self_dealing").into_response(),
+        Err(_) => Redirect::to("/moderation?msg=flag_failed").into_response(),
     }
 }
 
@@ -3611,15 +3767,16 @@ async fn account_warn(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if let Err(e) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
-        return Redirect::to(&format!("/moderation?msg=Action refused: {e:?}")).into_response();
+    if let Err(_) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
+        return Redirect::to("/moderation?msg=mod_refused").into_response();
     }
     let Some((target_id, ..)) = db::account_by_public_id(&st.pool, &id).await.ok().flatten() else {
         return (StatusCode::NOT_FOUND, "No such account").into_response();
     };
     match crate::moderation::warn_account(&st.pool, target_id, sess.account_id, &f.reason).await {
-        Ok(()) => Redirect::to("/moderation?msg=Warning recorded.").into_response(),
-        Err(e) => Redirect::to(&format!("/moderation?msg=Warn failed: {e:?}")).into_response(),
+        Ok(()) => Redirect::to("/moderation?msg=warning_recorded").into_response(),
+        Err(crate::moderation::ModError::Forbidden) => Redirect::to("/moderation?msg=warn_protected").into_response(),
+        Err(_) => Redirect::to("/moderation?msg=warn_failed").into_response(),
     }
 }
 
@@ -3639,15 +3796,16 @@ async fn account_close_mod(
         Ok(v) => v,
         Err(r) => return r,
     };
-    if let Err(e) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
-        return Redirect::to(&format!("/moderation?msg=Action refused: {e:?}")).into_response();
+    if let Err(_) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
+        return Redirect::to("/moderation?msg=mod_refused").into_response();
     }
     let Some((target_id, ..)) = db::account_by_public_id(&st.pool, &id).await.ok().flatten() else {
         return (StatusCode::NOT_FOUND, "No such account").into_response();
     };
     match crate::moderation::close_account(&st.pool, target_id, sess.account_id, "moderator closure").await {
-        Ok(()) => Redirect::to("/moderation?msg=Account closed. Its listings are unpublished and its history remains for counterparties.").into_response(),
-        Err(e) => Redirect::to(&format!("/moderation?msg=Closure failed: {e:?}")).into_response(),
+        Ok(()) => Redirect::to("/moderation?msg=account_closed").into_response(),
+        Err(crate::moderation::ModError::Forbidden) => Redirect::to("/moderation?msg=closure_protected").into_response(),
+        Err(_) => Redirect::to("/moderation?msg=closure_failed").into_response(),
     }
 }
 
@@ -3657,12 +3815,24 @@ async fn listing_remove_restore(st: &AppState, headers: &HeaderMap, id: &str, f:
         Ok(v) => v,
         Err(r) => return r,
     };
-    if let Err(e) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
-        return Redirect::to(&format!("/moderation?msg=Action refused: {e:?}")).into_response();
+    if let Err(_) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
+        return Redirect::to("/moderation?msg=mod_refused").into_response();
     }
     match crate::moderation::set_listing_removed(&st.pool, id, sess.account_id, remove).await {
-        Ok(()) => Redirect::to("/moderation?msg=Listing updated.").into_response(),
-        Err(e) => Redirect::to(&format!("/moderation?msg=Listing action failed: {e:?}")).into_response(),
+        Ok(()) => {
+            // CM1, on-disk half: a takedown moves the listing's
+            // images out of the served folder into quarantine; a
+            // restore moves them back. (media_serve's database
+            // check is the access boundary; this keeps the served
+            // folder itself free of taken-down content.)
+            if let Some(l) = lst::listing_by_public_id(&st.pool, id).await.ok().flatten() {
+                for (mref, _, _) in lst::media_of(&st.pool, l.id).await.unwrap_or_default() {
+                    st.media.set_quarantined(&mref, remove).await;
+                }
+            }
+            Redirect::to("/moderation?msg=listing_updated").into_response()
+        }
+        Err(_) => Redirect::to("/moderation?msg=listing_failed").into_response(),
     }
 }
 
@@ -3796,6 +3966,15 @@ async fn account_close_self(
             &headers,
             "Account closed",
             "This account is closed: it can no longer log in, its listings are unpublished, and its reputation history stays visible to past counterparties. Closing an account ends this identity — it does not erase order history, and it cannot be undone from here.",
+        )
+        .await,
+        // CM4: an admin account cannot be closed through the web
+        // path at all (operator console only) — say so plainly.
+        Err(crate::moderation::ModError::Forbidden) => notice_page(
+            &st,
+            &headers,
+            "Closure refused",
+            "Administrator accounts cannot be closed from the web interface. An admin account can only be closed from the operator console.",
         )
         .await,
         Err(e) => notice_page(&st, &headers, "Closure failed", &format!("The account could not be closed ({e:?}).")).await,

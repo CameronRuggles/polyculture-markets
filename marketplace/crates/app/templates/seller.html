@@ -38,12 +38,16 @@ Your seller ID: <code>{{ payment_seller_id }}</code></p>
 {% for l in listings %}
 <article><h3>{{ l.title }} — {{ l.status }}</h3>
 <p>{{ l.price_xmr }} XMR · <a href="/listings/{{ l.public_id }}">view</a></p>
+{% if l.taken_down %}
+<p role="alert">This listing was <strong>removed by a moderator</strong>. You cannot change its status or republish it; only a moderator can restore it.</p>
+{% else %}
 <form method="post" action="/seller/listings/{{ l.public_id }}/status">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Status <select name="status">
 <option value="draft">draft</option><option value="published">published</option>
-<option value="paused">paused</option><option value="removed">removed</option></select></label>
+<option value="paused">paused</option><option value="withdrawn">withdrawn</option></select></label>
 <button type="submit">Update</button></form>
+{% endif %}
 <form method="post" action="/seller/listings/{{ l.public_id }}/media" enctype="multipart/form-data">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Image (JPEG/PNG, max 5 MiB) <input type="file" name="image" accept="image/png,image/jpeg"></label>
