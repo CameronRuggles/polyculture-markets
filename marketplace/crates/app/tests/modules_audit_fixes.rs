@@ -338,6 +338,222 @@ async fn taken_username_registration_refused_without_hashing() {
 }
 
 // ---------------------------------------------------------------------------
+// Task 3 (BL1): publishing requires a payment identity and an
+// unused pool address; every authorization rule names a served
+// route (modulo the dead rules the locked blind_stage1 suite
+// pins — see the report).
+// ---------------------------------------------------------------------------
+
+fn location_of(r: &HttpResult) -> String {
+    for line in r.headers.lines() {
+        if line.to_lowercase().starts_with("location:") {
+            return line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// The session CSRF secret, as embedded in the seller page's forms.
+async fn session_csrf(addr: std::net::SocketAddr, session_cookie: &str) -> String {
+    let r = http_raw(addr, "GET", "/seller", Some(session_cookie), None, None).await;
+    assert_eq!(r.status, 200, "seller page loads for a seller");
+    let marker = "name=\"csrf\" value=\"";
+    let start = r.body.find(marker).expect("seller page carries csrf fields") + marker.len();
+    r.body[start..].split('"').next().unwrap().to_string()
+}
+
+async fn listing_status_of(pool: &PgPool, public_id: &str) -> String {
+    sqlx::query_scalar::<_, String>("SELECT status FROM listings WHERE public_id = $1")
+        .bind(public_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn publish_requires_payment_identity_and_unused_pool() {
+    let Some(pool) = pool().await else { return };
+    let srv = test_server(&pool).await;
+    let (seller, _name) = make_account(&pool, "seller", PW).await;
+    let r = login_attempt(srv.addr, &_name, PW).await;
+    let session = set_cookie_value(&r, "session").expect("seller login succeeds");
+    let cookie = format!("session={session}");
+    let pub_id = app::listings::create_listing(
+        &pool,
+        seller,
+        "BL1 widget",
+        "a widget",
+        1_250_000_000_000,
+        "general",
+        "signed-address-pool",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(listing_status_of(&pool, &pub_id).await, "draft");
+
+    // No payment identity, no pool: publishing is refused and the
+    // listing stays a draft.
+    let csrf = session_csrf(srv.addr, &cookie).await;
+    let r = post_form(
+        srv.addr,
+        &format!("/seller/listings/{pub_id}/status"),
+        Some(&cookie),
+        &[("csrf", &csrf), ("status", "published")],
+    )
+    .await;
+    assert!(
+        location_of(&r).contains("pmsg=payment_setup_required"),
+        "publish without payment setup is refused, got location {:?}",
+        location_of(&r)
+    );
+    assert_eq!(listing_status_of(&pool, &pub_id).await, "draft");
+
+    // Identity alone is not enough — an unused pool address is
+    // also required.
+    sqlx::query(
+        "INSERT INTO payment_identities (seller_id, primary_address, network)
+         VALUES ($1, $2, 'stagenet')",
+    )
+    .bind(seller)
+    .bind(PRIMARY)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let csrf = session_csrf(srv.addr, &cookie).await;
+    let r = post_form(
+        srv.addr,
+        &format!("/seller/listings/{pub_id}/status"),
+        Some(&cookie),
+        &[("csrf", &csrf), ("status", "published")],
+    )
+    .await;
+    assert!(
+        location_of(&r).contains("pmsg=payment_setup_required"),
+        "publish with identity but no unused pool address is refused"
+    );
+    assert_eq!(listing_status_of(&pool, &pub_id).await, "draft");
+
+    // Identity + one unused pool entry: publishing succeeds.
+    let (batch_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO payment_batches (seller_id, marketplace_id, network, entry_count)
+         VALUES ($1, 'vespiary-market', 'stagenet', 1) RETURNING id",
+    )
+    .bind(seller)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (dest_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO destinations (address, seller_id, source)
+         VALUES ($1, $2, 'pool') RETURNING id",
+    )
+    .bind(SUBADDR)
+    .bind(seller)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO payment_pool_entries (batch_id, seller_id, destination_id, address, message, signature)
+         VALUES ($1, $2, $3, $4, 'msg', 'sig')",
+    )
+    .bind(batch_id)
+    .bind(seller)
+    .bind(dest_id)
+    .bind(SUBADDR)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let csrf = session_csrf(srv.addr, &cookie).await;
+    let r = post_form(
+        srv.addr,
+        &format!("/seller/listings/{pub_id}/status"),
+        Some(&cookie),
+        &[("csrf", &csrf), ("status", "published")],
+    )
+    .await;
+    assert_eq!(location_of(&r), "/seller", "publish succeeds once the seller can be paid");
+    assert_eq!(listing_status_of(&pool, &pub_id).await, "published");
+    srv.stop();
+}
+
+/// The dead rules the LOCKED blind_stage1 suite pins: its expected
+/// authorize() table names each of these, so authorize() must keep
+/// answering Allow for them even though the router serves no such
+/// route. They cannot be removed without amending that locked
+/// suite (not authorized — see the batch report). This test pins
+/// the set: a NEW dead rule fails here, and if a pinned rule ever
+/// gains a route (or the locked suite is amended), the entry must
+/// be deliberately removed.
+const PINNED_DEAD_RULES: &[(&str, &str)] = &[
+    ("GET", "/invoices/{id}"),
+    ("GET", "/invoices/{id}/qr.png"),
+    ("GET", "/invoices/{id}/statement.txt"),
+    ("GET", "/invoices/{id}/statement.txt.asc"),
+    ("POST", "/invoices/{id}/signature"),
+    ("POST", "/invoices/{id}/evidence/{module}"),
+    ("GET", "/pools/{id}/statement.txt"),
+    ("GET", "/pools/{id}/statement.txt.asc"),
+    ("GET", "/seller/pools"),
+    ("POST", "/seller/pools"),
+    ("POST", "/seller/pools/{id}/signature"),
+    ("GET", "/messages/{id}/download"),
+    ("GET", "/security"),
+];
+
+#[tokio::test]
+async fn every_authz_rule_names_a_served_route() {
+    let Some(pool) = pool().await else { return };
+    let srv = test_server(&pool).await;
+    let mut checked = 0usize;
+    let mut seen_dead: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    for rule in app::authz::ROUTES {
+        if !seen.insert((rule.method, rule.path)) {
+            continue;
+        }
+        checked += 1;
+        let path = rule
+            .path
+            .replace("{id}", "x")
+            .replace("{module}", "x")
+            .replace("{ref}", "x");
+        // Anonymous probe: a served route answers with a page, a
+        // redirect, a refusal, or a handler 404 WITH a body; a
+        // route the router does not serve answers axum's bare 404
+        // with an empty body.
+        let r = http_raw(
+            srv.addr,
+            rule.method,
+            &path,
+            None,
+            Some("application/x-www-form-urlencoded"),
+            if rule.method == "POST" { Some(b"") } else { None },
+        )
+        .await;
+        let unserved = r.status == 404 && r.body.trim().is_empty();
+        if unserved {
+            seen_dead.push((rule.method.to_string(), rule.path.to_string()));
+        }
+    }
+    let mut expected_dead: Vec<(String, String)> = PINNED_DEAD_RULES
+        .iter()
+        .map(|(m, p)| (m.to_string(), p.to_string()))
+        .collect();
+    seen_dead.sort();
+    expected_dead.sort();
+    assert_eq!(
+        seen_dead, expected_dead,
+        "the set of authorization rules naming unserved routes changed \
+         ({checked} rules probed): only the blind_stage1-pinned dead \
+         rules may be unserved"
+    );
+    srv.stop();
+}
+
+const PRIMARY: &str = "55b6gZhKJ2b6EzvernZJBcPXiZym13w1CfbpDU6sR8aSGpaRbAmU4EMSH3XYXu5U1cSac7B49WRSSBbwQK9by3c7H9AdnFB";
+const SUBADDR: &str = "85ecAyh9QuvfaDyaPRTVnwgc2QxjTByx2GM2haFsn8wrEu2vSVn7QctGiKQdpP5vNPeB2Fzbg8Sb78mqA22Qc2GaHdYhWsY";
+
+// ---------------------------------------------------------------------------
 // Task 2 (BM2): a busy hashing pool must not burn a recovery code.
 // ---------------------------------------------------------------------------
 

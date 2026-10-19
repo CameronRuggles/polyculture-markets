@@ -608,6 +608,7 @@ fn alert_text(code: Option<&str>, n: Option<&str>) -> Option<String> {
         }
         "batch_rejected" => "Batch rejected (nothing was stored).".to_string(),
         "listing_taken_down" => "This listing was removed by a moderator. You cannot change its status until a moderator restores it.".to_string(),
+        "payment_setup_required" => "Publishing requires a payment identity and at least one unused pool address: set your primary address and upload a signed address batch first.".to_string(),
         // Order page (msg).
         "proof_recorded" => "Payment proof recorded. It is carried unverified: the seller and moderators check it in their own wallets.".to_string(),
         "proof_rejected" => "Proof not accepted.".to_string(),
@@ -1702,7 +1703,11 @@ struct ListingForm {
     description: String,
     price: String,
     category: String,
-    destination_module: String,
+    /// BL1: the create form no longer offers a destination-module
+    /// choice (Direct Payments has exactly one live module); the
+    /// field stays accepted for older form copies and defaults to
+    /// the pool module.
+    destination_module: Option<String>,
     auto_invoice: Option<String>,
     csrf: String,
 }
@@ -1722,16 +1727,19 @@ async fn create_listing(State(st): State<AppState>, headers: HeaderMap, Form(f):
         return (StatusCode::FORBIDDEN, "Sellers only").into_response();
     }
     let auto = f.auto_invoice.as_deref() == Some("true");
+    // BL1: no form choice remains — Direct Payments' only live
+    // destination module is the signed address pool.
+    let destination_module = f.destination_module.as_deref().unwrap_or("signed-address-pool");
     // Contract §8: validate_listing takes the price in atomic units; the
     // decimal form field is parsed here (unparseable ⇒ Price error).
     let validated = match domain::Atomic::parse_decimal(f.price.trim()) {
-        Some(p) => lst::validate_listing(&f.title, &f.description, p.0, &f.category, &f.destination_module, auto)
+        Some(p) => lst::validate_listing(&f.title, &f.description, p.0, &f.category, destination_module, auto)
             .map(|()| p.0 as i64),
         None => Err(lst::ListingError::Price),
     };
     match validated {
         Ok(price_atomic) => {
-            match lst::create_listing(&st.pool, sess.account_id, &f.title, &f.description, price_atomic, &f.category, &f.destination_module, auto).await {
+            match lst::create_listing(&st.pool, sess.account_id, &f.title, &f.description, price_atomic, &f.category, destination_module, auto).await {
                 Ok(_) => Redirect::to("/seller").into_response(),
                 Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
             }
@@ -1769,6 +1777,28 @@ async fn listing_status(
     // explicit branch gives the honest message).
     if l.taken_down && l.seller_id == sess.account_id {
         return Redirect::to("/seller?pmsg=listing_taken_down").into_response();
+    }
+    // Modules Audit BL1 (2026-10-19): a listing may be PUBLISHED
+    // only by a seller who can actually be paid — a payment
+    // identity AND at least one unused pool address. Before this,
+    // a seller with neither could publish, and every order on such
+    // a listing sat in Requested forever: accepting needs an
+    // assigned address, and there was nothing to assign. The guard
+    // lives at this (only) user-facing publish path; the library
+    // set_status primitive is unchanged.
+    if f.status == "published" && l.seller_id == sess.account_id {
+        let can_be_paid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM payment_identities WHERE seller_id = $1)
+                AND EXISTS(SELECT 1 FROM payment_pool_entries
+                            WHERE seller_id = $1 AND state = 'unused')",
+        )
+        .bind(sess.account_id)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap_or(false);
+        if !can_be_paid {
+            return Redirect::to("/seller?pmsg=payment_setup_required").into_response();
+        }
     }
     match lst::set_status(&st.pool, l.id, sess.account_id, &f.status).await {
         Ok(true) => Redirect::to("/seller").into_response(),

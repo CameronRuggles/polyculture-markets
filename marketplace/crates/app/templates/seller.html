@@ -64,10 +64,6 @@ Your seller ID: <code>{{ payment_seller_id }}</code></p>
 <label>Price (XMR) <input name="price" required></label>
 <label>Category <select name="category">
 {% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select></label>
-<label>Destination module <select name="destination_module">
-<option value="signed-address-pool">signed-address-pool</option>
-<option value="signed-invoice">signed-invoice</option></select></label>
-<label><input type="checkbox" name="auto_invoice" value="true"> Issue invoices automatically (pool module only)</label>
 <button type="submit">Create draft</button></form>
 {% else %}
 <h2>Become a seller</h2>
