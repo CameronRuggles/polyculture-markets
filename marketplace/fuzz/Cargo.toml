@@ -72,6 +72,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "batch_parse"
+path = "src/bin/batch_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unwrap_extract"
+path = "src/bin/unwrap_extract.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent workspace.
 [workspace]
 members = ["."]
