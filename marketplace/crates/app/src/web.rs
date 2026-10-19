@@ -631,7 +631,10 @@ fn alert_text(code: Option<&str>, n: Option<&str>) -> Option<String> {
         "unverified claim" => "Disclosure recorded as an unverified claim (no signature from the other party's pinned key verified).".to_string(),
         "no readable message" => "That paste held no readable message: decrypt the message with gpg --unwrap --armor and paste the whole output.".to_string(),
         "disclosure_rejected" => "Disclosure not accepted.".to_string(),
-        "mod_action_refused" => "Moderator action refused. Enroll in TOTP on your security page first.".to_string(),
+        // N1: worded for the actual refusal reasons — a code that was
+        // wrong, already used, or locked out after too many failures
+        // (the old text said "enroll first" even for a simple typo).
+        "mod_action_refused" => "Moderator action refused: the TOTP code was not accepted — it may be wrong, already used, or code entry may be locked out after too many failed attempts. Wait a few minutes and try again with a fresh code; if you have not enrolled in TOTP yet, enroll on your security page first.".to_string(),
         "outcome_recorded" => "Outcome recorded.".to_string(),
         "resolve_failed" => "Resolve failed.".to_string(),
         "resolve_self_dealing" => "Resolve refused: you are a party to this order, so another moderator must decide it.".to_string(),
@@ -3742,7 +3745,10 @@ async fn dispute_resolve(
         Err(r) => return r,
     };
     if let Err(_) = crate::moderation::require_totp(&st.pool, &st.keyfile, sess.account_id, &f.totp).await {
-        return Redirect::to(&format!("/moderation/{id}?msg=mod_action_refused")).into_response();
+        // N1: back to the dispute page — /moderation/{id} is not a
+        // route, so the old target landed the moderator on a bare
+        // 404 instead of the refusal.
+        return Redirect::to(&format!("/disputes/{id}?msg=mod_action_refused")).into_response();
     }
     match crate::disputes::resolve(&st.pool, &st.keyfile, &st.stage9, id, sess.account_id, &f.outcome).await {
         Ok(()) => Redirect::to(&format!("/disputes/{id}?msg=outcome_recorded")).into_response(),
