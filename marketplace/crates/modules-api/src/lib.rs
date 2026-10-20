@@ -175,6 +175,29 @@ pub fn validate_standard_address(
     Ok(parsed.to_string())
 }
 
+/// Validate an address a refund may be sent to (Alpha spec §5,
+/// `marketplace-settle-v1` / `marketplace-refund-to-v1`): same pinned
+/// check order as [`Subaddress::validate`] — decode/checksum →
+/// network → kind → key sanity — but the accepted kinds are Standard
+/// and Subaddress. Integrated addresses are refused: a baked-in
+/// payment ID would silently change what a transaction proof proves.
+/// Returns the canonical re-encoding of the validated address. Never
+/// trims its input.
+pub fn validate_any_address(input: &str, expected: Network) -> Result<String, DestinationError> {
+    let parsed = monero::Address::from_str(input).map_err(|_| DestinationError::Parse)?;
+    let network = Network::from(parsed.network);
+    if network != expected {
+        return Err(DestinationError::WrongNetwork);
+    }
+    if matches!(parsed.addr_type, monero::AddressType::Integrated(_)) {
+        return Err(DestinationError::WrongKind {
+            found: AddressKind::Integrated,
+        });
+    }
+    check_keys(&parsed)?;
+    Ok(parsed.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Public IDs (Q15): prefix + 32 lowercase hex (128 bits, matching §16).
 

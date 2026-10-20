@@ -6,6 +6,7 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 modules-api = { path = "../modules-api" }
+sha2 = "0.10"
 time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }

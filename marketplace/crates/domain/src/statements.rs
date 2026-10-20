@@ -84,19 +84,19 @@ impl PoolStatement {
 // Parsing helpers
 
 /// §4 byte gate: printable ASCII (0x20–0x7E) or LF only.
-fn byte_gate(text: &str) -> bool {
+pub(crate) fn byte_gate(text: &str) -> bool {
     text.bytes().all(|b| b == b'\n' || (0x20..=0x7e).contains(&b))
 }
 
 /// Fingerprints are uppercase hex, 40 or 64 chars (§4).
-fn valid_fingerprint(s: &str) -> bool {
+pub(crate) fn valid_fingerprint(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64)
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
 }
 
 /// Digests are exactly 64 lowercase hex chars (§4).
-fn valid_terms_sha256(s: &str) -> bool {
+pub(crate) fn valid_terms_sha256(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -105,7 +105,7 @@ fn valid_terms_sha256(s: &str) -> bool {
 /// Pull the next line from a `'\n'` split, requiring exactly `key: value`
 /// (single space after the colon) with the expected key, in fixed order.
 /// Any other shape — blank line, wrong key, missing space — is `None`.
-fn next_field<'a, I>(lines: &mut I, want: &str) -> Option<&'a str>
+pub(crate) fn next_field<'a, I>(lines: &mut I, want: &str) -> Option<&'a str>
 where
     I: Iterator<Item = &'a str>,
 {
@@ -120,7 +120,7 @@ where
 
 /// After the last field, the split must hold exactly the empty tail of
 /// the single final LF and nothing else.
-fn expect_end<'a, I>(lines: &mut I) -> Option<()>
+pub(crate) fn expect_end<'a, I>(lines: &mut I) -> Option<()>
 where
     I: Iterator<Item = &'a str>,
 {
