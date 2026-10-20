@@ -1,4 +1,8 @@
-//! seller-helper CLI: `init`, `generate --count N`, `check <address>`.
+//! The v1 seller commands (`init`, `generate --count N`,
+//! `check <address>`), preserved under the helper's seller mode
+//! (Alpha spec §14: "Existing seller init/generate/check behaviour
+//! preserved under seller mode"). Dispatched from main.rs as
+//! `helper seller init|generate|check`.
 //!
 //! The tool talks only to the seller's local monero-wallet-rpc on
 //! 127.0.0.1 (see the `rpc` module's allowlist) and writes a batch
@@ -11,17 +15,16 @@ use seller_helper::{run_generate, Error};
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::ExitCode;
 
-const USAGE: &str = "\
-seller-helper — Direct Monero Payments v1 seller tool
+pub(crate) const USAGE: &str = "\
+helper seller — Direct Monero Payments v1 seller commands
 
 USAGE:
-  seller-helper init [--marketplace-id ID] [--network mainnet|stagenet]
+  helper seller init [--marketplace-id ID] [--network mainnet|stagenet]
                      [--seller-id ID] [--rpc-url URL]
                      [--rpc-user USER] [--config PATH]
-  seller-helper generate --count N [--out FILE] [--config PATH]
-  seller-helper check <address> [--config PATH]
+  helper seller generate --count N [--out FILE] [--config PATH]
+  helper seller check <address> [--config PATH]
 
 init prompts for the wallet RPC password interactively. It is never
 accepted as a command-line flag: command lines leak through shell
@@ -32,12 +35,12 @@ the marketplace values copied from your seller dashboard plus the login
 for YOUR local monero-wallet-rpc. It never holds seeds or wallet keys.
 ";
 
-struct Args {
-    flags: HashMap<String, String>,
-    positional: Vec<String>,
+pub(crate) struct Args {
+    pub(crate) flags: HashMap<String, String>,
+    pub(crate) positional: Vec<String>,
 }
 
-fn parse_args(rest: &[String]) -> Result<Args, String> {
+pub(crate) fn parse_args(rest: &[String]) -> Result<Args, String> {
     let mut flags = HashMap::new();
     let mut positional = Vec::new();
     let mut i = 0;
@@ -134,7 +137,7 @@ impl Drop for EchoOff {
 }
 
 /// Prompt for a secret: like `prompt`, but with terminal echo off.
-fn prompt_password(label: &str) -> Result<String, String> {
+pub(crate) fn prompt_password(label: &str) -> Result<String, String> {
     print!("{label}: ");
     std::io::stdout()
         .flush()
@@ -159,7 +162,7 @@ fn rpc_password_value(args: &Args, interactive: bool) -> Result<String, String> 
     if args.flags.contains_key("rpc-password") {
         return Err(
             "--rpc-password is not accepted: a password on the command line leaks \
-             through shell history and process listings. Run `seller-helper init` \
+             through shell history and process listings. Run `helper seller init` \
              in a terminal and it will prompt for the password instead."
                 .to_string(),
         );
@@ -177,7 +180,7 @@ fn rpc_password_value(args: &Args, interactive: bool) -> Result<String, String> 
     )
 }
 
-fn cmd_init(args: &Args) -> Result<(), String> {
+pub(crate) fn cmd_init(args: &Args) -> Result<(), String> {
     let interactive = std::io::stdin().is_terminal();
     let cfg = Config {
         marketplace_id: value_or_prompt(args, "marketplace-id", "Marketplace ID (from your seller dashboard)", interactive)?,
@@ -202,7 +205,7 @@ fn cmd_init(args: &Args) -> Result<(), String> {
     println!("  sees it.");
     println!();
     println!("Next: start monero-wallet-rpc on 127.0.0.1 with --rpc-login, open");
-    println!("your wallet in it, then run: seller-helper generate --count 20");
+    println!("your wallet in it, then run: helper seller generate --count 20");
     Ok(())
 }
 
@@ -213,7 +216,7 @@ fn load_and_client(args: &Args) -> Result<(Config, PathBuf, RpcClient), String> 
     Ok((cfg, path, client))
 }
 
-fn cmd_generate(args: &Args) -> Result<(), String> {
+pub(crate) fn cmd_generate(args: &Args) -> Result<(), String> {
     let count_raw = args
         .flags
         .get("count")
@@ -273,7 +276,7 @@ fn cmd_generate(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_check(args: &Args) -> Result<i32, String> {
+pub(crate) fn cmd_check(args: &Args) -> Result<i32, String> {
     let address = args
         .positional
         .first()
@@ -299,51 +302,3 @@ fn cmd_check(args: &Args) -> Result<i32, String> {
     }
 }
 
-fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (cmd, rest) = match argv.split_first() {
-        Some((c, r)) => (c.as_str(), r),
-        None => {
-            eprint!("{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
-    if cmd == "--help" || cmd == "-h" || cmd == "help" {
-        print!("{USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    let args = match parse_args(rest) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: {e}\n\n{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
-    match cmd {
-        "init" => match cmd_init(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(1)
-            }
-        },
-        "generate" => match cmd_generate(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(1)
-            }
-        },
-        "check" => match cmd_check(&args) {
-            Ok(code) => ExitCode::from(code as u8),
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(1)
-            }
-        },
-        other => {
-            eprintln!("error: unknown command {other:?}\n\n{USAGE}");
-            ExitCode::from(2)
-        }
-    }
-}

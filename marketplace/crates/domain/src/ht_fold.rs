@@ -6,8 +6,13 @@
 //! disclosed statements through the same code.
 //!
 //! Rules (§6):
-//! - The assignment opens the trade. Statements by the wrong party
-//!   (fingerprint does not match the assignment) are ignored.
+//! - The assignment opens the trade. The fold runs over the
+//!   statements a party HOLDS for the trade (their evidence store);
+//!   statements enter a store only after their signatures check
+//!   against the pinned keys, so the fold itself does not re-check
+//!   signers — with one structural exception: a receipt names both
+//!   parties, and only a receipt naming the assignment's own buyer
+//!   and seller closes the trade.
 //! - Payment is shown by the buyer's payment record OR the seller's
 //!   ack — either is enough (§6 rule 1).
 //! - The issue path runs from Shipped, inside the 30-day issue
@@ -109,17 +114,14 @@ pub fn fold_trade(events: &[TradeEvent], now: &str) -> Option<FoldedTrade> {
                     last_milestone = Some(TradeState::Paid);
                 }
             }
-            TradeEvent::Ack(ack) => {
-                if ack.seller_key_fingerprint == assignment.seller_key_fingerprint && !paid {
+            TradeEvent::Ack(_ack) => {
+                if !paid {
                     paid = true;
                     last_milestone = Some(TradeState::Paid);
                 }
             }
             TradeEvent::Shipped(s) => {
-                if s.seller_key_fingerprint == assignment.seller_key_fingerprint
-                    && s.direction == ShippedDirection::Out
-                    && !shipped
-                {
+                if s.direction == ShippedDirection::Out && !shipped {
                     shipped = true;
                     shipped_date = Some(s.date.clone());
                     last_milestone = Some(TradeState::Shipped);
@@ -131,7 +133,7 @@ pub fn fold_trade(events: &[TradeEvent], now: &str) -> Option<FoldedTrade> {
                 // shipment, or after the window does not move the
                 // fold (it remains the signer's statement, and a
                 // dispute filed on it is the court's business, §9).
-                if issue.buyer_key_fingerprint == assignment.buyer_key_fingerprint && shipped {
+                if shipped {
                     if let Some(end) =
                         shipped_date.as_deref().and_then(|d| date_add_days(d, 30))
                     {
@@ -142,14 +144,14 @@ pub fn fold_trade(events: &[TradeEvent], now: &str) -> Option<FoldedTrade> {
                 }
             }
             TradeEvent::Settle(settle) => {
-                if settle.seller_key_fingerprint == assignment.seller_key_fingerprint
-                    && check_settle(assignment, settle)
-                {
+                if check_settle(assignment, settle) {
                     terminal = Some((TradeState::Settled, Some(settle.refund_atomic)));
                 }
             }
             TradeEvent::Receipt(receipt) => {
-                if receipt.buyer_key_fingerprint == assignment.buyer_key_fingerprint {
+                if receipt.buyer_key_fingerprint == assignment.buyer_key_fingerprint
+                    && receipt.seller_key_fingerprint == assignment.seller_key_fingerprint
+                {
                     terminal = Some((TradeState::Closed, None));
                 }
             }

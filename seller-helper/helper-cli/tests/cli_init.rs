@@ -1,5 +1,7 @@
-//! CLI-level tests for `seller-helper init` (audit fix-brief task 9,
-//! finding L4). The wallet RPC password must never be accepted as a
+//! CLI-level tests for `helper seller init` (audit fix-brief task 9,
+//! finding L4; the command moved under seller mode in the Alpha
+//! helper restructure, spec §14 — the behaviour asserted here is
+//! unchanged). The wallet RPC password must never be accepted as a
 //! command-line flag: command lines leak through shell history and
 //! process listings. `init` prompts for it instead.
 
@@ -7,7 +9,7 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn init_refuses_rpc_password_flag() {
-    let bin = env!("CARGO_BIN_EXE_seller-helper");
+    let bin = env!("CARGO_BIN_EXE_helper");
     let dir = std::env::temp_dir().join(format!(
         "seller-helper-cli-test-{}",
         std::process::id()
@@ -17,6 +19,7 @@ fn init_refuses_rpc_password_flag() {
     let cfg = dir.join("config.json");
     let out = Command::new(bin)
         .args([
+            "seller",
             "init",
             "--config",
             cfg.to_str().unwrap(),

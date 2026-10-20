@@ -1,0 +1,17 @@
+[package]
+name = "helper-cli"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "The `helper` command (Alpha spec §14): seller and buyer modes for Hidden Trades, with the v1 seller commands preserved under seller mode."
+
+[[bin]]
+name = "helper"
+path = "src/main.rs"
+
+[dependencies]
+seller-helper = { path = ".." }
+helper-core = { path = "../helper-core" }
+domain = { path = "../../marketplace/crates/domain" }
+modules-api = { path = "../../marketplace/crates/modules-api" }
+rand = "0.8"

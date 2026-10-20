@@ -463,6 +463,7 @@ fn assignment_bytes(
         "payment-timing: {}\n",
         payment_timing.as_str()
     ));
+    out.push_str("settlement: direct\n");
     out.push_str(&format!("expires-at: {expires_at}\n"));
     out.push_str(&format!("nonce: {nonce}\n"));
     out.into_bytes()
@@ -489,6 +490,11 @@ pub fn parse_assignment_fields(text: &str) -> Option<AssignmentFields> {
     }
     let payment_timing =
         PaymentTiming::from_statement(next_field(&mut lines, "payment-timing")?)?;
+    // `settlement` accepts only `direct` today (§19: the reserved
+    // settlement-mode values do not parse).
+    if next_field(&mut lines, "settlement")? != "direct" {
+        return None;
+    }
     let expires_at = next_field(&mut lines, "expires-at")?.to_string();
     if !validate_canonical_timestamp(&expires_at) {
         return None;
@@ -578,15 +584,15 @@ impl OpenToken {
         let mut out = String::new();
         out.push_str("statement-format: marketplace-open-v1\n");
         out.push_str(&format!("marketplace-id: {}\n", self.marketplace_id));
-        out.push_str(&format!("trade-id: {}\n", self.trade_id));
-        out.push_str(&format!(
-            "buyer-key-fingerprint: {}\n",
-            self.buyer_key_fingerprint
-        ));
         out.push_str(&format!(
             "seller-key-fingerprint: {}\n",
             self.seller_key_fingerprint
         ));
+        out.push_str(&format!(
+            "buyer-key-fingerprint: {}\n",
+            self.buyer_key_fingerprint
+        ));
+        out.push_str(&format!("trade-id: {}\n", self.trade_id));
         out.into_bytes()
     }
 }
@@ -598,9 +604,9 @@ pub fn parse_open_token(text: &str, marketplace_id: &str) -> Option<OpenToken> {
     let mut lines = text.split('\n');
     check_format(&mut lines, "marketplace-open-v1")?;
     let marketplace_id = next_marketplace_id(&mut lines, marketplace_id)?;
-    let trade_id = next_trade_id(&mut lines)?;
-    let buyer_key_fingerprint = next_fingerprint(&mut lines, "buyer-key-fingerprint")?;
     let seller_key_fingerprint = next_fingerprint(&mut lines, "seller-key-fingerprint")?;
+    let buyer_key_fingerprint = next_fingerprint(&mut lines, "buyer-key-fingerprint")?;
+    let trade_id = next_trade_id(&mut lines)?;
     expect_end(&mut lines)?;
     let stmt = OpenToken {
         marketplace_id,
@@ -611,15 +617,15 @@ pub fn parse_open_token(text: &str, marketplace_id: &str) -> Option<OpenToken> {
     (stmt.to_bytes() == text.as_bytes()).then_some(stmt)
 }
 
-// ---------------------------------------------------------------------------
 // Ack (§5): marketplace-ack-v1. The seller's signed word that the
 // buyer paid. `acknowledged` has exactly one value today: `paid`.
+// The statement names no fingerprint: the detached signature is
+// what identifies the signer (§5 "Signatures").
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AckStatement {
     pub marketplace_id: String,
     pub trade_id: String,
-    pub seller_key_fingerprint: String,
     pub date: String,
 }
 
@@ -629,10 +635,6 @@ impl AckStatement {
         out.push_str("statement-format: marketplace-ack-v1\n");
         out.push_str(&format!("marketplace-id: {}\n", self.marketplace_id));
         out.push_str(&format!("trade-id: {}\n", self.trade_id));
-        out.push_str(&format!(
-            "seller-key-fingerprint: {}\n",
-            self.seller_key_fingerprint
-        ));
         out.push_str("acknowledged: paid\n");
         out.push_str(&format!("date: {}\n", self.date));
         out.into_bytes()
@@ -647,7 +649,6 @@ pub fn parse_ack_statement(text: &str, marketplace_id: &str) -> Option<AckStatem
     check_format(&mut lines, "marketplace-ack-v1")?;
     let marketplace_id = next_marketplace_id(&mut lines, marketplace_id)?;
     let trade_id = next_trade_id(&mut lines)?;
-    let seller_key_fingerprint = next_fingerprint(&mut lines, "seller-key-fingerprint")?;
     if next_field(&mut lines, "acknowledged")? != "paid" {
         return None;
     }
@@ -656,24 +657,24 @@ pub fn parse_ack_statement(text: &str, marketplace_id: &str) -> Option<AckStatem
     let stmt = AckStatement {
         marketplace_id,
         trade_id,
-        seller_key_fingerprint,
         date,
     };
     (stmt.to_bytes() == text.as_bytes()).then_some(stmt)
 }
 
 // ---------------------------------------------------------------------------
-// Shipped (§5): marketplace-shipped-v1. `carrier-commit` is the
-// SHA-256 of `<carrier>|<tracking>|<salt hex>` or the literal `none`.
+// Shipped (§5): marketplace-shipped-v1 — the seller for `out`, the
+// buyer for an agreed `return`. Field order is direction, date,
+// carrier-commit. `carrier-commit` is the SHA-256 of
+// `<carrier>|<tracking>|<salt hex>` or the literal `none`.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShippedStatement {
     pub marketplace_id: String,
     pub trade_id: String,
-    pub seller_key_fingerprint: String,
     pub direction: ShippedDirection,
-    pub carrier_commit: String,
     pub date: String,
+    pub carrier_commit: String,
 }
 
 impl ShippedStatement {
@@ -682,13 +683,9 @@ impl ShippedStatement {
         out.push_str("statement-format: marketplace-shipped-v1\n");
         out.push_str(&format!("marketplace-id: {}\n", self.marketplace_id));
         out.push_str(&format!("trade-id: {}\n", self.trade_id));
-        out.push_str(&format!(
-            "seller-key-fingerprint: {}\n",
-            self.seller_key_fingerprint
-        ));
         out.push_str(&format!("direction: {}\n", self.direction.as_str()));
-        out.push_str(&format!("carrier-commit: {}\n", self.carrier_commit));
         out.push_str(&format!("date: {}\n", self.date));
+        out.push_str(&format!("carrier-commit: {}\n", self.carrier_commit));
         out.into_bytes()
     }
 }
@@ -701,21 +698,19 @@ pub fn parse_shipped_statement(text: &str, marketplace_id: &str) -> Option<Shipp
     check_format(&mut lines, "marketplace-shipped-v1")?;
     let marketplace_id = next_marketplace_id(&mut lines, marketplace_id)?;
     let trade_id = next_trade_id(&mut lines)?;
-    let seller_key_fingerprint = next_fingerprint(&mut lines, "seller-key-fingerprint")?;
     let direction = ShippedDirection::from_statement(next_field(&mut lines, "direction")?)?;
+    let date = next_date(&mut lines)?;
     let carrier_commit = next_field(&mut lines, "carrier-commit")?.to_string();
     if carrier_commit != "none" && !valid_terms_sha256(&carrier_commit) {
         return None;
     }
-    let date = next_date(&mut lines)?;
     expect_end(&mut lines)?;
     let stmt = ShippedStatement {
         marketplace_id,
         trade_id,
-        seller_key_fingerprint,
         direction,
-        carrier_commit,
         date,
+        carrier_commit,
     };
     (stmt.to_bytes() == text.as_bytes()).then_some(stmt)
 }
@@ -737,7 +732,6 @@ pub fn carrier_commit(carrier: &str, tracking: &str, salt_hex: &str) -> Option<S
 pub struct IssueStatement {
     pub marketplace_id: String,
     pub trade_id: String,
-    pub buyer_key_fingerprint: String,
     pub kind: IssueKind,
     pub requested_refund_pct: u64,
     pub date: String,
@@ -749,10 +743,6 @@ impl IssueStatement {
         out.push_str("statement-format: marketplace-issue-v1\n");
         out.push_str(&format!("marketplace-id: {}\n", self.marketplace_id));
         out.push_str(&format!("trade-id: {}\n", self.trade_id));
-        out.push_str(&format!(
-            "buyer-key-fingerprint: {}\n",
-            self.buyer_key_fingerprint
-        ));
         out.push_str(&format!("kind: {}\n", self.kind.as_str()));
         out.push_str(&format!(
             "requested-refund-pct: {}\n",
@@ -771,7 +761,6 @@ pub fn parse_issue_statement(text: &str, marketplace_id: &str) -> Option<IssueSt
     check_format(&mut lines, "marketplace-issue-v1")?;
     let marketplace_id = next_marketplace_id(&mut lines, marketplace_id)?;
     let trade_id = next_trade_id(&mut lines)?;
-    let buyer_key_fingerprint = next_fingerprint(&mut lines, "buyer-key-fingerprint")?;
     let kind = IssueKind::from_statement(next_field(&mut lines, "kind")?)?;
     let requested_refund_pct = next_u64(&mut lines, "requested-refund-pct")?;
     if requested_refund_pct == 0 || requested_refund_pct > 100 {
@@ -782,7 +771,6 @@ pub fn parse_issue_statement(text: &str, marketplace_id: &str) -> Option<IssueSt
     let stmt = IssueStatement {
         marketplace_id,
         trade_id,
-        buyer_key_fingerprint,
         kind,
         requested_refund_pct,
         date,
@@ -791,17 +779,18 @@ pub fn parse_issue_statement(text: &str, marketplace_id: &str) -> Option<IssueSt
 }
 
 // ---------------------------------------------------------------------------
-// Settle (§5): marketplace-settle-v1, signed by the seller. Closes a
-// trade with an agreed refund; `settlement` accepts only `direct`
-// today (§19: reserved values do not parse).
+// Settle (§5): marketplace-settle-v1, signed by both parties.
+// Closes the trade with an agreed refund, possibly zero. The
+// format bounds `refund-atomic` at the assignment's amount; that
+// bound needs the assignment, so it is enforced by the fold
+// (`ht_fold::check_settle`), not here.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettleStatement {
     pub marketplace_id: String,
     pub trade_id: String,
-    pub seller_key_fingerprint: String,
     pub refund_atomic: u64,
-    pub refund_to: String,
+    pub return_required: bool,
     pub month: String,
 }
 
@@ -811,23 +800,17 @@ impl SettleStatement {
         out.push_str("statement-format: marketplace-settle-v1\n");
         out.push_str(&format!("marketplace-id: {}\n", self.marketplace_id));
         out.push_str(&format!("trade-id: {}\n", self.trade_id));
-        out.push_str(&format!(
-            "seller-key-fingerprint: {}\n",
-            self.seller_key_fingerprint
-        ));
         out.push_str(&format!("refund-atomic: {}\n", self.refund_atomic));
-        out.push_str(&format!("refund-to: {}\n", self.refund_to));
+        out.push_str(&format!(
+            "return-required: {}\n",
+            if self.return_required { "yes" } else { "no" }
+        ));
         out.push_str(&format!("month: {}\n", self.month));
-        out.push_str("settlement: direct\n");
         out.into_bytes()
     }
 }
 
-pub fn parse_settle_statement(
-    text: &str,
-    marketplace_id: &str,
-    instance_network: Network,
-) -> Option<SettleStatement> {
+pub fn parse_settle_statement(text: &str, marketplace_id: &str) -> Option<SettleStatement> {
     if !byte_gate(text) {
         return None;
     }
@@ -835,21 +818,19 @@ pub fn parse_settle_statement(
     check_format(&mut lines, "marketplace-settle-v1")?;
     let marketplace_id = next_marketplace_id(&mut lines, marketplace_id)?;
     let trade_id = next_trade_id(&mut lines)?;
-    let seller_key_fingerprint = next_fingerprint(&mut lines, "seller-key-fingerprint")?;
     let refund_atomic = next_u64(&mut lines, "refund-atomic")?;
-    let refund_to = validate_any_address(next_field(&mut lines, "refund-to")?, instance_network)
-        .ok()?;
+    let return_required = match next_field(&mut lines, "return-required")? {
+        "yes" => true,
+        "no" => false,
+        _ => return None,
+    };
     let month = next_month(&mut lines)?;
-    if next_field(&mut lines, "settlement")? != "direct" {
-        return None;
-    }
     expect_end(&mut lines)?;
     let stmt = SettleStatement {
         marketplace_id,
         trade_id,
-        seller_key_fingerprint,
         refund_atomic,
-        refund_to,
+        return_required,
         month,
     };
     (stmt.to_bytes() == text.as_bytes()).then_some(stmt)
@@ -857,14 +838,14 @@ pub fn parse_settle_statement(
 
 // ---------------------------------------------------------------------------
 // Refund destination (§5): marketplace-refund-to-v1, signed by the
-// buyer before any refund or close.
+// buyer before any refund or close; names where, and how much.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundToStatement {
     pub marketplace_id: String,
     pub trade_id: String,
-    pub buyer_key_fingerprint: String,
     pub refund_destination: String,
+    pub refund_atomic: u64,
 }
 
 impl RefundToStatement {
@@ -874,13 +855,10 @@ impl RefundToStatement {
         out.push_str(&format!("marketplace-id: {}\n", self.marketplace_id));
         out.push_str(&format!("trade-id: {}\n", self.trade_id));
         out.push_str(&format!(
-            "buyer-key-fingerprint: {}\n",
-            self.buyer_key_fingerprint
-        ));
-        out.push_str(&format!(
             "refund-destination: {}\n",
             self.refund_destination
         ));
+        out.push_str(&format!("refund-atomic: {}\n", self.refund_atomic));
         out.into_bytes()
     }
 }
@@ -897,30 +875,32 @@ pub fn parse_refund_to_statement(
     check_format(&mut lines, "marketplace-refund-to-v1")?;
     let marketplace_id = next_marketplace_id(&mut lines, marketplace_id)?;
     let trade_id = next_trade_id(&mut lines)?;
-    let buyer_key_fingerprint = next_fingerprint(&mut lines, "buyer-key-fingerprint")?;
     let refund_destination = validate_any_address(
         next_field(&mut lines, "refund-destination")?,
         instance_network,
     )
     .ok()?;
+    let refund_atomic = next_u64(&mut lines, "refund-atomic")?;
     expect_end(&mut lines)?;
     let stmt = RefundToStatement {
         marketplace_id,
         trade_id,
-        buyer_key_fingerprint,
         refund_destination,
+        refund_atomic,
     };
     (stmt.to_bytes() == text.as_bytes()).then_some(stmt)
 }
 
 // ---------------------------------------------------------------------------
-// Receipt (§5): marketplace-receipt-v1, signed by the buyer.
-// `outcome` has exactly one value today: `completed`.
+// Receipt (§5): marketplace-receipt-v1 — both parties sign the same
+// bytes. `outcome` has exactly one value today: `completed`, and it
+// is the last field.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptStatement {
     pub marketplace_id: String,
     pub trade_id: String,
+    pub seller_key_fingerprint: String,
     pub buyer_key_fingerprint: String,
     pub month: String,
 }
@@ -932,11 +912,15 @@ impl ReceiptStatement {
         out.push_str(&format!("marketplace-id: {}\n", self.marketplace_id));
         out.push_str(&format!("trade-id: {}\n", self.trade_id));
         out.push_str(&format!(
+            "seller-key-fingerprint: {}\n",
+            self.seller_key_fingerprint
+        ));
+        out.push_str(&format!(
             "buyer-key-fingerprint: {}\n",
             self.buyer_key_fingerprint
         ));
-        out.push_str("outcome: completed\n");
         out.push_str(&format!("month: {}\n", self.month));
+        out.push_str("outcome: completed\n");
         out.into_bytes()
     }
 }
@@ -949,15 +933,17 @@ pub fn parse_receipt_statement(text: &str, marketplace_id: &str) -> Option<Recei
     check_format(&mut lines, "marketplace-receipt-v1")?;
     let marketplace_id = next_marketplace_id(&mut lines, marketplace_id)?;
     let trade_id = next_trade_id(&mut lines)?;
+    let seller_key_fingerprint = next_fingerprint(&mut lines, "seller-key-fingerprint")?;
     let buyer_key_fingerprint = next_fingerprint(&mut lines, "buyer-key-fingerprint")?;
+    let month = next_month(&mut lines)?;
     if next_field(&mut lines, "outcome")? != "completed" {
         return None;
     }
-    let month = next_month(&mut lines)?;
     expect_end(&mut lines)?;
     let stmt = ReceiptStatement {
         marketplace_id,
         trade_id,
+        seller_key_fingerprint,
         buyer_key_fingerprint,
         month,
     };
@@ -1022,7 +1008,6 @@ pub struct LinkStatement {
     pub account_key_fingerprint: String,
     pub venue_name: String,
     pub venue_address: String,
-    pub venue_account: String,
 }
 
 impl LinkStatement {
@@ -1036,7 +1021,6 @@ impl LinkStatement {
         ));
         out.push_str(&format!("venue-name: {}\n", self.venue_name));
         out.push_str(&format!("venue-address: {}\n", self.venue_address));
-        out.push_str(&format!("venue-account: {}\n", self.venue_account));
         out.into_bytes()
     }
 }
@@ -1057,17 +1041,12 @@ pub fn parse_link_statement(text: &str, marketplace_id: &str) -> Option<LinkStat
     if venue_address.is_empty() || venue_address.chars().count() > 200 {
         return None;
     }
-    let venue_account = next_field(&mut lines, "venue-account")?.to_string();
-    if venue_account.is_empty() || venue_account.chars().count() > 200 {
-        return None;
-    }
     expect_end(&mut lines)?;
     let stmt = LinkStatement {
         marketplace_id,
         account_key_fingerprint,
         venue_name,
         venue_address,
-        venue_account,
     };
     (stmt.to_bytes() == text.as_bytes()).then_some(stmt)
 }
