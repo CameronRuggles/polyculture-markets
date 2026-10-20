@@ -427,9 +427,17 @@ async fn pool_empty_refuses_and_no_identity_keeps_legacy_behaviour() {
     let (o, created) = create_order_with_config(&pool, "vespiary-market", buyer, &plain_listing, 1, "pe-3", &c).await.unwrap();
     assert!(created);
     assert!(assignment_for_order(&pool, o.id, &c).await.unwrap().is_none());
-    // And accept on that legacy order keeps the Stage 4 invoice gate.
-    let err = apply_action(&pool, &o, "accept", plain_seller).await.expect_err("accept without invoice must refuse");
-    assert_eq!(err, OrderError::InvoiceRequired);
+    // Accept on that legacy order no longer meets the Stage 4 invoice
+    // gate — it was removed by the BL1 amendment (2026-10-19): nothing
+    // issues invoices, so the gate made assignment-less orders
+    // unacceptable forever. Accept succeeds into AwaitingPayment, but
+    // no payment path opens: mark_paid refuses the unassigned order
+    // with NoAssignment.
+    let state = apply_action(&pool, &o, "accept", plain_seller).await.expect("legacy accept must succeed since the BL1 amendment");
+    assert_eq!(format!("{state:?}"), "AwaitingPayment");
+    let o = app::orders::order_by_public_id(&pool, &o.public_id).await.unwrap();
+    let err = mark_paid(&pool, &o, plain_seller, &c).await.expect_err("mark_paid without an assignment must refuse");
+    assert_eq!(err, PaymentError::NoAssignment);
     cleanup(&pool, &[seller_id, plain_seller, buyer]).await;
 }
 
