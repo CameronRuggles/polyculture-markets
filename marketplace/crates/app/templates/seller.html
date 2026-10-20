@@ -58,6 +58,7 @@ Your seller ID: <code>{{ payment_seller_id }}</code></p>
 {% else %}
 <p role="alert">No signed terms pinned yet: this listing cannot be published until its terms are signed and pinned.</p>
 {% endif %}
+<p>A remedy cap above 0 is an option you sell to every buyer: a dishonest buyer can always claim the cap.</p>
 <form method="post" action="/listings/{{ l.public_id }}/terms">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label>Terms statement (from the helper's <code>seller terms</code>)
