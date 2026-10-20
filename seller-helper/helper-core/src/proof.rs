@@ -234,6 +234,16 @@ fn generate_tx_proof(
 /// transaction keys in order; a plain single-recipient payment has
 /// exactly one. The message is the exact proof message (§5:
 /// `marketplace-pay-v1|<trade-id>`).
+///
+/// SPIKE STATUS (H1, spec §16.1): the construction follows Monero
+/// 0.18.3.4's `generate_tx_proof` exactly and verifies against a
+/// faithful port of the reference `check_tx_proof` + wallet2 output
+/// scan (see HT-H1-REPORT-2026-10-20.md). Acceptance by the
+/// reference wallet BINARY could not be obtained in the build
+/// sandbox (its daemon/wallet pair fails its own proof path on
+/// every transaction). Per the gate, no H1 command exposes this
+/// path; it must not be wired into a user command until binary
+/// acceptance is recorded on a real stagenet node.
 pub fn build_out_proof_v2(
     txid_hex: &str,
     tx_keys_hex: &[&str],

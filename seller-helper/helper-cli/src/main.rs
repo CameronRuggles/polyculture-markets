@@ -30,6 +30,9 @@ const USAGE: &str = "\
 helper — Hidden Trades helper (Polyculture Markets Alpha)
 
 USAGE:
+  helper init --marketplace-id ID --key-file F --cert-file F
+                      [--network monero-stagenet] [--store-dir DIR]
+                      [--core-config PATH] [--force true]
   helper seller init|generate|check ...   Direct Payments v1 commands
   helper seller terms --listing ID --transit-risk seller|buyer
                       --remedy-cap-pct N --payment-timing prepay|on_ship|on_receipt
@@ -410,8 +413,69 @@ fn run_core(mode: &str, cmd: &str, args: &legacy::Args) -> Result<(), String> {
     }
 }
 
+/// `helper init` (§14, both modes): write the core config the other
+/// commands read. The seller-mode `init` of Direct Payments v1 is a
+/// different command (`helper seller init`) and is untouched.
+fn cmd_init_core(args: &legacy::Args) -> Result<(), String> {
+    let path = match args.flags.get("core-config") {
+        Some(p) => PathBuf::from(p),
+        None => helper_core::default_core_config_path(),
+    };
+    if path.exists() && args.flags.get("force").map(String::as_str) != Some("true") {
+        return Err(format!(
+            "a helper config already exists at {}: pass --force to replace it",
+            path.display()
+        ));
+    }
+    let req = |flag: &str| -> Result<String, String> {
+        args.flags
+            .get(flag)
+            .cloned()
+            .ok_or_else(|| format!("init needs --{flag}"))
+    };
+    let cfg = helper_core::CoreConfig {
+        marketplace_id: req("marketplace-id")?,
+        network: args
+            .flags
+            .get("network")
+            .cloned()
+            .unwrap_or_else(|| "monero-stagenet".to_string()),
+        key_file: PathBuf::from(req("key-file")?),
+        cert_file: PathBuf::from(req("cert-file")?),
+        store_dir: match args.flags.get("store-dir") {
+            Some(p) => PathBuf::from(p),
+            None => helper_core::seller_config_dir().join("ht-store"),
+        },
+    };
+    if cfg.network_enum().is_none() {
+        return Err(format!(
+            "unknown network {:?}: use a statement network name (monero-mainnet, monero-stagenet, monero-testnet)",
+            cfg.network
+        ));
+    }
+    let fpr = cfg.own_fingerprint()?;
+    cfg.save(&path)?;
+    println!("Wrote helper config to {}", path.display());
+    println!("Marketplace: {}  Network: {}", cfg.marketplace_id, cfg.network);
+    println!("Your key fingerprint (from {}): {fpr}", cfg.cert_file.display());
+    println!("Evidence store: {}", cfg.store_dir.display());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("init") {
+        return match legacy::parse_args(&argv[1..]) {
+            Ok(a) => match cmd_init_core(&a) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(e),
+            },
+            Err(e) => {
+                eprintln!("error: {e}\n\n{USAGE}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let (mode, rest) = match argv.split_first() {
         Some((m, r)) => (m.as_str(), r),
         None => {

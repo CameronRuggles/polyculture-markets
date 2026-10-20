@@ -49,6 +49,20 @@ impl CoreConfig {
             .map_err(|e| format!("helper config {} is not valid: {e}", path.display()))
     }
 
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let raw = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("cannot serialise helper config: {e}"))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, raw + "\n")
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("cannot move {} into place: {e}", tmp.display()))
+    }
+
     /// The user's own key fingerprint, from their certificate file.
     pub fn own_fingerprint(&self) -> Result<String, String> {
         let cert = std::fs::read(&self.cert_file).map_err(|e| {
