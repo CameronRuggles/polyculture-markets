@@ -491,6 +491,7 @@ pub fn router(state: AppState) -> Router {
         .route("/account/recover", get(recover_form).post(recover))
         .route("/listings", get(catalogue))
         .route("/listings/{id}", get(listing_page))
+        .route("/listings/{id}/terms", get(listing_terms_download).post(terms_submit))
         .route("/seller", get(seller_page))
         .route("/seller/apply", post(seller_apply))
         .route("/seller/listings", post(create_listing))
@@ -609,6 +610,9 @@ fn alert_text(code: Option<&str>, n: Option<&str>) -> Option<String> {
         "batch_rejected" => "Batch rejected (nothing was stored).".to_string(),
         "listing_taken_down" => "This listing was removed by a moderator. You cannot change its status until a moderator restores it.".to_string(),
         "payment_setup_required" => "Publishing requires a payment identity and at least one unused pool address: set your primary address and upload a signed address batch first.".to_string(),
+        "terms_saved" => "Listing terms saved and pinned.".to_string(),
+        "terms_rejected" => "Terms statement rejected: it must parse, name this listing, carry the next version number, bind the listing's current text, and be signed by your current pinned key.".to_string(),
+        "terms_required" => "Publishing requires signed listing terms: build them with the helper and pin them from your seller page first.".to_string(),
         // Order page (msg).
         "proof_recorded" => "Payment proof recorded. It is carried unverified: the seller and moderators check it in their own wallets.".to_string(),
         "proof_rejected" => "Proof not accepted.".to_string(),
@@ -1282,6 +1286,10 @@ pub struct ListingView {
     pub status: String,
     /// CH1: a moderator takedown is in force on this listing.
     pub taken_down: bool,
+    /// Hidden Trades H1 (§4): the listing's current pinned terms
+    /// version, when one is pinned (seller page only; the catalogue
+    /// leaves it None).
+    pub terms_version: Option<i64>,
 }
 
 fn view_of(l: &lst::Listing) -> ListingView {
@@ -1294,6 +1302,7 @@ fn view_of(l: &lst::Listing) -> ListingView {
         seller_name: l.seller_name.clone(),
         status: l.status.clone(),
         taken_down: l.taken_down,
+        terms_version: None,
     }
 }
 
@@ -1351,6 +1360,9 @@ struct ListingTpl {
     idem: String,
     /// Stage 9: the report form renders for logged-in viewers.
     viewer_logged_in: bool,
+    /// Hidden Trades H1 (§4): the listing's pinned terms risk
+    /// fields, in the spec's fixed wording, shown beside the price.
+    terms_lines: Option<[String; 3]>,
 }
 
 async fn listing_page(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
@@ -1389,6 +1401,13 @@ async fn listing_page(State(st): State<AppState>, headers: HeaderMap, Path(id): 
             .map(|(_, s, _)| s.account_id != l.seller_id)
             .unwrap_or(false);
     let viewer_logged_in = viewer.is_some();
+    let terms_lines = lst::current_terms(&st.pool, l.id)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| {
+            lst::terms_risk_lines(&t.transit_risk, i64::from(t.remedy_cap_pct), &t.payment_timing)
+        });
     let title = l.title.clone();
     let tpl = ListingTpl {
         price_xmr: domain::Atomic(l.price_atomic as u64).format_decimal(),
@@ -1399,6 +1418,7 @@ async fn listing_page(State(st): State<AppState>, headers: HeaderMap, Path(id): 
         csrf: viewer.map(|(_, _, c)| c).unwrap_or_default(),
         idem: sessions::new_token(),
         viewer_logged_in,
+        terms_lines,
         listing: l,
     };
     page(&st, &headers, &title, tpl.render().unwrap()).await
@@ -1438,12 +1458,20 @@ async fn seller_page(
     let role_s = db::role_of(&st.pool, sess.account_id).await.ok().flatten().unwrap_or_else(|| "buyer".into());
     let is_seller = matches!(role_from_str(&role_s), Role::Seller | Role::Admin);
     let listings = if is_seller {
-        lst::listings_of_seller(&st.pool, sess.account_id)
+        let rows = lst::listings_of_seller(&st.pool, sess.account_id)
             .await
-            .unwrap_or_default()
-            .iter()
-            .map(view_of)
-            .collect()
+            .unwrap_or_default();
+        let mut views = Vec::with_capacity(rows.len());
+        for l in &rows {
+            let mut v = view_of(l);
+            v.terms_version = lst::current_terms(&st.pool, l.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.version);
+            views.push(v);
+        }
+        views
     } else {
         vec![]
     };
@@ -1748,6 +1776,78 @@ async fn create_listing(State(st): State<AppState>, headers: HeaderMap, Form(f):
     }
 }
 
+// -- Hidden Trades H1: signed listing terms (§4/§13) --------------------------
+
+#[derive(Deserialize)]
+struct TermsForm {
+    statement: String,
+    signature: String,
+    csrf: String,
+}
+
+/// POST /listings/{id}/terms — the seller pins a signed terms
+/// statement for their listing (spec §13 paste endpoint). All
+/// verification lives in `lst::submit_terms`; this handler owns
+/// session, CSRF, throttling and ownership only.
+async fn terms_submit(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(f): Form<TermsForm>,
+) -> Response {
+    let Some((_t, sess, csrf)) = current_session(&st, &headers).await else {
+        return Redirect::to("/login").into_response();
+    };
+    if let Some(r) = st.throttle_or_429(sess.account_id) {
+        return r;
+    }
+    if !sessions::csrf_matches(&csrf, &f.csrf) {
+        return (StatusCode::FORBIDDEN, "CSRF check failed").into_response();
+    }
+    let Some(l) = lst::listing_by_public_id(&st.pool, &id).await.ok().flatten() else {
+        return (StatusCode::NOT_FOUND, "No such listing").into_response();
+    };
+    if l.seller_id != sess.account_id {
+        return (StatusCode::FORBIDDEN, "Not your listing").into_response();
+    }
+    match lst::submit_terms(&st.pool, &st.payments.marketplace_id, &l, &f.statement, &f.signature).await {
+        Ok(_) => Redirect::to("/seller?pmsg=terms_saved").into_response(),
+        Err(_) => Redirect::to("/seller?pmsg=terms_rejected").into_response(),
+    }
+}
+
+/// GET /listings/{id}/terms — the listing's current pinned terms
+/// statement and detached signature, as one text body (statement
+/// bytes, then the armored signature), for the buyer's helper to
+/// save from the listing (§13). Unpublished listings answer only
+/// their owner, exactly like the listing page.
+async fn listing_terms_download(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(l) = lst::listing_by_public_id(&st.pool, &id).await.ok().flatten() else {
+        return (StatusCode::NOT_FOUND, "No such listing").into_response();
+    };
+    if l.status != "published" {
+        let owner = current_session(&st, &headers)
+            .await
+            .map(|(_, s, _)| s.account_id == l.seller_id)
+            .unwrap_or(false);
+        if !owner {
+            return (StatusCode::NOT_FOUND, "No such listing").into_response();
+        }
+    }
+    let Some(pin) = lst::current_terms(&st.pool, l.id).await.ok().flatten() else {
+        return (StatusCode::NOT_FOUND, "No pinned terms").into_response();
+    };
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!("{}{}", pin.statement, pin.signature),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct StatusForm {
     status: String,
@@ -1798,6 +1898,17 @@ async fn listing_status(
         .unwrap_or(false);
         if !can_be_paid {
             return Redirect::to("/seller?pmsg=payment_setup_required").into_response();
+        }
+    }
+    // Hidden Trades H1 (§4): a listing may be PUBLISHED only with a
+    // current pinned terms statement whose hash matches the
+    // listing's current text — terms are verified at publish and at
+    // every edit, and this is the publish half of that rule (the
+    // submission half is submit_terms). A listing whose text changed
+    // after signing cannot publish until the seller re-signs.
+    if f.status == "published" && l.seller_id == sess.account_id {
+        if !lst::terms_match_listing(&st.pool, &l).await {
+            return Redirect::to("/seller?pmsg=terms_required").into_response();
         }
     }
     match lst::set_status(&st.pool, l.id, sess.account_id, &f.status).await {

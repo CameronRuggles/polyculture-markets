@@ -549,6 +549,7 @@ dependencies = [
  "image",
  "modules-api",
  "qrcode",
+ "sha2",
  "time",
 ]
 

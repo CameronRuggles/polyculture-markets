@@ -53,6 +53,18 @@ Your seller ID: <code>{{ payment_seller_id }}</code></p>
 <label>Image (JPEG/PNG, max 5 MiB) <input type="file" name="image" accept="image/png,image/jpeg"></label>
 <button type="submit">Upload</button></form>
 <p>Warning: photo backgrounds and reflections can identify you.</p>
+{% if let Some(v) = l.terms_version %}
+<p>Signed terms: version {{ v }} pinned. Publishing checks them against the listing's current text.</p>
+{% else %}
+<p role="alert">No signed terms pinned yet: this listing cannot be published until its terms are signed and pinned.</p>
+{% endif %}
+<form method="post" action="/listings/{{ l.public_id }}/terms">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label>Terms statement (from the helper's <code>seller terms</code>)
+<textarea name="statement" rows="10" cols="80" required></textarea></label>
+<label>Detached signature (armored)
+<textarea name="signature" rows="8" cols="80" required></textarea></label>
+<button type="submit">Pin signed terms</button></form>
 </article>
 {% endfor %}
 <h2>New listing</h2>
