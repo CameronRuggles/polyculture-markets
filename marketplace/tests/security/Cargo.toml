@@ -45,6 +45,7 @@ axum = { version = "0.8" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 app = { path = "../../crates/app" }
+helper-core = { path = "../../../seller-helper/helper-core" }
 domain = { path = "../../crates/domain" }
 modules-api = { path = "../../crates/modules-api" }
 tokio = { version = "1", features = ["full"] }
@@ -62,3 +63,8 @@ path = "blind_stage9.rs"
 [[test]]
 name = "blind_stage10"
 path = "blind_stage10.rs"
+
+
+[[test]]
+name = "blind_ht1"
+path = "blind_ht1.rs"
