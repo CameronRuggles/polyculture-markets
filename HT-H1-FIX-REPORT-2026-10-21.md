@@ -761,3 +761,173 @@ should be committed as helper-core tests and the
 either-party signing is a recorded design choice in
 `ExpectedSigners::for_kind` — if the spec intends a fixed
 signer for either, it is a one-line change plus its test.
+
+## Blind re-authoring of the `blind_stage9` restore case (Q3) — 2026-10-21
+
+Open item (1) above is closed by this record. The locked case
+`listing_removal_hides_from_browse_and_restore_returns_it`
+predated F14 + Q5 and asserted the opposite of the ratified
+policy, so it was re-authored under the Q3 protocol: a
+separate blind author, briefed with the ratified policy only
+((a) browsable only while published; (b) restore returns the
+pre-takedown status ONLY IF signed terms are currently pinned
+that match the listing, else the restore leaves it `paused`;
+(c) both branches under test). The author was not shown the
+implementation code, the old case's body, or this report.
+
+Three authoring passes were needed; all are recorded, none
+hidden:
+
+1. **Rejected — fabricated harness.** The first pass produced
+   a case against an HTTP harness that does not exist in
+   `blind_stage9.rs` (invented helpers and endpoints —
+   `spawn_with`, `common_listing`, `post_seller_terms`,
+   `/admin/listings/remove` — none present in the file, whose
+   harness is service-level throughout) and cited the case at
+   the wrong line range. Rejected by the integrator after
+   symbol-level verification against the file. Nothing was
+   integrated.
+2. **Rejected — grounded harness, guessed mechanics.** The
+   second pass used the real service-level harness and
+   honestly flagged its two undiscoverable unknowns, but
+   guessed both wrong: `moderation::remove_listing` /
+   `moderation::restore_listing` do not exist, and the
+   `listing_term_pins` table it invented does not exist.
+   Not integrated: replacing its placeholder pin with a real
+   signed pin would have meant the integrator authoring the
+   fixture, voiding the blindness the protocol exists for.
+3. **Integrated.** The third pass was briefed with the policy,
+   a grounding requirement (quote the exact signature line of
+   every file helper used, with line numbers), a minimal
+   API-contract fragment (the `set_listing_removed` /
+   `browse` / `submit_terms` signatures — the restore entry
+   point appears only inside the forbidden case, so it cannot
+   be discovered from allowed reading), and permission to
+   read the sibling locked suite `blind_ht1.rs`'s
+   `TermsFixture` region for the pinning idiom only (stage9's
+   file has no pinning idiom of its own). It read neither the
+   old case's body nor any implementation.
+
+The integrated case is ONE case under the same name, covering
+both branches: a genuinely signed pin (real generated identity
+key registered for the seller, statement built over the
+listing's own stored fields, submitted through
+`app::listings::submit_terms`) restores to `published` and
+back to browse; the plain unpinned `make_listing` shape
+restores to `paused` and stays out of browse. The integrator's
+only act was the splice (old lines 1454–1485 replaced);
+**no mechanical adjustments were needed** — the case compiled
+as delivered and passed standalone before the gate re-run.
+Locked-file diff: 1 file, 125 insertions / 21 deletions, a
+single hunk inside the one function; no other case, helper,
+or assertion in the suite was touched.
+
+**The author's plain-language assertion list, verbatim:**
+
+1. Pinning the valid signed terms to the first listing succeeds.
+2. After pinning, the first listing's pinned terms match the listing.
+3. Before takedown, the first listing's stored status is published.
+4. Before takedown, the first listing appears in public browse.
+5. Takedown of the first listing succeeds.
+6. After takedown, the first listing does not appear in public browse.
+7. Restore of the first listing succeeds.
+8. After restore, the first listing's stored status is published, its pre-takedown status.
+9. After restore, the first listing appears in public browse again.
+10. Before takedown, the second listing has no pinned terms matching it.
+11. Before takedown, the second listing's stored status is published.
+12. Before takedown, the second listing appears in public browse.
+13. Takedown of the second listing succeeds.
+14. After takedown, the second listing does not appear in public browse.
+15. Restore of the second listing succeeds.
+16. After restore, the second listing's stored status is paused.
+17. After restore, the second listing still does not appear in public browse.
+
+## Close-out gate re-run — 2026-10-21
+
+`./run-gate.sh`, unmodified, exit code 0 (`gate: PASS` printed
+by the script itself under `set -e`; no phase needed altered
+commands or a `--no-fail-fast` pass this time).
+
+**Environment.** The VM was replaced again: PostgreSQL was
+re-provisioned from the user-space binaries (`~/pgsys` copied
+to `/home/pguser/pgsys`, server run as user `pguser` on
+127.0.0.1:5432, trust auth), the `~/pgbin/psql` stand-in on
+PATH, `DATABASE_URL=postgres://postgres:dev@localhost:5432/marketplace_dev`,
+`MEDIA_WORKER=<workspace>/target/debug/media-worker` (built
+fresh with `cargo build -p media-worker` first),
+`TMPDIR` on the real filesystem (`~/gate-tmp` — `/tmp` is a
+512 MiB tmpfs on this generation), nettle shim env as before.
+
+**First attempt (recorded, not the gate).** Log
+`~/tmp-build/ht-h1-fix-gate/gate4.log`, SHA-256
+`c11a24ab6be1d133fa08d4c9a83e8054e0524a5d7b14b63111c61f22cf787339`.
+It halted in the security phase at `blind_stage2` 36/2/0: the
+two media PNG acceptance cases failed because this attempt
+omitted `MEDIA_WORKER` from the recorded environment shape
+(`MediaPipeline::from_env` defaults to a relative worker path
+that does not resolve from the test package's working
+directory). An environment omission by the integrator, not a
+tree defect — under the recorded env shape `blind_stage2`
+stands at 38/0/0 below. Per the task-4 lesson, the defect is
+named here and the second run is the recorded gate.
+
+**Recorded gate.** Log `~/tmp-build/ht-h1-fix-gate/gate5.log`,
+SHA-256
+`6ab1caa7d449276f0cce15f73743470b0bb88dd0636dbf0f5cf92375edb521ee`
+— computed with `sha256sum` against the file on disk after the
+run, per the task-4 lesson.
+
+Phase 1 — security (fresh DB):
+
+| Target | Passed / Failed / Ignored |
+| --- | --- |
+| security_tests lib | 0 / 0 / 0 |
+| blind_direct_v1 | 42 / 0 / 0 |
+| blind_ht1 | 24 / 0 / 0 |
+| blind_stage1 | 41 / 0 / 0 |
+| blind_stage10 | 32 / 0 / 0 |
+| blind_stage2 | 38 / 0 / 0 |
+| blind_stage3 | 34 / 0 / 0 |
+| blind_stage4 | 58 / 0 / 6 |
+| blind_stage6 | 83 / 0 / 0 |
+| blind_stage9 | **43 / 0 / 0** (the re-authored case passes) |
+| ht_invariants_scope | 2 / 0 / 0 |
+| **Subtotal** | **397 / 0 / 6** |
+
+Phase 2 — workspace excluding security (rebuilt DB): **all
+green**, subtotal **231 / 0 / 3**, every target identical to
+the tasks 5–13 close-out table, including `blind_stage5` at
+the brief's named **35 / 0 / 3** (app lib 58, domain lib 21,
+envelope lib 7, modules-api lib 8, `ht_publish_gate` 3,
+`ht_terms_files` 2, `ht_terms_web` 1,
+`ht_terms_default_instance` 1, `media_disputes_audit` 9,
+`modules_audit_fixes` 9, `messaging_audit` 9,
+`account_security` 14, `payments_db` 11, `tx_proof_flow` 20,
+`verification_fixes` 10, `media_verification` 6,
+`audit_fix_tasks` 4, `dispute_signature` 1,
+`media_serve_http` 1, `stage1_db` 1).
+
+Phase 3 — seller-helper workspace: **31 / 0 / 0** (helper bin
+0, helper-core lib 11, `cli_ht` 2, `cli_init` 1, seller-helper
+lib 17).
+
+**Totals and reconciliation.** Marketplace: **628 passed / 0
+failed / 9 ignored**; seller-helper: **31 / 0 / 0**; combined
+**659 / 0 / 9**. Against the tasks 5–13 close-out (627/1/9 and
+31/0/0) the delta is exactly ONE test changing state,
+explained test-by-test: `blind_stage9` goes 42/1/0 →
+43/0/0 — the same 43 tests (one case replaced by one case of
+the same name), with
+`listing_removal_hides_from_browse_and_restore_returns_it`
+flipping from the single recorded failure to a pass. No test
+was added or removed anywhere; every other target is
+numerically identical to the close-out table, and the ignored
+count is unchanged at 9. The full gate is green for the first
+time since the F14 + Q5 policy landed.
+
+**Open items handed forward, updated:** item (1) is closed by
+this record. Remaining: (2) H2 intake receipt times; (3) the
+OutProofV2 rig re-run (owner-side); (4) the
+`ExpectedSigners::for_kind` design note. H2 still waits on
+the auditor's re-verification of this stack plus the spike
+re-run.
