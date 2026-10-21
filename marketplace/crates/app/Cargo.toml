@@ -39,3 +39,10 @@ anyhow = "1"
 # Verification-fix V9: statvfs for the message blob volume's
 # free-disk floor (already in the locked tree transitively).
 libc = "0.2"
+
+[dev-dependencies]
+# HT H1 audit fix task 5: the terms-download test runs the buyer
+# helper's real §14 verify against the exact bytes the three GET
+# resources serve. Test-only: the server never depends on the
+# helper in production code.
+helper-core = { path = "../../../seller-helper/helper-core" }

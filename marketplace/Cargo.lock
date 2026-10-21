@@ -48,6 +48,7 @@ dependencies = [
  "axum",
  "domain",
  "envelope",
+ "helper-core",
  "hex",
  "hmac",
  "libc",

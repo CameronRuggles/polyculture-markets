@@ -492,6 +492,9 @@ pub fn router(state: AppState) -> Router {
         .route("/listings", get(catalogue))
         .route("/listings/{id}", get(listing_page))
         .route("/listings/{id}/terms", get(listing_terms_download).post(terms_submit))
+        .route("/listings/{id}/terms/statement", get(listing_terms_statement))
+        .route("/listings/{id}/terms/signature", get(listing_terms_signature))
+        .route("/listings/{id}/terms/text", get(listing_terms_text))
         .route("/seller", get(seller_page))
         .route("/seller/apply", post(seller_apply))
         .route("/seller/listings", post(create_listing))
@@ -1832,36 +1835,99 @@ async fn terms_submit(
     }
 }
 
+/// The shared gate for the terms downloads (§13, audit F7):
+/// the listing must exist; an unpublished listing answers only
+/// its owner, exactly like the listing page; and a current terms
+/// pin must exist. Returns the listing and its pin.
+async fn terms_download_parts(
+    st: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<(lst::Listing, lst::TermsPin), Response> {
+    let Some(l) = lst::listing_by_public_id(&st.pool, id).await.ok().flatten() else {
+        return Err((StatusCode::NOT_FOUND, "No such listing").into_response());
+    };
+    if l.status != "published" {
+        let owner = current_session(st, headers)
+            .await
+            .map(|(_, s, _)| s.account_id == l.seller_id)
+            .unwrap_or(false);
+        if !owner {
+            return Err((StatusCode::NOT_FOUND, "No such listing").into_response());
+        }
+    }
+    let Some(pin) = lst::current_terms(&st.pool, l.id).await.ok().flatten() else {
+        return Err((StatusCode::NOT_FOUND, "No pinned terms").into_response());
+    };
+    Ok((l, pin))
+}
+
+fn plain_text(body: String) -> Response {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+}
+
 /// GET /listings/{id}/terms — the listing's current pinned terms
 /// statement and detached signature, as one text body (statement
 /// bytes, then the armored signature), for the buyer's helper to
 /// save from the listing (§13). Unpublished listings answer only
-/// their owner, exactly like the listing page.
+/// their owner, exactly like the listing page. The three parts are
+/// also served separately (statement / signature / text) for
+/// buyers whose helper consumes them as files (audit F7).
 async fn listing_terms_download(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let Some(l) = lst::listing_by_public_id(&st.pool, &id).await.ok().flatten() else {
-        return (StatusCode::NOT_FOUND, "No such listing").into_response();
-    };
-    if l.status != "published" {
-        let owner = current_session(&st, &headers)
-            .await
-            .map(|(_, s, _)| s.account_id == l.seller_id)
-            .unwrap_or(false);
-        if !owner {
-            return (StatusCode::NOT_FOUND, "No such listing").into_response();
-        }
+    match terms_download_parts(&st, &headers, &id).await {
+        Ok((_l, pin)) => plain_text(format!("{}{}", pin.statement, pin.signature)),
+        Err(r) => r,
     }
-    let Some(pin) = lst::current_terms(&st.pool, l.id).await.ok().flatten() else {
-        return (StatusCode::NOT_FOUND, "No pinned terms").into_response();
-    };
-    (
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        format!("{}{}", pin.statement, pin.signature),
-    )
-        .into_response()
+}
+
+/// GET /listings/{id}/terms/statement — the pinned terms statement
+/// alone, byte-exact (the file `helper buyer verify --terms`
+/// consumes).
+async fn listing_terms_statement(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    match terms_download_parts(&st, &headers, &id).await {
+        Ok((_l, pin)) => plain_text(pin.statement),
+        Err(r) => r,
+    }
+}
+
+/// GET /listings/{id}/terms/signature — the pinned terms
+/// statement's detached signature alone.
+async fn listing_terms_signature(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    match terms_download_parts(&st, &headers, &id).await {
+        Ok((_l, pin)) => plain_text(pin.signature),
+        Err(r) => r,
+    }
+}
+
+/// GET /listings/{id}/terms/text — the canonical terms text alone:
+/// the human-readable terms the pinned statement's `terms-sha256`
+/// binds, and the file `helper buyer verify --terms-text`
+/// consumes. Without this resource no buyer could ever satisfy
+/// §14 check 3 from what the site serves (audit F7).
+async fn listing_terms_text(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    match terms_download_parts(&st, &headers, &id).await {
+        Ok((l, _pin)) => match lst::listing_terms_text_for(&st.pool, &l).await {
+            Ok(text) => plain_text(text),
+            Err(_) => (StatusCode::NOT_FOUND, "No such listing").into_response(),
+        },
+        Err(r) => r,
+    }
 }
 
 #[derive(Deserialize)]

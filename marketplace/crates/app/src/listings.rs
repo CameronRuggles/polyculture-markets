@@ -469,22 +469,34 @@ pub async fn current_terms(pool: &PgPool, listing_id: i64) -> Result<Option<Term
     Ok(row.map(row_to_terms))
 }
 
-/// The listing's canonical terms text (domain's one definition) and
-/// its SHA-256, from the listing's stored fields.
-async fn listing_terms_digest(pool: &PgPool, listing: &Listing) -> Result<String, sqlx::Error> {
+/// The listing's canonical terms text (domain's one definition),
+/// from the listing's stored fields — the exact bytes whose
+/// SHA-256 the pinned terms statement binds, and the bytes the
+/// buyer's helper hashes at verify (§13/§14 check 3). Served to
+/// buyers as its own resource (audit F7: without it, no buyer
+/// could ever satisfy check 3 from what the site serves).
+pub async fn listing_terms_text_for(
+    pool: &PgPool,
+    listing: &Listing,
+) -> Result<String, sqlx::Error> {
     let (delivery_terms, refund_terms): (String, String) = sqlx::query_as(
         "SELECT delivery_terms, refund_terms FROM listings WHERE id = $1",
     )
     .bind(listing.id)
     .fetch_one(pool)
     .await?;
-    let text = domain::ht_statements::listing_terms_text(
+    Ok(domain::ht_statements::listing_terms_text(
         &listing.title,
         &listing.description,
         &delivery_terms,
         &refund_terms,
         listing.price_atomic as u64,
-    );
+    ))
+}
+
+/// The listing's canonical terms text's SHA-256.
+async fn listing_terms_digest(pool: &PgPool, listing: &Listing) -> Result<String, sqlx::Error> {
+    let text = listing_terms_text_for(pool, listing).await?;
     Ok(domain::ht_statements::sha256_hex(text.as_bytes()))
 }
 
