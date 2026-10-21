@@ -318,8 +318,21 @@ manifest; its invocations never had this default.
 `TMPDIR=$HOME/tmp-gate` on the real filesystem (the F3 report's
 environment note). One run of `./run-gate.sh`; log at
 `~/tmp-build/ht-h1-fix-gate/gate2.log`, **SHA-256
-`52fc78848d5fdd8db23906b42e8f3e0c5f23619e4c99d66187e59b12454ff374`**;
+`69be7d80d522a38e24dfcd30c85d64851802d7161553aa4f959ebe64e0031371`**;
 final lines `gate: PASS` and `GATE_EXIT_CODE=0`.
+
+Correction (same day, on post-commit verification): this addendum
+originally recorded SHA-256 `52fc7884…` for that log. That value
+does not match the log preserved at the path above — no file in
+the build directory hashes to it — so it was recorded in error and
+is corrected here. The preserved log was re-verified in full after
+the mismatch was found: its `test result` lines sum to exactly
+636 passed / 0 failed / 9 ignored, its per-target counts are the
+tables below (blind_stage5 35/0/3), it contains both database
+rebuilds and no failure lines, and it ends `gate: PASS` /
+`GATE_EXIT_CODE=0`. The commit message of `28ce3d0` still carries
+the incorrect hash; this note is the correction of record, since
+history is not rewritten.
 
 Phase 1 — `cargo test -p security-tests` (fresh DB):
 
