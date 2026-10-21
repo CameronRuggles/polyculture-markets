@@ -13,12 +13,14 @@
 
 use app::config::InstanceConfig;
 use app::keyfile::KeyFile;
+use domain::ht_statements as hs;
 use app::media::MediaPipeline;
 use app::passwords::HashGuard;
 use app::throttle::Throttles;
 use app::web::{router, AppState};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::io::Write as _;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -67,6 +69,10 @@ struct TestServer {
     addr: std::net::SocketAddr,
     hash_guard: HashGuard,
     throttles: Arc<Throttles>,
+    /// The test instance's Hidden Trades marketplace id, minted by
+    /// config resolution (fix task 2) — terms statements are signed
+    /// against this value.
+    ht_marketplace_id: String,
     handle: tokio::task::JoinHandle<()>,
     dir: std::path::PathBuf,
 }
@@ -84,6 +90,7 @@ async fn test_server(pool: &PgPool) -> TestServer {
     };
     let instance = InstanceConfig::resolve(&|_| None).expect("empty env resolves");
     let marketplace_id = instance.marketplace_id.clone();
+    let ht_marketplace_id = instance.ht_marketplace_id.clone();
     let payments = app::payments::PaymentConfig::from_env(&marketplace_id, instance.network);
     let keyfile = Arc::new(KeyFile::load_or_generate(&key_path).expect("key file"));
     let hash_guard = HashGuard::new(4);
@@ -108,7 +115,7 @@ async fn test_server(pool: &PgPool) -> TestServer {
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router(state)).await;
     });
-    TestServer { addr, hash_guard, throttles, handle, dir }
+    TestServer { addr, hash_guard, throttles, ht_marketplace_id, handle, dir }
 }
 
 impl TestServer {
@@ -372,6 +379,156 @@ async fn listing_status_of(pool: &PgPool, public_id: &str) -> String {
         .unwrap()
 }
 
+// ---------------------------------------------------------------------------
+// Terms pinning for the publish test (HT H1 reconciliation).
+//
+// Since H1, the publish handler ALSO requires a pinned terms
+// statement whose hash matches the listing's current text (the
+// terms gate in listing_status). This test predates H1: it set up
+// payment identity + pool and published, so against a live
+// database the H1 gate refused it (terms_required) — a failure
+// the tasks 1+3 report proved pre-existing at the audited commit
+// d21c523, hidden until then by the F3 silent-skip. The setup is
+// now completed the way a real seller completes it: install a key,
+// sign the terms statement against the instance's HT marketplace
+// id (fix task 2), and pin it through the real POST route. The
+// test's payment-identity assertions are untouched.
+// ---------------------------------------------------------------------------
+
+fn generate_test_cert(user_id: &str) -> (Vec<u8>, Vec<u8>) {
+    use sequoia_openpgp::armor::Kind as ArmorKind;
+    use sequoia_openpgp::cert::prelude::*;
+    use sequoia_openpgp::serialize::Marshal;
+    let (cert, _rev) = CertBuilder::new()
+        .add_userid(user_id)
+        .add_signing_subkey()
+        .add_storage_encryption_subkey()
+        .add_transport_encryption_subkey()
+        .generate()
+        .expect("generate test cert");
+    fn armor(kind: ArmorKind, bytes: &[u8]) -> Vec<u8> {
+        let mut w = sequoia_openpgp::armor::Writer::new(Vec::new(), kind).expect("armor writer");
+        w.write_all(bytes).expect("armor write");
+        w.finalize().expect("armor finalize")
+    }
+    let mut secret = Vec::new();
+    cert.as_tsk().serialize(&mut secret).expect("serialize secret");
+    let mut public = Vec::new();
+    cert.serialize(&mut public).expect("serialize public");
+    (
+        armor(ArmorKind::SecretKey, &secret),
+        armor(ArmorKind::PublicKey, &public),
+    )
+}
+
+fn fingerprint_of(cert_bytes: &[u8]) -> String {
+    use sequoia_openpgp::parse::Parse;
+    let cert = sequoia_openpgp::Cert::from_bytes(cert_bytes).expect("parse cert");
+    cert.fingerprint().to_hex()
+}
+
+fn sign_detached(secret_cert_bytes: &[u8], message: &[u8]) -> String {
+    use sequoia_openpgp::armor::Kind as ArmorKind;
+    use sequoia_openpgp::parse::Parse;
+    use sequoia_openpgp::policy::StandardPolicy;
+    use sequoia_openpgp::serialize::stream::{Armorer, Message, Signer};
+    let cert = sequoia_openpgp::Cert::from_bytes(secret_cert_bytes).expect("parse secret cert");
+    assert!(cert.is_tsk(), "secret cert carries secret material");
+    let policy = StandardPolicy::new();
+    let mut keypair = None;
+    for ka in cert.keys().with_policy(&policy, None).secret().for_signing() {
+        let key = ka.key().clone();
+        assert!(!key.secret().is_encrypted(), "test key is unencrypted");
+        if let Ok(kp) = key.into_keypair() {
+            keypair = Some(kp);
+            break;
+        }
+    }
+    let keypair = keypair.expect("usable signing key");
+    let mut sink = Vec::new();
+    {
+        let message_writer = Message::new(&mut sink);
+        let message_writer = Armorer::new(message_writer)
+            .kind(ArmorKind::Signature)
+            .build()
+            .expect("armorer");
+        let mut signer = Signer::new(message_writer, keypair)
+            .expect("signer")
+            .detached()
+            .build()
+            .expect("detached signer");
+        signer.write_all(message).expect("sign write");
+        signer.finalize().expect("sign finalize");
+    }
+    String::from_utf8(sink).expect("signature armor is UTF-8")
+}
+
+/// Install a fresh identity key for `seller` and pin signed terms
+/// for the listing through POST /listings/{id}/terms.
+async fn pin_terms_via_web(
+    pool: &PgPool,
+    srv: &TestServer,
+    cookie: &str,
+    seller: i64,
+    pub_id: &str,
+) {
+    let (secret, cert) = generate_test_cert("BL1 Seller <bl1@example.org>");
+    let fpr = fingerprint_of(&cert);
+    let cert_text = String::from_utf8(cert).expect("cert armor is UTF-8");
+    let info = app::keys::validate_cert(cert_text.as_bytes()).expect("test cert must validate");
+    assert_eq!(info.fingerprint, fpr);
+    app::keys::install_key(pool, seller, cert_text.as_bytes(), &info, None)
+        .await
+        .expect("install seller key");
+
+    let listing = app::listings::listing_by_public_id(pool, pub_id)
+        .await
+        .expect("load listing")
+        .expect("listing exists");
+    let (delivery, refund): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT delivery_terms, refund_terms FROM listings WHERE public_id = $1",
+    )
+    .bind(pub_id)
+    .fetch_one(pool)
+    .await
+    .expect("listing terms row");
+    let text = hs::listing_terms_text(
+        &listing.title,
+        &listing.description,
+        delivery.as_deref().unwrap_or(""),
+        refund.as_deref().unwrap_or(""),
+        listing.price_atomic as u64,
+    );
+    let stmt = hs::TermsStatement {
+        marketplace_id: srv.ht_marketplace_id.clone(),
+        listing_id: pub_id.to_string(),
+        listing_version: 1,
+        seller_key_fingerprint: fpr,
+        terms_sha256: hs::sha256_hex(text.as_bytes()),
+        risk: hs::RiskTerms {
+            transit_risk: hs::TransitRisk::Seller,
+            remedy_cap_pct: 25,
+            payment_timing: hs::PaymentTiming::Prepay,
+        },
+    };
+    let bytes = stmt.to_bytes();
+    let statement = String::from_utf8(bytes).expect("statement is UTF-8");
+    let signature = sign_detached(&secret, statement.as_bytes());
+    let csrf = session_csrf(srv.addr, cookie).await;
+    let r = post_form(
+        srv.addr,
+        &format!("/listings/{pub_id}/terms"),
+        Some(cookie),
+        &[("csrf", &csrf), ("statement", &statement), ("signature", &signature)],
+    )
+    .await;
+    assert!(
+        location_of(&r).contains("pmsg=terms_saved"),
+        "terms pin through the real route, got location {:?}",
+        location_of(&r)
+    );
+}
+
 #[tokio::test]
 async fn publish_requires_payment_identity_and_unused_pool() {
     let Some(pool) = pool().await else { return };
@@ -469,6 +626,14 @@ async fn publish_requires_payment_identity_and_unused_pool() {
     .execute(&pool)
     .await
     .unwrap();
+
+    // HT H1 reconciliation: publishing ALSO requires pinned terms
+    // whose hash matches the listing text (the H1 terms gate).
+    // Complete that requirement through the real route, exactly as
+    // a seller would, so the publish below can succeed on every
+    // gate — the payment assertions that follow are unchanged.
+    pin_terms_via_web(&pool, &srv, &cookie, seller, &pub_id).await;
+
     let csrf = session_csrf(srv.addr, &cookie).await;
     let r = post_form(
         srv.addr,
