@@ -48,7 +48,8 @@ were compromised.
 ```sh
 cd seller-helper
 cargo build --release
-# binary: target/release/seller-helper
+# binary: target/release/helper (the v1 commands below run as
+# `helper seller …`)
 ```
 
 ## Step 0 — start your wallet RPC (local only)
@@ -101,7 +102,7 @@ your seller dashboard — they are baked into every signed message, and
 a mismatch means the marketplace will reject your batch.
 
 ```sh
-seller-helper init \
+helper seller init \
   --marketplace-id <from dashboard> \
   --network stagenet \
   --seller-id <your seller id> \
@@ -125,7 +126,7 @@ marketplace. The config contains no seed and no wallet password.
 With your wallet open in the local RPC:
 
 ```sh
-seller-helper generate --count 20
+helper seller generate --count 20
 ```
 
 This writes `xmr-direct-batch-<your seller id>.json` in the current
@@ -150,7 +151,7 @@ Open one of your listings' payment pages (a test order is ideal),
 copy the payment subaddress shown, and run:
 
 ```sh
-seller-helper check <the address from the payment page>
+helper seller check <the address from the payment page>
 ```
 
 It prints whether the address belongs to your wallet, and which
