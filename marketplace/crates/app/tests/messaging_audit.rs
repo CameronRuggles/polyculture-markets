@@ -56,7 +56,7 @@ const CERT_DAVE_ADDED: &str = include_str!("fixtures/gpg/cert-dave-added-subkey.
 const ALICE_FPR: &str = "698C2CE6489C747F1458C2BF35C511FEAF38F328";
 const BOB_FPR: &str = "54C8A581E49106123FB5CCBACED0A0143425A8E0";
 const CAROL_FPR: &str = "346F063FB3DB1FB8EDB9F17D4065C0B2115BED30";
-const DAVE_FPR: &str = "61CD1CD1481CE46CF786B1A352DC295EC3B2A7A3";
+const DAVE_FPR: &str = "5A37E91C3A9C8A8BAAEB9503DD38B3DF073E742C";
 
 const MSG_300_UNSIGNED: &str = include_str!("fixtures/gpg/msg-300-unsigned.asc");
 const MSG_300_SIGNED: &str = include_str!("fixtures/gpg/msg-300-signed.asc");
