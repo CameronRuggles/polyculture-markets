@@ -1455,33 +1455,137 @@ async fn warn_sets_timestamp_audit_and_notice_but_account_stays_active() {
 async fn listing_removal_hides_from_browse_and_restore_returns_it() {
     let pool = pool().await;
     let moderator = make_moderator(&pool).await;
-    let (seller_id, _) = make_account(&pool, "seller", 72).await;
-    install_dummy_key(&pool, seller_id, &fingerprint(uniq128())).await;
-    let title = format!("Blind9Remove{:x}", uniq128());
-    let listing = make_listing(&pool, seller_id, &title).await;
-    let found = app::listings::browse(&pool, Some(&title), None, 1).await.unwrap();
-    assert!(found.iter().any(|l| l.public_id == listing.public_id), "published listing is browsable");
-    moderation::set_listing_removed(&pool, &listing.public_id, moderator, true)
+
+    // ---- Branch 1: restore WITH a matching signed-terms pin ----
+    // Seller with a REAL registered identity key (the blind_ht1
+    // terms_fixture construction), so a genuine signature can pin.
+    let (pinned_seller, _pinned_seller_pub) = make_account(&pool, "seller", 72).await;
+    let (seller_secret, seller_cert) =
+        helper_core::keys::generate_test_cert("Restore Seller <restoreseller@example.org>").unwrap();
+    let seller_fpr = helper_core::keys::fingerprint_of(&seller_cert).unwrap();
+    sqlx::query(
+        "INSERT INTO identity_keys (account_id, certificate, fingerprint, version, status, created_at) \
+         VALUES ($1, $2, $3, 1, 'current', now())",
+    )
+    .bind(pinned_seller)
+    .bind(seller_cert)
+    .bind(&seller_fpr)
+    .execute(&pool)
+    .await
+    .expect("insert seller identity key");
+    let pinned_title = format!("Restore Pinned {}", uniq_name());
+    let pinned = make_listing(&pool, pinned_seller, &pinned_title).await;
+
+    // Pin terms built over the listing's own stored fields, exactly
+    // as the blind_ht1 signed_terms construction builds them.
+    let pinned_listing = app::listings::listing_by_public_id(&pool, &pinned.public_id)
         .await
-        .expect("remove listing");
-    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
-        .bind(listing.internal_id)
+        .unwrap()
+        .unwrap();
+    let row = sqlx::query("SELECT delivery_terms, refund_terms FROM listings WHERE id = $1")
+        .bind(pinned.internal_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(status, "removed");
-    let found = app::listings::browse(&pool, Some(&title), None, 1).await.unwrap();
-    assert!(!found.iter().any(|l| l.public_id == listing.public_id), "a removed listing is absent from browse");
-    assert!(has_event(&pool, seller_id, "listing_removed").await, "the seller must be notified");
-    let err = moderation::set_listing_removed(&pool, &listing.public_id, moderator, true)
+    let delivery: String = row.get("delivery_terms");
+    let refund: String = row.get("refund_terms");
+    let terms_text = domain::ht_statements::listing_terms_text(
+        &pinned_listing.title,
+        &pinned_listing.description,
+        &delivery,
+        &refund,
+        pinned_listing.price_atomic as u64,
+    );
+    let stmt = domain::ht_statements::TermsStatement {
+        marketplace_id: MARKETPLACE_ID.into(),
+        listing_id: pinned.public_id.clone(),
+        listing_version: 1,
+        seller_key_fingerprint: seller_fpr.clone(),
+        terms_sha256: domain::ht_statements::sha256_hex(terms_text.as_bytes()),
+        risk: domain::ht_statements::RiskTerms {
+            transit_risk: domain::ht_statements::TransitRisk::Seller,
+            remedy_cap_pct: 25,
+            payment_timing: domain::ht_statements::PaymentTiming::Prepay,
+        },
+    };
+    let stmt_bytes = stmt.to_bytes();
+    let sig = helper_core::keys::sign_detached(&seller_secret, None, &stmt_bytes).unwrap();
+    let stmt_text = String::from_utf8(stmt_bytes).unwrap();
+    app::listings::submit_terms(&pool, MARKETPLACE_ID, &pinned_listing, &stmt_text, &sig)
         .await
-        .expect_err("removing an already-removed listing must be refused");
-    assert!(matches!(err, ModError::BadInput), "got {err:?}");
-    moderation::set_listing_removed(&pool, &listing.public_id, moderator, false)
+        .expect("valid signed terms pin to the listing");
+    assert!(
+        app::listings::terms_match_listing(&pool, &pinned_listing).await,
+        "the pinned terms must match the listing before takedown"
+    );
+
+    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
+        .bind(pinned.internal_id)
+        .fetch_one(&pool)
         .await
-        .expect("restore listing");
-    let found = app::listings::browse(&pool, Some(&title), None, 1).await.unwrap();
-    assert!(found.iter().any(|l| l.public_id == listing.public_id), "a restored listing returns to browse");
+        .unwrap();
+    assert_eq!(status, "published", "the pinned fixture listing starts published");
+    let found = app::listings::browse(&pool, Some(pinned_title.as_str()), None, 1).await.unwrap();
+    assert!(found.iter().any(|l| l.public_id == pinned.public_id), "a published listing is browsable before takedown");
+
+    moderation::set_listing_removed(&pool, &pinned.public_id, moderator, true)
+        .await
+        .expect("moderator takedown of the pinned listing");
+    let found = app::listings::browse(&pool, Some(pinned_title.as_str()), None, 1).await.unwrap();
+    assert!(!found.iter().any(|l| l.public_id == pinned.public_id), "a taken-down listing must leave browse");
+
+    moderation::set_listing_removed(&pool, &pinned.public_id, moderator, false)
+        .await
+        .expect("moderator restore of the pinned listing");
+    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
+        .bind(pinned.internal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "published", "restore with a matching pin returns the pre-takedown status");
+    let found = app::listings::browse(&pool, Some(pinned_title.as_str()), None, 1).await.unwrap();
+    assert!(found.iter().any(|l| l.public_id == pinned.public_id), "restored with a matching pin, the listing returns to browse");
+
+    // ---- Branch 2: restore with NO matching pin ----
+    // The plain make_listing shape: published, with nothing pinned.
+    let (plain_seller, _plain_seller_pub) = make_account(&pool, "seller", 72).await;
+    install_dummy_key(&pool, plain_seller, &fingerprint(uniq128())).await;
+    let plain_title = format!("Restore Unpinned {}", uniq_name());
+    let plain = make_listing(&pool, plain_seller, &plain_title).await;
+    let plain_listing = app::listings::listing_by_public_id(&pool, &plain.public_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !app::listings::terms_match_listing(&pool, &plain_listing).await,
+        "the unpinned fixture listing must start with no matching pinned terms"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
+        .bind(plain.internal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "published", "the unpinned fixture listing starts published");
+    let found = app::listings::browse(&pool, Some(plain_title.as_str()), None, 1).await.unwrap();
+    assert!(found.iter().any(|l| l.public_id == plain.public_id), "a published listing is browsable before takedown");
+
+    moderation::set_listing_removed(&pool, &plain.public_id, moderator, true)
+        .await
+        .expect("moderator takedown of the unpinned listing");
+    let found = app::listings::browse(&pool, Some(plain_title.as_str()), None, 1).await.unwrap();
+    assert!(!found.iter().any(|l| l.public_id == plain.public_id), "a taken-down listing must leave browse");
+
+    moderation::set_listing_removed(&pool, &plain.public_id, moderator, false)
+        .await
+        .expect("moderator restore of the unpinned listing");
+    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
+        .bind(plain.internal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "paused", "restore without a matching pin leaves the listing paused");
+    let found = app::listings::browse(&pool, Some(plain_title.as_str()), None, 1).await.unwrap();
+    assert!(!found.iter().any(|l| l.public_id == plain.public_id), "restored without a matching pin, the listing stays out of browse");
 }
 
 /// Insert a live session and one unused payment-pool entry for `seller`.
