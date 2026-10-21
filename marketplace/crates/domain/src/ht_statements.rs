@@ -303,6 +303,14 @@ pub fn parse_terms_statement(text: &str, marketplace_id: &str) -> Option<TermsSt
     let marketplace_id = next_marketplace_id(&mut lines, marketplace_id)?;
     let listing_id = next_listing_id(&mut lines)?;
     let listing_version = next_u64(&mut lines, "listing-version")?;
+    // §4 rule 5 (audit F11): version 0 is the off-platform terms'
+    // one legal version, and a real listing's terms start at
+    // version 1 — an `lst_` id with version 0, or `off-platform`
+    // with any other version, does not parse.
+    match (listing_id == "off-platform", listing_version) {
+        (true, 0) | (false, 1..) => {}
+        _ => return None,
+    }
     let seller_key_fingerprint = next_fingerprint(&mut lines, "seller-key-fingerprint")?;
     let terms_sha256 = next_digest(&mut lines, "terms-sha256")?;
     let transit_risk = TransitRisk::from_statement(next_field(&mut lines, "transit-risk")?)?;
@@ -1093,4 +1101,53 @@ pub fn proof_message_matches(message: &str, purpose: ProofPurpose, trade_id: &st
 /// for this marketplace and fingerprint.
 pub fn stake_message_matches(message: &str, marketplace_id: &str, fingerprint: &str) -> bool {
     message == stake_proof_message(marketplace_id, fingerprint)
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MKT: &str = "mkt_0123456789abcdef0123456789abcdef";
+    const LST: &str = "lst_00000000000000000000000000000001";
+
+    fn terms_text(listing_id: &str, version: u64) -> String {
+        let stmt = TermsStatement {
+            marketplace_id: MKT.into(),
+            listing_id: listing_id.into(),
+            listing_version: version,
+            seller_key_fingerprint: "0123456789ABCDEF0123456789ABCDEF01234567".into(),
+            terms_sha256: "cd".repeat(32),
+            risk: RiskTerms {
+                transit_risk: TransitRisk::Seller,
+                remedy_cap_pct: 25,
+                payment_timing: PaymentTiming::Prepay,
+            },
+        };
+        String::from_utf8(stmt.to_bytes()).expect("statement is ASCII")
+    }
+
+    /// §4 rule 5 (audit F11): an `lst_` id requires version ≥ 1 and
+    /// `off-platform` requires version 0; both mutations refuse,
+    /// both legal forms parse.
+    #[test]
+    fn terms_version_rule_bites() {
+        assert!(parse_terms_statement(&terms_text(LST, 0), MKT).is_none(), "lst_ v0 refuses");
+        assert!(parse_terms_statement(&terms_text(LST, 1), MKT).is_some(), "lst_ v1 parses");
+        assert!(parse_terms_statement(&terms_text(LST, 3), MKT).is_some(), "lst_ v3 parses");
+        assert!(
+            parse_terms_statement(&terms_text("off-platform", 0), MKT).is_some(),
+            "off-platform v0 parses"
+        );
+        assert!(
+            parse_terms_statement(&terms_text("off-platform", 1), MKT).is_none(),
+            "off-platform v1 refuses"
+        );
+        assert!(
+            parse_terms_statement(&terms_text("off-platform", 7), MKT).is_none(),
+            "off-platform v7 refuses"
+        );
+    }
 }
