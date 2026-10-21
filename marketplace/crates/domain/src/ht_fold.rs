@@ -316,7 +316,7 @@ mod tests {
             seller_key_fingerprint: SELLER.into(),
             buyer_key_fingerprint: BUYER.into(),
             terms_statement_sha256: "ab".repeat(32),
-            destination: crate::ht_statements::Subaddress::validate(SUB, Network::Stagenet)
+            destination: modules_api::Subaddress::validate(SUB, Network::Stagenet)
                 .expect("fixture subaddress"),
             amount_atomic: 250_000_000_000,
             payment_timing: timing,
