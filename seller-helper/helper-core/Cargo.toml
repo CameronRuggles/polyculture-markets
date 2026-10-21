@@ -5,6 +5,17 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Hidden Trades helper core (Alpha spec §14): canonical statement handling, buyer verify, the trade fold, the evidence store, and transaction-proof construction — shared by the helper's seller and buyer modes."
 
+[features]
+# Transaction-proof CONSTRUCTION from the transaction key (the H1
+# spike's subject, proof.rs): NOT compiled by default. The spike
+# proved the construction against a faithful port of the reference
+# checker, but acceptance by a real stagenet node/binary is still
+# outstanding (see HT-H1-REPORT-2026-10-20.md and the H1 audit fix
+# report), so construction stays out of default builds — and out of
+# every command — until that acceptance is recorded. The proof
+# FORM checks are always compiled.
+proof-construction = []
+
 [dependencies]
 domain = { path = "../../marketplace/crates/domain" }
 modules-api = { path = "../../marketplace/crates/modules-api" }

@@ -21,11 +21,23 @@
 //!    (subaddress). Whether this construction is accepted by a real
 //!    `check_tx_proof` is the spike's verdict, recorded in the H1
 //!    report; this code is the thing the spike tests.
+//!
+//!    The construction is behind the non-default cargo feature
+//!    `proof-construction` (HT H1 audit fix, task 9): the spike's
+//!    checker port and its two stagenet transaction vectors were
+//!    rig-side scratch and are not recoverable from the repository,
+//!    and binary acceptance on a real stagenet node is still an
+//!    open owner item — so the construction does not compile into
+//!    default builds and no command can reach it.
 
+#[cfg(feature = "proof-construction")]
 use curve25519_dalek::scalar::Scalar;
+#[cfg(feature = "proof-construction")]
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+#[cfg(feature = "proof-construction")]
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
 use sha3::Digest as _;
+#[cfg(feature = "proof-construction")]
 use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
@@ -37,10 +49,12 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+#[cfg(feature = "proof-construction")]
 fn hash_to_scalar(data: &[u8]) -> Scalar {
     Scalar::from_bytes_mod_order(keccak256(data))
 }
 
+#[cfg(feature = "proof-construction")]
 fn random_scalar() -> Scalar {
     let mut wide = [0u8; 64];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut wide);
@@ -164,8 +178,11 @@ pub fn proof_form_ok(proof: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Construction (the spike's subject).
+// Construction (the spike's subject) — feature-gated, see the
+// module docs. Nothing below this line compiles into a default
+// build.
 
+#[cfg(feature = "proof-construction")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProofError {
     BadTxid,
@@ -174,6 +191,7 @@ pub enum ProofError {
     BadPoint,
 }
 
+#[cfg(feature = "proof-construction")]
 fn hex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -185,6 +203,7 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+#[cfg(feature = "proof-construction")]
 fn decompress(bytes: &[u8; 32]) -> Option<EdwardsPoint> {
     CompressedEdwardsY(*bytes).decompress()
 }
@@ -193,6 +212,7 @@ fn decompress(bytes: &[u8; 32]) -> Option<EdwardsPoint> {
 /// of `secret` such that `R = secret·G` (or `secret·B` when a spend
 /// key `b` is given) and `d = secret·A`, committing to
 /// `prefix_hash`. Returns (c, r) as 64 signature bytes.
+#[cfg(feature = "proof-construction")]
 fn generate_tx_proof(
     prefix_hash: &[u8; 32],
     r_point: &EdwardsPoint,
@@ -243,7 +263,9 @@ fn generate_tx_proof(
 /// sandbox (its daemon/wallet pair fails its own proof path on
 /// every transaction). Per the gate, no H1 command exposes this
 /// path; it must not be wired into a user command until binary
-/// acceptance is recorded on a real stagenet node.
+/// acceptance is recorded on a real stagenet node. It compiles
+/// only under the non-default `proof-construction` feature.
+#[cfg(feature = "proof-construction")]
 pub fn build_out_proof_v2(
     txid_hex: &str,
     tx_keys_hex: &[&str],

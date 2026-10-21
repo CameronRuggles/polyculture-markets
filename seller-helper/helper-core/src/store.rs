@@ -1113,7 +1113,7 @@ mod tests {
 
     #[test]
     fn seeding_never_resurrects_a_spent_address_and_heals() {
-        let (_root, store, p, trade_id, _own) = held_trade("seed");
+        let (_root, store, _p, trade_id, _own) = held_trade("seed");
         let batch = format!(
             "{{\"entries\":[{{\"subaddress\":\"{SUB_A}\"}},{{\"subaddress\":\"{SUB_B}\"}}]}}"
         );
