@@ -756,20 +756,24 @@ pub async fn close_account(
 /// pre-takedown status — it can never republish a listing the
 /// seller withdrew ('withdrawn'), because a withdrawn listing has
 /// no takedown to clear and restoring it is refused (BadInput).
+/// One exception, deliberate (HT H1 audit fix task 10, finding
+/// F14): a restore whose target is 'published' re-checks the §4
+/// terms publish gate, and lands on 'paused' when the gate fails —
+/// moderation restore is not a side door around the gate.
 pub async fn set_listing_removed(
     pool: &PgPool,
     listing_public_id: &str,
     moderator_id: i64,
     remove: bool,
 ) -> Result<(), ModError> {
-    let row: Option<(i64, i64, String, bool)> = sqlx::query_as(
-        "SELECT id, seller_id, status, taken_down_at IS NOT NULL FROM listings WHERE public_id = $1",
+    let row: Option<(i64, i64, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT id, seller_id, status, taken_down_at IS NOT NULL, pre_takedown_status FROM listings WHERE public_id = $1",
     )
     .bind(listing_public_id)
     .fetch_optional(pool)
     .await
     .map_err(|_| ModError::Db)?;
-    let Some((listing_id, seller_id, _status, taken_down)) = row else {
+    let Some((listing_id, seller_id, _status, taken_down, pre_takedown_status)) = row else {
         return Err(ModError::NotFound);
     };
     let action = if remove {
@@ -792,14 +796,33 @@ pub async fn set_listing_removed(
         if !taken_down {
             return Err(ModError::BadInput);
         }
+        // HT H1 audit fix task 10 (finding F14): a restore to
+        // 'published' must pass the same §4 publish gate as any
+        // other publish — a current terms pin whose hash matches
+        // the listing's text. A taken-down listing whose terms were
+        // never pinned (or no longer match) restores to 'paused'
+        // instead of slipping back into the catalogue through the
+        // moderation side door; the seller re-signs and
+        // re-publishes to bring it back.
+        let mut target = pre_takedown_status.as_deref().unwrap_or("published").to_string();
+        if target == "published" {
+            let listing = crate::listings::listing_by_public_id(pool, listing_public_id)
+                .await
+                .map_err(|_| ModError::Db)?
+                .ok_or(ModError::NotFound)?;
+            if !crate::listings::terms_match_listing(pool, &listing).await {
+                target = "paused".to_string();
+            }
+        }
         sqlx::query(
             "UPDATE listings
-                SET status = COALESCE(pre_takedown_status, 'published'),
+                SET status = $2,
                     pre_takedown_status = NULL,
                     taken_down_at = NULL, taken_down_by = NULL
               WHERE id = $1",
         )
         .bind(listing_id)
+        .bind(&target)
         .execute(pool)
         .await
         .map_err(|_| ModError::Db)?;
