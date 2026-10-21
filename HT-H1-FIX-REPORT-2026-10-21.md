@@ -393,3 +393,11 @@ targets actually executed this time. No locked suite was edited;
 no assertion anywhere was changed to reach green — the only test
 modified in this addendum is the reconciled BL1 publish test,
 whose setup grew and whose assertions did not move.
+
+One operational footnote: `account_security`'s binary smoke test
+executes the real app binary in the Development profile, and the
+gate runs show task 2's persistence working as designed — it
+minted `marketplace.htid` (0600, valid id) beside the crate
+before serving. `marketplace.htid` is now gitignored beside
+`marketplace.key` as a per-instance runtime file, and the stray
+artifact was removed.
