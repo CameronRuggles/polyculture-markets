@@ -414,3 +414,349 @@ minted `marketplace.htid` (0600, valid id) beside the crate
 before serving. `marketplace.htid` is now gitignored beside
 `marketplace.key` as a per-instance runtime file, and the stray
 artifact was removed.
+
+---
+
+# Tasks 5–13 (second batch, 2026-10-21)
+
+Executed under the brief with all five owner decisions in hand
+(Q1–Q5, recorded with tasks 1–4). Commits on
+`deployment-fix-batch`, new commits only, no history rewrite, no
+push: `0ed7fd4` (task 11) · `f819cc4` + `1df6758` (task 13b,
+domain half — the first was committed mid-pipeline with a
+test-compile error that a piped `cargo test | tail` masked; the
+second fixes it; both kept, append-only, recorded here rather
+than hidden) · `40ac455` (tasks 6+7, task 8's core half) ·
+`f8b32ee` (task 9) · `4acfa4b` (task 8, CLI tests) · `73e38ad`
+(task 12) · `fa7526d` (task 5) · `7d5ca43` (task 10) · `9eaa05e`
+(task 13a).
+
+**Environment note.** The VM was replaced mid-session: the
+PostgreSQL cluster was re-provisioned from the user-space
+binaries (`~/pgsys`, port 5432, database `marketplace_dev`,
+migrations re-applied) and, this generation having no psql
+client at all, a minimal `sqlx`-backed psql stand-in was built
+for the gate's preflight and rebuild steps (`~/pgbin/psql`; it
+implements exactly the flags `run-gate.sh` and the migration
+loop use). Nothing in the tree depends on it; it is recorded
+here because the gate logs below were produced with it on PATH.
+
+## Task 11 — terms version rule (F11) · `0ed7fd4`
+
+`parse_terms_statement` now enforces spec §4 rule 5 (basis: the
+in-tree locked test's comment naming the rule): an `lst_`
+listing id requires version ≥ 1; an `off-platform` trade
+requires version 0. New domain unit test
+`terms_version_rule_scoped_by_destination` refuses both
+mutations and accepts both legal forms. Domain lib 15 → 16 at
+this commit.
+
+## Task 13b — receipt-time fold and the overdue flag (F6/F18, Q2) · `f819cc4`, `1df6758`
+
+The domain fold is now `fold_trade_timed(&[TimedEvent], now)`;
+`fold_trade` delegates with no witnessed times and no clock, so
+the locked `blind_ht1` behaviour is byte-identical (24/24 at the
+close-out gate). `TimedEvent` pairs a statement with the time
+the counterparty received it, when a witness recorded one.
+Rules: the issue window's upper bound is the issue statement's
+receipt when witnessed (else its signer date, as before); the
+lower bound (an issue received before the shipment was received
+cannot raise) applies only when **both** sides are
+receipt-witnessed — a receipt time is never compared against a
+mere signing date. `FoldedTrade.payment_overdue` is new:
+payment method `on_receipt`, goods shipped, nothing accepted as
+paid, and the caller-supplied `now` past the assignment's
+`payment_due` (the date the assignment itself states — the
+assignment's payment date, per Q2). Five domain unit tests
+cover the receipt-governed window in both directions, the
+signer-date fallback, the unwitnessed lower bound, and the
+overdue flag (positive; not-yet-due negative; prepay negative).
+
+The helper half (in `40ac455`): `EvidenceStore::admit_statement`
+accepts an optional witnessed `received_at`, persisted as a
+`<NN>-<kind>.received` sidecar (integer unix seconds; a
+hand-edited sidecar is refused at load). `trade_status` folds
+with the witnessed times and the wall clock, and both status
+commands print `PAYMENT OVERDUE` when the flag is set.
+`helper buyer verify` gained `--received-at <unix-seconds>` —
+harness/conversation tooling passes the marketplace message's
+receipt time; interactive use omits it.
+
+**The Q2 gap, recorded precisely (no silent approximation).**
+In H1 the only statement with an intake path is the assignment
+(`buyer verify`). Shipped and issue statements have **no**
+intake command yet — they arrive with H2's command set — so for
+those two classes no receipt time exists for the fold to
+consult today, and it falls back to signer dates exactly as
+pre-fix. The fold's receipt path is unit-proven with witnessed
+inputs; wiring it for shipped/issue is H2 work: each H2 intake
+command must record the receipt time the same way (the store
+machinery — admit parameter, sidecar, load — already carries
+any kind). Similarly, `load_events` can currently only
+reconstitute receipt times this helper itself recorded; a
+receipt time witnessed by the *other* party's helper reaches
+this fold only when an intake path carries it in.
+
+## Tasks 6+7 — verified admission, durable ledger (F4/F5, with F9/F10/F13 and F16's line) · `40ac455`
+
+**Held-set admission (F4).** `EvidenceStore::admit_statement`
+replaces `save_statement`'s optional signature: it parses the
+statement per kind, checks its trade id against the folder
+(assignments by digest — an assignment's id is its content
+digest; the existing H1 check), checks the signer's
+fingerprint against the expected party for the kind, and
+verifies the detached signature against the signer's pinned
+certificate — all before any byte is written. Expected parties:
+assignment/open/ack from the seller; shipped from the seller
+on `on_ship` and from the buyer on the prepay paths (direction
+decides — an assignment is required to know it, and its absence
+is a refusal); issue and refund-to from the buyer; settle and
+receipt from **either** party (deliberate: the protocol
+exchanges these between the parties and only one signature is
+held; a third party's is refused — pinned by test).
+`load_events` re-verifies the whole held set on every read
+(missing `.sig`, a foreign statement, a tampered byte are all
+errors, never skipped) and returns the timed events.
+`trade_status` now takes each trade's parties from *its own*
+assignment (the previous single-seller assumption is gone),
+folds per trade, and returns a `Result` per trade.
+
+**Ledger durability (F5).** `PoolLedger::load` errors on an
+unreadable `pool.json` (was: silent empty ledger). A new
+`load_for_assign` refuses a *missing* ledger over a store that
+holds any trade. `LedgerLock` (exclusive `.lock` file, bounded
+wait, a clear stale-lock message) spans load → seed → mark →
+save inside `seller assign`. `seed_from_batch_json` consults
+the evidence store before inserting: an address present in any
+stored assignment is never re-seeded, and if one is somehow
+already in the ledger as unused it is healed to used.
+
+**Helper correctness (F9/F10/F13, F16's line).** TOFU pinning of
+`--seller-cert` happens only after the fingerprint matches the
+assignment's `seller_fp` — a refused verify leaves no pin.
+Status prints unreadable trades as `ERROR: <reason>` lines
+instead of omitting them. `create_terms` and `create_assignment`
+parse every statement back before signing, and the assignment is
+parsed back again before its address is marked used. The
+success line is now "Assignment checks passed (signature,
+terms, destination, amount, expiry). Trade <id>".
+
+Eight new helper-core store tests: admit/load round trip with
+receipt times; refusals for a garbage signature, a buyer-signed
+ack, and a foreign-trade ack; either-party settle acceptance
+with third-party refusal; load refusals for a missing
+signature, a tampered statement, and a foreign statement;
+corrupt and missing ledger errors; seeding that never
+resurrects and heals; and four concurrent assigns over one
+store taking four distinct addresses under the lock.
+
+## Task 9 — spike evidence (OutProofV2) · `f8b32ee`
+
+**The checker port and the two transaction vectors could not
+be recovered.** The H1 report quotes only truncated prefixes of
+both txids/keys; the spike crate in-tree (`stage0-spike`) holds
+the RPC *client*, not the verdict port; and a search of file
+names and contents across the workspace, the build tree, and
+all git history and branches found neither artefact. Per the
+brief's fallback, the `proof.rs` construction is now behind
+the non-default cargo feature `proof-construction` in
+helper-core (the form checks stay default-on; no command
+reaches construction either way, as before — `verify_payment`
+still returns the explicit "lands in H2" error). Default and
+feature builds both pass 11/11. The spike verdict is unchanged
+and still limited: construction proven against a faithful port;
+**binary acceptance on a real stagenet node remains an open
+owner-side rig item**, and the tx-key proof path ships in no
+command until it passes there.
+
+## Task 8 — CLI integration tests · `4acfa4b`
+
+New `helper-cli/tests/cli_ht.rs` drives the real binary end to
+end: two inits, seller terms, a seller assign against a
+batch-seeded pool, buyer pin, a fully accepted verify asserting
+the new F16 line verbatim, and both status commands (buyer
+shows the assignment; seller lists the address used). A refused
+verify (wrong `--seller-cert`) leaves **no** pin, after which
+the correct cert pins and verifies. Off-platform terms at
+version 1 are refused by the CLI — the task-11 rule biting
+end-to-end (F13 evidence). 2/2.
+
+## Task 12 — wording and docs (F16/F17) · `73e38ad`
+
+`SELLER-GUIDE.md` and `sh/src/config.rs` now use the real
+command surface (`helper seller init|generate|check`); the
+guide's stale build path is corrected to `target/release/helper`
+(the only binary the workspace builds); the seller-helper
+manifest comment scopes the "no hand-rolled cryptography" claim
+to the v1 crate and names helper-core's tx-proof construction
+as the audited exception. Acceptance greps over the seller-helper
+tree return nothing for `seller-helper init|generate|check` or
+"Assignment verified"; the same greps over marketplace sources
+are also clean (historical report files quote the old strings
+as record and are not edited).
+
+## Task 5 — the three terms resources (F7) · `fa7526d`
+
+The canonical terms text now comes from one function
+(`listings::listing_terms_text_for`); the digest helper uses
+it, so the served text is byte-identical to what the statement
+digests. Three gated GET resources —
+`/listings/{id}/terms/statement`, `/terms/signature`,
+`/terms/text` — share the existing download's gate (exists →
+owner-only while unpublished → current pin required) via
+`terms_download_parts`; the combined `/terms` page is kept for
+back-compat. New app suite `ht_terms_files` (helper-core added
+as a test-only dev-dependency): downloads all three files for a
+published listing, asserts the gating (draft not served,
+owner-only until published, unpinned 404, unknown listing 404),
+asserts the check-3 chain (text hashes to the statement's
+stated digest; the statement parses; the signature verifies
+against the seller's certificate), and runs the real
+`helper_core::verify::verify_assignment` against an assignment
+built on exactly those downloaded files. `helper buyer verify`
+itself cannot be invoked from the marketplace workspace (it
+lives in the separate helper workspace); the acceptance is
+therefore evidenced as the app-side chain test here **plus**
+task 8's CLI suite, where the same verify code accepts
+end-to-end — the composition is the same code path the CLI
+runs (`verify::verify_assignment` is helper-core, shared).
+
+## Task 10 — publish-gate side doors (F14 + Q5) · `7d5ca43`
+
+Moderator restore now re-checks `terms_match_listing` when the
+pre-takedown status was `published`: a listing whose terms no
+longer pin (or never pinned) is restored to **`paused`**, not
+back to the shelf; the route's doc comment is updated to say
+so. Migration `0017_ht_pause_unpinned_listings.sql` pauses
+every currently-`published` listing with no current pin;
+taken-down rows are untouched (restore re-checks them), as
+are draft/paused rows. New suite `ht_publish_gate` (3/3):
+restore-without-pin lands on `paused`; restore with a matching
+pin (submitted through the real submit route) returns to
+`published`; and a migration test that builds a scratch
+database **from the migration files themselves**, seeds
+pre-H1-shaped rows (published-unpinned, published-pinned,
+removed, draft), applies only `0017`, and finds exactly the
+unpinned published row paused. The two `media_disputes_audit`
+assertions that encoded the old restore-to-published behaviour
+for unpinned listings were updated with F14 comments in this
+(non-locked) suite, assertions otherwise unchanged.
+
+**⚠ Locked-suite collision — owner attention required.** The
+LOCKED `blind_stage9` case
+`listing_removal_hides_from_browse_and_restore_returns_it`
+restores a published listing that has no terms pin and asserts
+it returns to browse. That is irreconcilable with F14 + Q5 as
+ratified: the fixture and a genuine pre-H1 listing are
+observationally identical, so any rule that pauses the
+pre-H1 listing pauses this one. The locked file was **not**
+edited. At the close-out gate `blind_stage9` stands at
+42 passed / 1 failed, failing at exactly that case's restore
+assertion (line 1484) and nothing else in the tree. The fix is
+process, not code: that one case needs blind re-authoring
+under the Q3 protocol (below) so the suite encodes the
+ratified behaviour (restore of an unpinned listing → paused,
+off the shelf) before H2's gate can be full-green.
+
+## Task 13a — invariant scoping (F8 + Q4) · `9eaa05e`
+
+`docs/invariants.md` gains a **Scope** section directly under
+its header: the amended (7)–(10) govern Hidden Trades; Direct
+Payments v1 keeps the pre-amendment (7)–(10) — quoted in full
+from the pre-amendment text — until v1's removal in stage H6;
+(11) is marked v1-scoped, which is what reconciles it with the
+amended (10) (they govern different coexisting systems). The
+foot amendment paragraph now points to the scope.
+`crates/domain/src/lib.rs`'s citation no longer states the v1
+(10) as if it were the whole rule. New guard suite
+`ht_invariants_scope` — brief-authored scaffolding under this
+reviewed fix brief (named `ht_`, not `blind_`, per Q3), now
+locked like every suite in that manifest — asserts the scope
+text is present in the doc and, on a freshly migrated
+database, that both systems' tables exist (v1
+`destinations`/`orders`/`invoices` alongside
+`listing_terms_statements`): the live-tree half that makes the
+scope line load-bearing. 2/2.
+
+## Q3 — process adoption for H2 (no code)
+
+Ratified and recorded: **locked suites get a separate blind
+author again.** The tasks-1–4 addendum's shortcut (no separate
+blind author for `modules_audit_fixes`-class reconciliations)
+is superseded for H2: every locked suite added or re-authored
+in H2 — including the `blind_stage9` restore case above — is
+written by a blind author from a plain-language assertion
+list, and the implementer does not see the assertions before
+the gate, exactly as in the stage protocol that produced the
+existing suites.
+
+## Close-out gate — tasks 5–13
+
+`run-gate.sh` was run with the same env shape as task 4 (plus
+the psql stand-in on PATH; see the environment note). Its
+`set -e` halted after the security phase on the one known
+failure, so the remaining phases were run with the script's
+own commands unchanged, plus a `--no-fail-fast` security pass
+so every security target is accounted on a freshly rebuilt
+database. Logs: `~/tmp-build/ht-h1-fix-gate/gate3.log`
+(SHA-256
+`be7772a658eef0c4f7440bc4c17c5eaec0a1c443a6c5c52bc21088c3ab1855e9`)
+and `~/tmp-build/ht-h1-fix-gate/gate3b.log` (SHA-256
+`31823a760279e665d5ba89cc4e2404918ee2500d343541b7b989841827b68432`)
+— **both hashes verified against the files on disk**
+(`sha256sum -c`), per the task-4 lesson.
+
+Phase 1 — security (fresh DB):
+
+| Target | Passed / Failed / Ignored |
+| --- | --- |
+| security_tests lib | 0 / 0 / 0 |
+| blind_direct_v1 | 42 / 0 / 0 |
+| blind_ht1 | 24 / 0 / 0 |
+| blind_stage1 | 41 / 0 / 0 |
+| blind_stage10 | 32 / 0 / 0 |
+| blind_stage2 | 38 / 0 / 0 |
+| blind_stage3 | 34 / 0 / 0 |
+| blind_stage4 | 58 / 0 / 6 |
+| blind_stage6 | 83 / 0 / 0 |
+| blind_stage9 | **42 / 1 / 0** (the collision above) |
+| ht_invariants_scope (task 13a, new) | 2 / 0 / 0 |
+| **Subtotal** | **396 / 1 / 6** |
+
+Phase 2 — workspace excluding security (rebuilt DB): **all
+green**. Deltas against task 4's table: domain lib 15 → 21
+(tasks 11, 13b); new `ht_terms_files` 2/0/0 (task 5); new
+`ht_publish_gate` 3/0/0 (task 10); `media_disputes_audit` still
+9/0/0 with the two F14 assertion updates; every other target
+identical to the task-4 table, including `blind_stage5` at the
+brief's named **35/0/3**. Subtotal **231 / 0 / 3**.
+
+Phase 3 — seller-helper workspace: helper bin 0; `cli_ht`
+(task 8, new) 2/0/0; `cli_init` 1/0/0; helper_core lib 3 → 11
+(tasks 6+7's store tests); seller_helper lib 17/0/0. Subtotal
+**31 / 0 / 0**.
+
+**Totals and reconciliation.** Marketplace: **627 passed / 1
+failed / 9 ignored**; seller-helper: **31 / 0 / 0**. Against
+the task-4 close-out (615/0/9 and 21/0/0): 13 new tests
+(domain +6, `ht_terms_files` +2, `ht_publish_gate` +3,
+`ht_invariants_scope` +2, helper-core +8, `cli_ht` +2 — of
+which the marketplace accounts for 13: 615 + 13 = 628 tests
+run, 627 passing) and exactly one new failure, the locked
+`blind_stage9` restore case, whose conflict with F14 + Q5 is
+documented above and in commit `7d5ca43`. No locked suite's
+assertions were edited anywhere in this batch; the only
+existing tests modified are the two `media_disputes_audit`
+(non-locked) restore assertions under F14, noted in task 10.
+
+**Open items handed forward:** (1) blind re-authoring of the
+one `blind_stage9` restore case under Q3; (2) H2 intake
+commands must record receipt times for shipped/issue (the
+fold machinery is ready); (3) the OutProofV2 binary-acceptance
+rig re-run remains owner-side, and the checker port + vectors
+remain unrecovered — if the rig session resurfaces them, they
+should be committed as helper-core tests and the
+`proof-construction` feature gate revisited; (4) settle/receipt
+either-party signing is a recorded design choice in
+`ExpectedSigners::for_kind` — if the spec intends a fixed
+signer for either, it is a one-line change plus its test.
