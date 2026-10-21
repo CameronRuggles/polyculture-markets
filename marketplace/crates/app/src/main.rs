@@ -7,7 +7,7 @@ async fn main() -> anyhow::Result<()> {
     // closed. A bad profile, an unknown network, or an unconfirmed
     // mainnet selection stops startup with the reason — the process
     // never runs under a configuration nobody chose (config.rs).
-    let instance = match app::config::InstanceConfig::from_env() {
+    let mut instance = match app::config::InstanceConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("configuration error: {e}");
@@ -63,6 +63,36 @@ async fn main() -> anyhow::Result<()> {
         app::keyfile::KeyFile::load_or_generate(std::path::Path::new(&key_path))
             .expect("marketplace key file must be readable or creatable")
     };
+    // HT H1 audit fix task 2 (F1): the Hidden Trades statement
+    // identity gets the key file's lifecycle. Unless the operator
+    // fixed it via HT_MARKETPLACE_ID, the value `resolve` produced
+    // is a fresh generation; it is replaced here by the persisted
+    // one — generated and stored on first boot in Development,
+    // required to already exist outside it. Minting a replacement
+    // silently would orphan every pinned terms statement and every
+    // configured helper on the instance: the AL1 failure class,
+    // one level up. Loaded before the pool opens, like the key
+    // file, so a refused start is deterministic.
+    if std::env::var_os("HT_MARKETPLACE_ID").is_none() {
+        let id_path = std::env::var("HT_ID_FILE_PATH").unwrap_or_else(|_| "marketplace.htid".into());
+        if instance.profile != app::config::Profile::Development {
+            match app::htid::load_existing(std::path::Path::new(&id_path)) {
+                Ok(id) => instance.ht_marketplace_id = id,
+                Err(e) => {
+                    eprintln!(
+                        "configuration error: cannot load HT marketplace id file at {id_path}: {e}; \
+                         refusing to start outside the development profile (a fresh id would \
+                         orphan every pinned terms statement)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            instance.ht_marketplace_id =
+                app::htid::load_or_generate(std::path::Path::new(&id_path))
+                    .expect("HT marketplace id file must be readable or creatable");
+        }
+    }
     let pool = PgPoolOptions::new().max_connections(8).connect(&url).await?;
     // Direct Payments v1: the marketplace_id is baked into every signed
     // payment message, so it must be short, stable, and permanent —

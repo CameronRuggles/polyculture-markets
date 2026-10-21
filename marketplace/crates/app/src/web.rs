@@ -1434,6 +1434,9 @@ struct SellerTpl {
     // Direct Payments v1 dashboard state.
     payment_seller_id: String,
     payment_marketplace_id: String,
+    /// HT H1 fix task 2 (F1): the instance's Hidden Trades
+    /// marketplace id — the value the HT helper's `init` copies.
+    ht_marketplace_id: String,
     payment_network: String,
     payment_primary: Option<String>,
     payment_unused: i64,
@@ -1511,6 +1514,7 @@ async fn seller_page(
         application_state,
         payment_seller_id,
         payment_marketplace_id: st.payments.marketplace_id.clone(),
+        ht_marketplace_id: st.instance.ht_marketplace_id.clone(),
         payment_network: crate::payments::network_name(st.payments.network).to_string(),
         payment_primary,
         payment_unused,
@@ -1817,7 +1821,12 @@ async fn terms_submit(
     // verified.
     let statement = normalize_crlf(&f.statement);
     let signature = normalize_crlf(&f.signature);
-    match lst::submit_terms(&st.pool, &st.payments.marketplace_id, &l, &statement, &signature).await {
+    // F1: HT statements pin the instance's permanent `mkt_` id
+    // (instance config) — never the v1 slug, which stays on the
+    // payments side for xmr-direct-v1 messages only. Before fix
+    // task 2 this call passed the slug and the statement parser
+    // refused every submission on a default-configured instance.
+    match lst::submit_terms(&st.pool, &st.instance.ht_marketplace_id, &l, &statement, &signature).await {
         Ok(_) => Redirect::to("/seller?pmsg=terms_saved").into_response(),
         Err(_) => Redirect::to("/seller?pmsg=terms_rejected").into_response(),
     }

@@ -3,6 +3,7 @@ pub mod config;
 pub mod retention;
 pub mod disputes;
 pub mod keyfile;
+pub mod htid;
 pub mod messages;
 pub mod moderation;
 pub mod reputation;

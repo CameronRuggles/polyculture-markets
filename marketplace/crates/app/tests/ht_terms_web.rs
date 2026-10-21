@@ -10,13 +10,16 @@
 //! signature whose line endings are CRLF throughout, and asserts the
 //! `terms_saved` redirect and exactly one pinned row.
 //!
-//! Scope note (audit F1): the marketplace id a default-configured
-//! instance hands this handler is still the v1 slug, which the
-//! statement family's `mkt_` rule refuses; that half of the
-//! end-to-end path awaits an owner decision and is NOT fixed here.
-//! This test therefore configures its AppState with a valid `mkt_`
-//! id (the same id the blind_ht1 router uses) so it isolates the
-//! CRLF behaviour alone.
+//! Scope note (audit F1): when this test was written, the
+//! marketplace id a default-configured instance handed this
+//! handler was still the v1 slug, which the statement family's
+//! `mkt_` rule refuses. Fix task 2 has since given the instance a
+//! real `mkt_` id of its own; this test pins its instance's HT id
+//! to the same fixed id the fixture signs against (the id the
+//! blind_ht1 router uses) so it continues to isolate the CRLF
+//! behaviour alone. The default-instance path — resolution minting
+//! the id, the handler using it — has its own test
+//! (ht_terms_default_instance.rs).
 //!
 //! DB tests require DATABASE_URL; skipped silently when unset, and
 //! the pool helper panics when it is set but unreachable (fix task
@@ -268,6 +271,10 @@ async fn test_server(pool: &PgPool) -> TestServer {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let key_path = dir.join("test.key");
+    // Fix task 2: the handler verifies against the instance's HT
+    // id; pin it to the fixture's id (see the scope note above).
+    let mut instance = app::config::InstanceConfig::resolve(&|_| None).expect("empty env resolves");
+    instance.ht_marketplace_id = MKT.into();
     let state = AppState {
         pool: pool.clone(),
         hash_guard: app::passwords::HashGuard::new(4),
@@ -281,7 +288,7 @@ async fn test_server(pool: &PgPool) -> TestServer {
         keyfile: Arc::new(app::keyfile::KeyFile::load_or_generate(&key_path).expect("key file")),
         stage9: app::reputation::Stage9Config::defaults(),
         retention: app::retention::RetentionConfig::defaults(),
-        instance: app::config::InstanceConfig::resolve(&|_| None).expect("empty env resolves"),
+        instance,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
