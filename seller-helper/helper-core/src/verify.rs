@@ -191,21 +191,38 @@ pub fn verify_assignment(inputs: &VerifyInputs) -> Result<VerifiedAssignment, Ve
     })
 }
 
+/// One row of [`trade_status`]: the trade id and its fold — or
+/// the error its held set produced. An unreadable trade is a row
+/// with an `Err`, never a missing row (audit F10).
+pub type TradeStatusRow = (String, Result<Option<domain::ht_fold::FoldedTrade>, String>);
+
 /// Fold every trade in the store (§6) — the data behind
-/// `helper buyer status` / `helper seller status`.
+/// `helper buyer status` / `helper seller status`. Each trade's
+/// held set is re-verified at load (audit F4): the parties come
+/// from the trade's own assignment, certificates resolve against
+/// `own_cert` (the holder's key) and the pins.
 pub fn trade_status(
     store: &crate::store::EvidenceStore,
     marketplace_id: &str,
     network: Network,
     now: &str,
-) -> Vec<(String, domain::ht_fold::FoldedTrade)> {
+    own_cert: Option<&std::path::Path>,
+) -> Vec<TradeStatusRow> {
     let mut out = Vec::new();
     for trade_id in store.trade_ids() {
-        if let Ok(events) = store.load_events(&trade_id, marketplace_id, network) {
-            if let Some(folded) = domain::ht_fold::fold_trade(&events, now) {
-                out.push((trade_id, folded));
-            }
-        }
+        let row = (|| -> Result<Option<domain::ht_fold::FoldedTrade>, String> {
+            let Some(assignment) = store.load_assignment(&trade_id, marketplace_id, network)?
+            else {
+                return Ok(None);
+            };
+            let expected = crate::store::ExpectedSigners {
+                seller_fpr: assignment.seller_key_fingerprint.clone(),
+                buyer_fpr: assignment.buyer_key_fingerprint.clone(),
+            };
+            let events = store.load_events(&trade_id, &expected, marketplace_id, network, own_cert)?;
+            Ok(domain::ht_fold::fold_trade_timed(&events, now))
+        })();
+        out.push((trade_id, row));
     }
     out
 }

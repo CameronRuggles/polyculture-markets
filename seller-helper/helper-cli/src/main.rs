@@ -45,6 +45,7 @@ USAGE:
   helper buyer pin <certificate-file>
   helper buyer verify --assignment FILE --terms FILE --terms-text FILE
                       [--seller-cert FILE] [--ceiling N --open-exposure N]
+                      [--received-at TS]
   helper buyer status
 
 Core commands take --core-config PATH (default
@@ -182,11 +183,18 @@ fn cmd_seller_assign(args: &legacy::Args) -> Result<(), String> {
     let terms_stmt = domain::ht_statements::parse_terms_statement(&saved.statement, &cfg.marketplace_id)
         .ok_or("the saved terms statement no longer parses")?;
     let pool_path = cfg.store_dir.join("pool.json");
-    let mut pool = PoolLedger::load(&pool_path);
+    // Ledger durability (audit F5): the lock spans load → seed →
+    // create_assignment (which marks the address used and saves);
+    // load_for_assign refuses a missing ledger over a store that
+    // already holds trades, and an unreadable ledger is a hard
+    // error — never an empty one.
+    let _ledger_lock = helper_core::store::LedgerLock::acquire(&pool_path)?;
+    let mut pool = PoolLedger::load_for_assign(&pool_path, &store)?;
     if let Some(batch) = args.flags.get("batch") {
         let raw = std::fs::read(batch).map_err(|e| format!("cannot read batch {batch}: {e}"))?;
-        let added = pool.seed_from_batch_json(&raw)?;
+        let added = pool.seed_from_batch_json(&raw, &store, &cfg.marketplace_id, network)?;
         println!("Seeded {added} new pool address(es) from the batch file.");
+        pool.save(&pool_path)?;
     }
     let amount_atomic = match flag_u64(args, "amount-atomic")? {
         Some(n) => n,
@@ -265,21 +273,44 @@ fn cmd_status(args: &legacy::Args) -> Result<(), String> {
     let network = cfg.network_enum().ok_or("helper config network is not a statement network name")?;
     let store = EvidenceStore::open(cfg.store_dir.clone())?;
     let now = helper_core::now_canonical();
-    let rows = helper_core::verify::trade_status(&store, &cfg.marketplace_id, network, &now);
+    let rows = helper_core::verify::trade_status(
+        &store,
+        &cfg.marketplace_id,
+        network,
+        &now,
+        Some(cfg.cert_file.as_path()),
+    );
     if rows.is_empty() {
         println!("No trades in the evidence store.");
         return Ok(());
     }
-    for (trade_id, f) in rows {
-        println!(
-            "{trade_id}  state={:?}  paid={} shipped={} terminal={}",
-            f.state, f.paid, f.shipped, f.terminal
-        );
-        if let Some(end) = &f.issue_window_ends {
-            println!("    issue window ends {end}");
-        }
-        if let Some(r) = f.refund_atomic {
-            println!("    settled refund: {r} atomic");
+    for (trade_id, row) in rows {
+        match row {
+            Ok(Some(f)) => {
+                println!(
+                    "{trade_id}  state={:?}  paid={} shipped={} terminal={}",
+                    f.state, f.paid, f.shipped, f.terminal
+                );
+                if let Some(end) = &f.issue_window_ends {
+                    println!("    issue window ends {end}");
+                }
+                if f.payment_overdue {
+                    println!(
+                        "    PAYMENT OVERDUE: pay-on-receipt terms, goods shipped, still unpaid past the assignment's payment date"
+                    );
+                }
+                if let Some(r) = f.refund_atomic {
+                    println!("    settled refund: {r} atomic");
+                }
+            }
+            Ok(None) => {
+                println!("{trade_id}  (no assignment held for this trade)");
+            }
+            Err(e) => {
+                // An unreadable trade is printed as an error, never
+                // silently skipped (audit F10).
+                println!("{trade_id}  ERROR: {e}");
+            }
         }
     }
     Ok(())
@@ -330,8 +361,11 @@ fn cmd_buyer_verify(args: &legacy::Args) -> Result<(), String> {
         .map_err(|_| "terms text is not text".to_string())?;
 
     // The seller's certificate: the pin, or an explicitly supplied
-    // certificate pinned on first use (TOFU, §14) after its
-    // fingerprint is shown.
+    // certificate pinned on first use (TOFU, §14) — pinned ONLY
+    // after its fingerprint is computed and matches the one the
+    // assignment names (audit F9: the pin write used to happen
+    // before the comparison, so a refused verify still left the
+    // wrong key pinned while the message claimed "not pinned").
     let fields = helper_core::verify::assignment_fields(
         std::str::from_utf8(&assignment).map_err(|_| "assignment is not text".to_string())?,
     )
@@ -341,13 +375,16 @@ fn cmd_buyer_verify(args: &legacy::Args) -> Result<(), String> {
         None => match args.flags.get("seller-cert") {
             Some(p) => {
                 let cert = std::fs::read(p).map_err(|e| format!("cannot read {p}: {e}"))?;
-                let fpr = store.pin_cert(&cert)?;
+                let fpr = helper_core::keys::fingerprint_of(&cert)
+                    .map_err(|e| format!("the supplied certificate is unusable: {e}"))?;
                 if fpr != fields.seller_key_fingerprint {
                     return Err(format!(
                         "the supplied certificate is {fpr}, but the assignment names {}: not pinned",
                         fields.seller_key_fingerprint
                     ));
                 }
+                let pinned = store.pin_cert(&cert)?;
+                debug_assert_eq!(pinned, fpr);
                 println!("Pinned the seller's key {fpr} on first use. Check it against a");
                 println!("fingerprint the seller published somewhere you trust before paying.");
                 cert
@@ -381,12 +418,33 @@ fn cmd_buyer_verify(args: &legacy::Args) -> Result<(), String> {
     };
     match helper_core::verify::verify_assignment(&inputs) {
         Ok(v) => {
-            store.save_statement(&v.trade_id, "assignment", &assignment, Some(&assignment_sig))?;
+            // Admission (audit F4): the verified assignment enters
+            // the held set through the store's verified door, with
+            // the receipt time the buyer recorded (owner decision
+            // Q2) when they pass one.
+            let expected = helper_core::store::ExpectedSigners {
+                seller_fpr: fields.seller_key_fingerprint.clone(),
+                buyer_fpr: inputs.own_fingerprint.clone(),
+            };
+            store.admit_statement(
+                &v.trade_id,
+                "assignment",
+                &assignment,
+                &assignment_sig,
+                &inputs.seller_cert,
+                &expected,
+                &cfg.marketplace_id,
+                network,
+                args.flags.get("received-at").map(String::as_str),
+            )?;
             for w in &v.warnings {
                 println!("WARNING: {w}");
             }
             let a = &v.assignment;
-            println!("Assignment verified. Trade {}", v.trade_id);
+            println!(
+                "Assignment checks passed (signature, terms, destination, amount, expiry). Trade {}",
+                v.trade_id
+            );
             println!("Pay {} XMR to {}", domain::Atomic(a.amount_atomic).format_decimal(), a.destination.as_str());
             println!("Payment proof message (exact): {}", domain::ht_statements::payment_proof_message(&v.trade_id));
             println!("The assignment is saved in your evidence store. Nothing has been paid yet:");

@@ -63,6 +63,20 @@ pub fn create_terms(
         },
     };
     let statement_text = String::from_utf8(statement.to_bytes()).expect("statement is ASCII");
+    // Parse-back before signing (audit F13): the composed statement
+    // must round-trip through the domain parser — the same parser
+    // the server pins with and the buyer's helper verifies with —
+    // so a statement this build's serializer emits but the parser
+    // refuses (e.g. an off-platform id with a nonzero version
+    // after the F11 rule) fails here, not at the counterparty.
+    let reparsed = ht_statements::parse_terms_statement(&statement_text, &inputs.marketplace_id)
+        .ok_or(
+            "the composed terms statement does not re-parse: check the listing id and version \
+             (off-platform terms are version 0; a listing's terms start at version 1)",
+        )?;
+    if reparsed.to_bytes() != statement.to_bytes() {
+        return Err("the composed terms statement does not round-trip through the parser".to_string());
+    }
     let signature = crate::keys::sign_detached(secret_key, passphrase, statement_text.as_bytes())?;
     Ok(SignedTerms {
         statement,
@@ -152,6 +166,18 @@ pub fn create_assignment(
     };
     let assignment_text = String::from_utf8(assignment.to_bytes()).expect("statement is ASCII");
     let trade_id = ht_statements::trade_id(assignment_text.as_bytes());
+    // Parse-back before signing and before the address is marked
+    // used (audit F13): both statements must round-trip through
+    // the domain parsers the counterparty's helper will use.
+    let reparsed = ht_statements::parse_assignment_statement(
+        &assignment_text,
+        &inputs.marketplace_id,
+        inputs.network,
+    )
+    .ok_or("the composed assignment does not re-parse")?;
+    if reparsed.to_bytes() != assignment.to_bytes() {
+        return Err("the composed assignment does not round-trip through the parser".to_string());
+    }
     let assignment_sig =
         crate::keys::sign_detached(secret_key, passphrase, assignment_text.as_bytes())?;
 
@@ -162,6 +188,9 @@ pub fn create_assignment(
         seller_key_fingerprint: inputs.seller_fingerprint.clone(),
     };
     let open_text = String::from_utf8(open.to_bytes()).expect("statement is ASCII");
+    if ht_statements::parse_open_token(&open_text, &inputs.marketplace_id).is_none() {
+        return Err("the composed open token does not re-parse".to_string());
+    }
     let open_sig = crate::keys::sign_detached(secret_key, passphrase, open_text.as_bytes())?;
 
     // Mark + persist the ledger BEFORE the statements are stored.
@@ -169,8 +198,36 @@ pub fn create_assignment(
     pool.mark_used(&destination_str, &trade_id)?;
     pool.save(pool_path)?;
 
-    store.save_statement(&trade_id, "assignment", assignment_text.as_bytes(), Some(&assignment_sig))?;
-    store.save_statement(&trade_id, "open", open_text.as_bytes(), Some(&open_sig))?;
+    // Admission (audit F4): the seller's own statements enter the
+    // held set through the same verified door as everyone else's.
+    // The secret cert doubles as the signer's certificate here —
+    // same key, same fingerprint.
+    let expected = crate::store::ExpectedSigners {
+        seller_fpr: inputs.seller_fingerprint.clone(),
+        buyer_fpr: inputs.buyer_fingerprint.clone(),
+    };
+    store.admit_statement(
+        &trade_id,
+        "assignment",
+        assignment_text.as_bytes(),
+        &assignment_sig,
+        secret_key,
+        &expected,
+        &inputs.marketplace_id,
+        inputs.network,
+        None,
+    )?;
+    store.admit_statement(
+        &trade_id,
+        "open",
+        open_text.as_bytes(),
+        &open_sig,
+        secret_key,
+        &expected,
+        &inputs.marketplace_id,
+        inputs.network,
+        None,
+    )?;
 
     Ok(SignedAssignment {
         destination: assignment.destination.as_str(),
