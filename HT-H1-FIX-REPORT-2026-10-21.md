@@ -189,3 +189,207 @@ the fix brief's remaining work (task 4's clean full gate cannot be
 green until this test is reconciled with the H1 terms gate — most
 likely by pinning terms in its setup, which becomes possible end
 to end once task 2 lands the `mkt_` id).
+
+---
+
+# Addendum — Tasks 2 and 4, and the BL1 publish-test reconciliation
+
+2026-10-21 (later). Scope: fix brief task 2 (F1, a real `mkt_`
+marketplace id — gated on owner question 1, answered: mint a
+separate permanent id, do NOT relax the parser), the reconciliation
+of the one failure recorded above, and fix brief task 4 (F15, run
+and record the full gate). Three commits on top of `0d1ecc1`, same
+branch; nothing pushed:
+
+- `664cf63` — task 2: the per-instance `mkt_` id (F1)
+- `eb30a7e` — reconciliation: the BL1 publish test completed for H1
+- `7f6bf3a` — task 4: run-gate.sh executes the brief's gate shape
+
+## Task 2 (F1) — a real `mkt_` marketplace id per instance
+
+**Design.** `InstanceConfig` gains `ht_marketplace_id` beside the
+v1 slug (`marketplace_id`, unchanged — it still feeds every
+`xmr-direct-v1` message via the payments config). Resolution
+(`config.rs`, still a pure function of the injected getter):
+
+- `HT_MARKETPLACE_ID` set: the value must already satisfy the
+  statement family's rule (`mkt_` + 32 lowercase hex, checked with
+  `modules_api::validate_public_id`) or resolution fails closed
+  with `InvalidValue` — the slug, a truncated id, uppercase hex,
+  and the empty string are all refused at startup instead of by
+  every statement parser forever.
+- Unset: a fresh id is generated (`mkt_` + 16 random bytes, hex).
+
+**Persistence.** `resolve` is stateless per process, so permanence
+follows the codebase's one existing generated-once mechanism: the
+key file's lifecycle (`keyfile.rs`, audit AL1). A new sibling
+module `htid.rs` (`load_existing` / `load_or_generate`, file
+created 0600 from creation) is wired into `main.rs` immediately
+after the key-file load, before the pool opens: when
+`HT_MARKETPLACE_ID` is not set, the resolved (fresh) value is
+replaced by the persisted one from `HT_ID_FILE_PATH` (default
+`marketplace.htid`) — generated and stored on first boot in the
+Development profile; outside Development the file must already
+exist, because silently minting a replacement would orphan every
+pinned terms statement and every configured helper on the
+instance, the AL1 failure class one level up. With the env
+override set, the file is neither read nor written. The id is not
+a secret (it is printed on the seller page); its integrity is
+what the file protects.
+
+**Use.** `terms_submit` now verifies against
+`st.instance.ht_marketplace_id` (it previously passed the payments
+slug — the F1 defect). The seller page displays the HT id in a new
+"Signed terms (Hidden Trades)" block beside the terms forms,
+labelled as the value the helper's `init` copies, and explicitly
+as NOT the payments marketplace ID shown above it.
+
+**Acceptance** (the brief's, verbatim in effect): new test
+`marketplace/crates/app/tests/ht_terms_default_instance.rs` builds
+its AppState from `InstanceConfig::resolve` defaults only — the
+slug flows to payments untouched, no marketplace id value of
+either family appears as a literal in the file — and pins terms
+end to end through the POST route: (1) the minted id has the
+family shape and differs from the slug; (2) a valid statement
+naming the SLUG is refused (`terms_rejected`, zero rows) — the
+direct F1 regression assertion; (3) the same statement naming the
+minted id, submitted with CRLF line endings, is accepted
+(`terms_saved`, exactly one row) and the stored bytes parse under
+the HT id and not under the slug. Passes (1/0).
+
+Supporting changes, recorded: four new unit tests (config ×2 —
+default generation validity/distinctness, override strictness;
+htid ×2 — lifecycle/mode, strict parsing; app lib 54 → 58). The
+task-1 test `ht_terms_web.rs` had wired the fixture id through
+`PaymentConfig`, which the handler no longer reads; its harness
+now pins the resolved instance's `ht_marketplace_id` to the
+fixture id instead. Its assertions are unchanged and it still
+isolates the CRLF behaviour; its header's scope note was updated
+to say so.
+
+## Reconciliation — the BL1 publish test vs the H1 terms gate
+
+`modules_audit_fixes::publish_requires_payment_identity_and_unused_pool`
+(see "The one failure" above) is reconciled by completing its
+setup, not by weakening anything: after the payment identity and
+unused pool entry are in place and before the final publish
+attempt, the seller installs a fresh identity key (app layer, the
+established fixture pattern) and pins signed terms for the listing
+through the real `POST /listings/{id}/terms` route, signed against
+the test instance's minted HT id from task 2, asserting the
+`terms_saved` redirect. The publish handler's gate order (payment
+setup first, terms second) means the test's two refusal assertions
+still exercise the payment gate exactly as before; its payment
+assertions and the final success assertion are byte-for-byte
+unchanged, and no app code was touched — the gate is not bypassed
+anywhere. `TestServer` additionally carries the resolved
+instance's HT id for signing. Result: the whole
+`modules_audit_fixes` file passes 9/0 (was 8 passed / 1 failed).
+
+## Task 4 (F15) — the full gate, run and recorded
+
+`run-gate.sh` now executes the brief's shape exactly: preflight
+(DATABASE_URL unset or unreachable → exit 2; psql required), rebuild
+the database, `cargo test -p security-tests`, rebuild again,
+`cargo test --workspace --exclude security-tests`, then the
+seller-helper workspace. The rebuild drops and recreates the
+database and applies all 16 migrations; it refuses any database
+whose name does not contain `dev`, because the script drops a
+database. The script runs under `set -eu`, so every cargo
+invocation's own exit code gates the run: any non-zero aborts
+before `gate: PASS`.
+
+**A defect the first run exposed (recorded, then fixed).** The
+first full run under the new shape (log `gate.log`, SHA-256
+`5029876b3486d8157a9ea53a70321f8b1e828b1f7e249ea1f853d8796fcdac90`)
+was green on the marketplace side (615/0/9, per-target identical
+to the recorded run below) — but its helper step silently ran
+only 17 of the helper workspace's 21 tests: seller-helper's root
+manifest is a package as well as its workspace root, so the
+script's bare `cargo test --manifest-path seller-helper/Cargo.toml`
+tested the root package only and `helper-core`/`helper-cli` never
+ran, while the script still printed PASS. That is F3's failure
+class inside the gate script itself, and it is why the run below,
+not the first, is the recorded gate. The step now passes
+`--workspace` (commit `7f6bf3a`). The marketplace root is a virtual
+manifest; its invocations never had this default.
+
+**The recorded gate** — environment as for tasks 1+3, plus
+`TMPDIR=$HOME/tmp-gate` on the real filesystem (the F3 report's
+environment note). One run of `./run-gate.sh`; log at
+`~/tmp-build/ht-h1-fix-gate/gate2.log`, **SHA-256
+`52fc78848d5fdd8db23906b42e8f3e0c5f23619e4c99d66187e59b12454ff374`**;
+final lines `gate: PASS` and `GATE_EXIT_CODE=0`.
+
+Phase 1 — `cargo test -p security-tests` (fresh DB):
+
+| Target | Passed / Failed / Ignored |
+| --- | --- |
+| security_tests lib | 0 / 0 / 0 |
+| blind_direct_v1 | 42 / 0 / 0 |
+| blind_ht1 | 24 / 0 / 0 |
+| blind_stage1 | 41 / 0 / 0 |
+| blind_stage10 | 32 / 0 / 0 |
+| blind_stage2 | 38 / 0 / 0 |
+| blind_stage3 | 34 / 0 / 0 |
+| blind_stage4 | 58 / 0 / 6 |
+| blind_stage6 | 83 / 0 / 0 |
+| blind_stage9 | 43 / 0 / 0 |
+| doc-tests | 0 / 0 / 0 |
+| **Subtotal** | **395 / 0 / 6** |
+
+Phase 2 — `cargo test --workspace --exclude security-tests`
+(rebuilt DB):
+
+| Target | Passed / Failed / Ignored |
+| --- | --- |
+| app lib | 58 / 0 / 0 |
+| app main | 0 / 0 / 0 |
+| account_security | 14 / 0 / 0 |
+| audit_fix_tasks | 4 / 0 / 0 |
+| dispute_signature | 1 / 0 / 0 |
+| ht_terms_default_instance (task 2, new) | 1 / 0 / 0 |
+| ht_terms_web (task 1) | 1 / 0 / 0 |
+| media_disputes_audit | 9 / 0 / 0 |
+| media_serve_http | 1 / 0 / 0 |
+| media_verification | 6 / 0 / 0 |
+| messaging_audit | 9 / 0 / 0 |
+| modules_audit_fixes (reconciled) | 9 / 0 / 0 |
+| payments_db | 11 / 0 / 0 |
+| stage1_db | 1 / 0 / 0 |
+| tx_proof_flow | 20 / 0 / 0 |
+| verification_fixes | 10 / 0 / 0 |
+| domain lib | 15 / 0 / 0 |
+| envelope lib | 7 / 0 / 0 |
+| blind_stage5 | **35 / 0 / 3** |
+| media_worker main | 0 / 0 / 0 |
+| modules_api lib | 8 / 0 / 0 |
+| doc-tests (app, domain, envelope, modules_api) | 0 / 0 / 0 |
+| **Subtotal** | **220 / 0 / 3** |
+
+Phase 3 — `cargo test --manifest-path seller-helper/Cargo.toml
+--workspace`:
+
+| Target | Passed / Failed / Ignored |
+| --- | --- |
+| helper (bin) unittests | 0 / 0 / 0 |
+| helper-cli tests/cli_init | 1 / 0 / 0 |
+| helper_core lib | 3 / 0 / 0 |
+| seller_helper lib | 17 / 0 / 0 |
+| doc-tests | 0 / 0 / 0 |
+| **Subtotal** | **21 / 0 / 0** |
+
+**Totals and reconciliation.** Marketplace workspace:
+**615 passed / 0 failed / 9 ignored**; seller-helper workspace:
+**21 / 0 / 0**; grand total 636 / 0 / 9. Against the audit's
+counting statement (the corrected post-H1 baseline at `d21c523`:
+609/0/9 marketplace, 21/0/0 helper): 609 + 1 (task 1's
+`ht_terms_web`) + 1 (task 2's `ht_terms_default_instance`) + 4
+(task 2's unit tests: config ×2, htid ×2) = **615** exactly; the
+ignored count is unchanged at 9 (blind_stage4's 6 + blind_stage5's
+3); `blind_stage5` runs at the brief's named **35/0/3**; the
+helper total matches the audit's static 21 with every member's
+targets actually executed this time. No locked suite was edited;
+no assertion anywhere was changed to reach green — the only test
+modified in this addendum is the reconciled BL1 publish test,
+whose setup grew and whose assertions did not move.
