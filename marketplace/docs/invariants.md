@@ -3,6 +3,24 @@
 Changes to this file require the owner's review (spec §22). Each invariant has
 at least one locked test in `tests/security/`.
 
+**Scope (owner decision Q4, 2026-10-21).** The amended invariants (7)–(10)
+below govern **Hidden Trades**. Direct Payments v1 — which still runs on
+this tree — keeps the pre-amendment (7)–(10) until v1's removal in build
+stage H6: under v1, (7) every invoice destination is a Monero subaddress on
+the configured network, parsed with a maintained Monero library in the
+order decode/checksum → network → kind → torsion-free keys, with primary
+and integrated addresses rejected; (8) no destination is ever assigned to
+more than one invoice (unique constraint, one global `destinations`
+table); (9) a destination is stored only after the core verifies a seller
+signature binding it to the seller's pinned key and cross-checks it with
+the wallet-RPC `validate_address` second parser, disagreement meaning
+reject + security event; (10) only the core changes order/invoice state,
+through the §9 transition tables. Invariant (11) belongs to that v1 scope:
+it speaks of orders and Paid, which are v1 concepts — under Hidden Trades
+there is no server-side order for a payment report to move. Read with this
+scoping, the amended (9)/(10) and (11) do not contradict each other: they
+govern different systems that coexist on the tree until H6.
+
 **Funds.** The marketplace never: (1) generates, imports, or stores a spending
 key; (2) receives purchase funds into an address it controls; (3) keeps customer
 balances; (4) signs or relays payment transactions; (5) deducts fees from
@@ -51,4 +69,5 @@ is strict.
 the Alpha build spec's §17 (the owner-reviewed amendment, spec §0/§17):
 (7), (8), (9), (10) and (15) amended as above. The remaining §17 amendments
 and additions — (11), (12), (18) and (22)–(30) — lock in their named stages
-(H2–H4) and are not enacted here.
+(H2–H4) and are not enacted here. (Scope of the amended rows: see the
+Scope paragraph at the top of this file — owner decision Q4, 2026-10-21.)

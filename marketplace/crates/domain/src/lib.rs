@@ -1,6 +1,9 @@
 //! domain — state machines, money, and canonical statements (spec §9, §10).
-//! Only the core changes state, and only through these transition tables
-//! (spec §3 invariant 10).
+//! Only the core changes v1 order/invoice state, and only through these
+//! transition tables (spec §3 invariant 10, v1 scope). Hidden Trades state
+//! is computed by the helpers from signed statements with the shared fold
+//! in this crate (the amended invariant (10), scoped to Hidden Trades —
+//! see docs/invariants.md, Scope paragraph, owner decision Q4 2026-10-21).
 
 pub mod ht_fold;
 pub mod ht_statements;
