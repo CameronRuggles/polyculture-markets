@@ -738,11 +738,12 @@ Phase 3 — seller-helper workspace: helper bin 0; `cli_ht`
 
 **Totals and reconciliation.** Marketplace: **627 passed / 1
 failed / 9 ignored**; seller-helper: **31 / 0 / 0**. Against
-the task-4 close-out (615/0/9 and 21/0/0): 13 new tests
-(domain +6, `ht_terms_files` +2, `ht_publish_gate` +3,
-`ht_invariants_scope` +2, helper-core +8, `cli_ht` +2 — of
-which the marketplace accounts for 13: 615 + 13 = 628 tests
-run, 627 passing) and exactly one new failure, the locked
+the task-4 close-out (615/0/9 and 21/0/0): the marketplace
+gains 13 new tests (domain +6, `ht_terms_files` +2,
+`ht_publish_gate` +3, `ht_invariants_scope` +2 — 615 + 13 =
+628 tests run, 627 passing) and the helper gains 10
+(helper-core +8, `cli_ht` +2 — 21 + 10 = 31), and there is
+exactly one new failure, the locked
 `blind_stage9` restore case, whose conflict with F14 + Q5 is
 documented above and in commit `7d5ca43`. No locked suite's
 assertions were edited anywhere in this batch; the only
