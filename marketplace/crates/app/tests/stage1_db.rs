@@ -9,11 +9,13 @@ use time::OffsetDateTime;
 
 async fn pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .ok()
+    Some(
+        PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .expect("DATABASE_URL is set but the database is unreachable"),
+    )
 }
 
 #[tokio::test]

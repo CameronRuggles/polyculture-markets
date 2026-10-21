@@ -49,7 +49,7 @@ const CSRF: &str = "mediadisp-csrf";
 
 async fn pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    PgPoolOptions::new().max_connections(8).connect(&url).await.ok()
+    Some(PgPoolOptions::new().max_connections(8).connect(&url).await.expect("DATABASE_URL is set but the database is unreachable"))
 }
 
 fn uniq() -> String {

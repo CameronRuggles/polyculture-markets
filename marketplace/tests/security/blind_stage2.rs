@@ -774,7 +774,11 @@ use sqlx::Row;
 
 async fn connect() -> Option<sqlx::PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    sqlx::PgPool::connect(&url).await.ok()
+    Some(
+        sqlx::PgPool::connect(&url)
+            .await
+            .expect("DATABASE_URL is set but the database is unreachable"),
+    )
 }
 
 fn unique_seq(tag: u64) -> u64 {

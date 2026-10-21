@@ -171,11 +171,13 @@ const EXTRA: &[&str] = &[
 
 async fn pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    PgPoolOptions::new()
-        .max_connections(24)
-        .connect(&url)
-        .await
-        .ok()
+    Some(
+        PgPoolOptions::new()
+            .max_connections(24)
+            .connect(&url)
+            .await
+            .expect("DATABASE_URL is set but the database is unreachable"),
+    )
 }
 
 fn cfg() -> PaymentConfig {
@@ -479,24 +481,24 @@ async fn guard_pool() -> Option<PgPool> {
         .max_connections(2)
         .connect(&format!("{root}/postgres"))
         .await
-        .ok()?;
+        .expect("DATABASE_URL is set but the database is unreachable");
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'marketplace_fix_guard')",
     )
     .fetch_one(&admin)
     .await
-    .ok()?;
+    .expect("guard database existence check failed");
     if !exists {
         sqlx::query("CREATE DATABASE marketplace_fix_guard")
             .execute(&admin)
             .await
-            .ok()?;
+            .expect("create guard database");
     }
     let pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&format!("{root}/marketplace_fix_guard"))
         .await
-        .ok()?;
+        .expect("DATABASE_URL is set but the guard database is unreachable");
     // The three tables the guard reads, with the migration-0008
     // columns it touches.
     for ddl in [
@@ -532,7 +534,10 @@ async fn guard_pool() -> Option<PgPool> {
         "DELETE FROM payment_batches",
         "DELETE FROM payment_identities",
     ] {
-        sqlx::query(ddl).execute(&pool).await.ok()?;
+        sqlx::query(ddl)
+            .execute(&pool)
+            .await
+            .expect("guard database setup failed");
     }
     Some(pool)
 }

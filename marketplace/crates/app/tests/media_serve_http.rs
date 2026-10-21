@@ -52,7 +52,11 @@ async fn get(addr: std::net::SocketAddr, path: &str) -> (u16, Vec<(String, Strin
 async fn stored_image_is_served_end_to_end() {
     let Ok(url) = std::env::var("DATABASE_URL") else { return };
     let Ok(worker) = std::env::var("MEDIA_WORKER") else { return };
-    let Ok(pool) = PgPoolOptions::new().max_connections(4).connect(&url).await else { return };
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("DATABASE_URL is set but the database is unreachable");
 
     // Unique temp media dir for this test run.
     let mut dir = std::env::temp_dir();
