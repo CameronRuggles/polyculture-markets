@@ -1810,7 +1810,14 @@ async fn terms_submit(
     if l.seller_id != sess.account_id {
         return (StatusCode::FORBIDDEN, "Not your listing").into_response();
     }
-    match lst::submit_terms(&st.pool, &st.payments.marketplace_id, &l, &f.statement, &f.signature).await {
+    // MH1 class (audit F2): the statement parser admits LF only and
+    // verifies byte-exact, and browsers submit textarea content with
+    // CRLF line endings — normalize at the handler boundary, as every
+    // other paste handler does, so what is stored is exactly what was
+    // verified.
+    let statement = normalize_crlf(&f.statement);
+    let signature = normalize_crlf(&f.signature);
+    match lst::submit_terms(&st.pool, &st.payments.marketplace_id, &l, &statement, &signature).await {
         Ok(_) => Redirect::to("/seller?pmsg=terms_saved").into_response(),
         Err(_) => Redirect::to("/seller?pmsg=terms_rejected").into_response(),
     }
