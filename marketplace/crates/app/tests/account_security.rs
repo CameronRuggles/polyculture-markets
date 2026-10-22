@@ -1335,14 +1335,16 @@ fn production_profile_fails_closed() {
     // the server starts.
     //
     // HT H2 first batch task 7 (re-verification N6): the control
-    // also points HT_ID_FILE_PATH away from the crate directory —
-    // taken from the environment when one is provided, else this
-    // test's own temp dir. Without it, every gate run minted a
-    // marketplace.htid into crates/app/ (the binary's CWD), an
-    // operator file leaking into the source tree.
-    let ht_id_path = std::env::var("HT_ID_FILE_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| dir.join("marketplace.htid"));
+    // also points HT_ID_FILE_PATH away from the crate directory.
+    // HT H2 fix batch E6 (audit 3): the path is this test's own
+    // temp dir UNCONDITIONALLY — an earlier shape honoured an
+    // ambient HT_ID_FILE_PATH from the environment, which made
+    // the run depend on the caller's shell and could write the
+    // id file anywhere the environment pointed. Without the
+    // redirect at all, every gate run minted a marketplace.htid
+    // into crates/app/ (the binary's CWD), an operator file
+    // leaking into the source tree.
+    let ht_id_path = dir.join("marketplace.htid");
     let mut child = {
         let mut c = std::process::Command::new(bin);
         c.env_clear()
