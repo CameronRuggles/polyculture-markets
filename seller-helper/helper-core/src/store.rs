@@ -26,7 +26,12 @@
 //! kind expects, and verified the signature. Loading re-verifies
 //! the whole set the same way: a held file that lost its signature,
 //! names another trade, or no longer verifies is an error the
-//! caller hears about, never a silent skip.
+//! caller hears about, never a silent skip. Settle and receipt
+//! are joint statements (§5/§6): each is held with one signature
+//! file per party (`<stem>.seller.sig`, `<stem>.buyer.sig`) and
+//! folds only when both parties' signatures are held and verify
+//! — a one-signature settle or receipt is a proposal, never a
+//! terminal state (re-verification N1).
 
 use domain::ht_fold::{PaymentRecord, TimedEvent, TradeEvent};
 use domain::ht_statements;
@@ -80,12 +85,23 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 pub enum ExpectedSigner {
     Seller,
     Buyer,
-    /// Settle and receipt may be signed by either party: settle is
-    /// "signed by whoever proposes it" (§6) and the receipt names
-    /// both parties, superseding the v1 "whoever closes" ambiguity
-    /// for the held set. Both are still checked to be ONE of the
-    /// two parties.
+    /// Settle and receipt are signed by BOTH parties (§5/§6):
+    /// settle is "signed by both parties" and for the receipt
+    /// "both parties sign the same bytes". An admission from
+    /// either party is therefore accepted — and checked to be
+    /// ONE of the two parties — but what it creates is only a
+    /// proposal: the statement completes, and may fold as a
+    /// terminal state, only once both parties' signatures are
+    /// held (re-verification finding N1).
     Either,
+}
+
+/// Statement kinds that complete only when BOTH parties have
+/// signed them (§5/§6; re-verification N1). They are held with
+/// one signature file per party (`<stem>.seller.sig`,
+/// `<stem>.buyer.sig`) beside the single statement file.
+fn is_joint_kind(kind: &str) -> bool {
+    matches!(kind, "settle" | "receipt")
 }
 
 /// The trade's two parties by key fingerprint. Admission and load
@@ -214,8 +230,11 @@ impl EvidenceStore {
     ///   the folder's id);
     /// - `signer_cert`'s fingerprint is the party `expected` names
     ///   for this kind (shipped is direction-dependent: `out` is the
-    ///   seller's, `return` the buyer's; settle and receipt may
-    ///   come from either party);
+    ///   seller's, `return` the buyer's; settle and receipt are
+    ///   JOINT — an admit from either party is held as that party's
+    ///   signature on the statement, and the statement completes
+    ///   only when both parties' signatures are held,
+    ///   re-verification N1);
     /// - the detached signature verifies against that certificate.
     ///
     /// `received_at`, when the holder recorded one, is the
@@ -282,6 +301,17 @@ impl EvidenceStore {
                 ));
             }
         }
+        if is_joint_kind(kind) {
+            return self.admit_joint_statement(
+                trade_id,
+                kind,
+                statement,
+                signature,
+                &signer_fpr,
+                expected,
+                received_at,
+            );
+        }
         let seq = self.next_seq(trade_id)?;
         let base = self.trade_dir(trade_id).join(format!("{seq:02}-{kind}"));
         write_atomic(&base.with_extension("txt"), statement)?;
@@ -291,6 +321,84 @@ impl EvidenceStore {
                 .trade_dir(trade_id)
                 .join(format!("{seq:02}-{kind}.received"));
             write_atomic(&received_path, ts.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Hold one party's signature on a JOINT statement (settle /
+    /// receipt — see [`is_joint_kind`]). The statement bytes are
+    /// stored once, with the first signature; a later admit of
+    /// the SAME bytes by the other party adds their
+    /// `<stem>.<party>.sig` beside it, and re-admitting a
+    /// signature that is already held is a no-op. An admit of
+    /// DIFFERENT bytes under the same kind is a separate proposal
+    /// with its own sequence number: two competing settles can
+    /// both be held, and held order decides which completed one
+    /// the fold reaches first. Every check in
+    /// [`EvidenceStore::admit_statement`] (parse, trade-id,
+    /// party, signature) has already run for the presented
+    /// signature before this is called; the received-at sidecar
+    /// is written when the statement is first held.
+    fn admit_joint_statement(
+        &self,
+        trade_id: &str,
+        kind: &str,
+        statement: &[u8],
+        signature: &str,
+        signer_fpr: &str,
+        expected: &ExpectedSigners,
+        received_at: Option<&str>,
+    ) -> Result<(), String> {
+        let party = if signer_fpr == expected.seller_fpr {
+            "seller"
+        } else {
+            "buyer"
+        };
+        let dir = self.trade_dir(trade_id);
+        if dir.is_dir() {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .map_err(|e| e.to_string())?
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            for name in names {
+                if name.starts_with('.') {
+                    continue;
+                }
+                let Some(stem) = name.strip_suffix(".txt") else {
+                    continue;
+                };
+                let Some((_, held_kind)) = stem.split_once('-') else {
+                    continue;
+                };
+                if held_kind != kind {
+                    continue;
+                }
+                let held = std::fs::read(dir.join(&name)).map_err(|e| e.to_string())?;
+                if held == statement {
+                    let sig_path = dir.join(format!("{stem}.{party}.sig"));
+                    if !sig_path.exists() {
+                        write_atomic(&sig_path, signature.as_bytes())?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        let seq = self.next_seq(trade_id)?;
+        write_atomic(
+            &dir.join(format!("{seq:02}-{kind}.txt")),
+            statement,
+        )?;
+        write_atomic(
+            &dir.join(format!("{seq:02}-{kind}.{party}.sig")),
+            signature.as_bytes(),
+        )?;
+        if let Some(ts) = received_at {
+            write_atomic(
+                &dir.join(format!("{seq:02}-{kind}.received")),
+                ts.as_bytes(),
+            )?;
         }
         Ok(())
     }
@@ -380,7 +488,11 @@ impl EvidenceStore {
     /// the certificate of the party its kind expects — resolved
     /// from `own_cert` when that is the signer's key, else from
     /// the pins. Any failure is an error the caller hears about;
-    /// an unverifiable held set never folds. Returns the events as
+    /// an unverifiable held set never folds. For the joint kinds
+    /// (settle, receipt) the set is complete only when both
+    /// parties' signatures are held and verify; a one-signature
+    /// settle or receipt loads as a proposal and yields no fold
+    /// event (re-verification N1). Returns the events as
     /// [`TimedEvent`]s carrying each statement's recorded receipt
     /// time for the fold (owner decision Q2).
     pub fn load_events(
@@ -439,11 +551,6 @@ impl EvidenceStore {
                 continue; // not a statement kind this build knows
             }
             let stem = name.strip_suffix(".txt").unwrap_or_default();
-            let sig = std::fs::read_to_string(dir.join(format!("{stem}.sig"))).map_err(|_| {
-                format!(
-                    "{name} is held without its signature ({stem}.sig is missing): the held set is not trusted"
-                )
-            })?;
             let text = String::from_utf8(raw)
                 .map_err(|_| format!("stored {kind} in {name} is not UTF-8"))?;
             let (carried_id, role, event) =
@@ -461,34 +568,52 @@ impl EvidenceStore {
                     "{name}'s digest is not this trade's id ({trade_id}): the held set is not trusted"
                 ));
             }
-            let candidates: Vec<&str> = match role {
-                ExpectedSigner::Seller => vec![expected.seller_fpr.as_str()],
-                ExpectedSigner::Buyer => vec![expected.buyer_fpr.as_str()],
-                ExpectedSigner::Either => {
-                    vec![expected.seller_fpr.as_str(), expected.buyer_fpr.as_str()]
-                }
-            };
-            let mut verified = false;
-            let mut resolve_error: Option<String> = None;
-            for fpr in candidates {
-                match self.resolve_cert(fpr, own_cert) {
-                    Ok(cert) => {
-                        if crate::keys::verify_detached(&cert, text.as_bytes(), sig.as_bytes()) {
-                            verified = true;
-                            break;
-                        }
+            // Signature evidence. An ordinary kind holds one
+            // detached signature from its expected party. A JOINT
+            // kind (settle, receipt) holds one signature PER
+            // PARTY and is complete — allowed to reach the fold —
+            // only when both parties' signatures are held and
+            // verify (re-verification N1): a one-signature settle
+            // or receipt loads as a proposal and yields no event.
+            let complete = if is_joint_kind(kind) {
+                self.joint_signature_state(&dir, stem, &name, &text, expected, own_cert)?
+            } else {
+                let sig = std::fs::read_to_string(dir.join(format!("{stem}.sig"))).map_err(|_| {
+                    format!(
+                        "{name} is held without its signature ({stem}.sig is missing): the held set is not trusted"
+                    )
+                })?;
+                let candidates: Vec<&str> = match role {
+                    ExpectedSigner::Seller => vec![expected.seller_fpr.as_str()],
+                    ExpectedSigner::Buyer => vec![expected.buyer_fpr.as_str()],
+                    ExpectedSigner::Either => {
+                        vec![expected.seller_fpr.as_str(), expected.buyer_fpr.as_str()]
                     }
-                    Err(e) => resolve_error = Some(e),
+                };
+                let mut verified = false;
+                let mut resolve_error: Option<String> = None;
+                for fpr in candidates {
+                    match self.resolve_cert(fpr, own_cert) {
+                        Ok(cert) => {
+                            if crate::keys::verify_detached(&cert, text.as_bytes(), sig.as_bytes())
+                            {
+                                verified = true;
+                                break;
+                            }
+                        }
+                        Err(e) => resolve_error = Some(e),
+                    }
                 }
-            }
-            if !verified {
-                let detail = resolve_error
-                    .map(|e| format!(" ({e})"))
-                    .unwrap_or_default();
-                return Err(format!(
-                    "{name}'s signature does not verify against the pinned certificate of its expected signer{detail}: the held set is not trusted"
-                ));
-            }
+                if !verified {
+                    let detail = resolve_error
+                        .map(|e| format!(" ({e})"))
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "{name}'s signature does not verify against the pinned certificate of its expected signer{detail}: the held set is not trusted"
+                    ));
+                }
+                true
+            };
             let received_at = match std::fs::read_to_string(dir.join(format!("{stem}.received"))) {
                 Ok(raw) => {
                     let ts = raw.trim_end().to_string();
@@ -502,11 +627,100 @@ impl EvidenceStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(format!("cannot read {stem}.received: {e}")),
             };
-            if let Some(event) = event {
-                events.push(TimedEvent { event, received_at });
+            if complete {
+                if let Some(event) = event {
+                    events.push(TimedEvent { event, received_at });
+                }
             }
         }
         Ok(events)
+    }
+
+    /// The signature state of a held JOINT statement (settle /
+    /// receipt) at load. Returns `Ok(true)` when BOTH parties'
+    /// signatures are held and verify — only then may the
+    /// statement reach the fold as a terminal state — and
+    /// `Ok(false)` when it is a one-signature proposal. A
+    /// signature file that is present but does not verify, or
+    /// whose signer's certificate cannot be resolved, is an
+    /// error, as is a statement with no signature file at all:
+    /// a proposal is a legitimate held state, an unverifiable
+    /// one is not.
+    ///
+    /// Signature files: `<stem>.seller.sig` and
+    /// `<stem>.buyer.sig` (the joint shape), plus a legacy
+    /// `<stem>.sig` written before the joint shape existed —
+    /// counted as the evidence of whichever party it verifies
+    /// against, so an old one-signature hold loads as exactly
+    /// what it is: a proposal, never a terminal state.
+    fn joint_signature_state(
+        &self,
+        dir: &Path,
+        stem: &str,
+        name: &str,
+        text: &str,
+        expected: &ExpectedSigners,
+        own_cert: Option<&Path>,
+    ) -> Result<bool, String> {
+        let mut seller_signed = false;
+        let mut buyer_signed = false;
+        let mut any_signature = false;
+        for (party, fpr, slot) in [
+            ("seller", expected.seller_fpr.as_str(), &mut seller_signed),
+            ("buyer", expected.buyer_fpr.as_str(), &mut buyer_signed),
+        ] {
+            let path = dir.join(format!("{stem}.{party}.sig"));
+            if !path.exists() {
+                continue;
+            }
+            any_signature = true;
+            let sig = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let cert = self.resolve_cert(fpr, own_cert).map_err(|e| {
+                format!(
+                    "{name}'s {party} signature cannot be checked ({e}): the held set is not trusted"
+                )
+            })?;
+            if !crate::keys::verify_detached(&cert, text.as_bytes(), sig.as_bytes()) {
+                return Err(format!(
+                    "{name}'s {party} signature does not verify against that party's pinned certificate: the held set is not trusted"
+                ));
+            }
+            *slot = true;
+        }
+        let legacy = dir.join(format!("{stem}.sig"));
+        if legacy.exists() {
+            any_signature = true;
+            let sig = std::fs::read_to_string(&legacy)
+                .map_err(|e| format!("cannot read {}: {e}", legacy.display()))?;
+            let mut counted = false;
+            for (fpr, slot) in [
+                (expected.seller_fpr.as_str(), &mut seller_signed),
+                (expected.buyer_fpr.as_str(), &mut buyer_signed),
+            ] {
+                if *slot {
+                    continue;
+                }
+                if let Ok(cert) = self.resolve_cert(fpr, own_cert) {
+                    if crate::keys::verify_detached(&cert, text.as_bytes(), sig.as_bytes()) {
+                        *slot = true;
+                        counted = true;
+                        break;
+                    }
+                }
+            }
+            if !counted && !(seller_signed && buyer_signed) {
+                return Err(format!(
+                    "{name}'s signature does not verify against either party's pinned certificate: the held set is not trusted"
+                ));
+            }
+        }
+        if !any_signature {
+            return Err(format!(
+                "{name} is held without its signature ({stem}.seller.sig and {stem}.buyer.sig are both missing): the held set is not trusted"
+            ));
+        }
+        Ok(seller_signed && buyer_signed)
     }
 }
 
@@ -859,8 +1073,10 @@ mod tests {
     /// A store holding one fully-admitted trade (assignment, ack,
     /// shipped, issue, receipt, payment), with the buyer's cert
     /// pinned and the seller's cert written next to the store as
-    /// the "own cert". Returns (root, store, parties, trade_id,
-    /// own_cert_path).
+    /// the "own cert". The receipt is countersigned by the buyer:
+    /// a joint statement is complete only with both parties'
+    /// signatures (re-verification N1). Returns (root, store,
+    /// parties, trade_id, own_cert_path).
     fn held_trade(tag: &str) -> (PathBuf, EvidenceStore, Parties, String, PathBuf) {
         let root = temp_root(tag);
         let store = EvidenceStore::open(root.clone()).expect("store");
@@ -905,6 +1121,7 @@ mod tests {
         }
         .to_bytes();
         admit("receipt", &receipt, &p.seller_sec, &p.seller_pub, None);
+        admit("receipt", &receipt, &p.buyer_sec, &p.buyer_pub, None);
         store
             .save_payment(&trade_id, &PaymentRecord { txid: "aa".repeat(32), proof: "OutProofV2:x".into() })
             .expect("payment");
@@ -972,10 +1189,12 @@ mod tests {
         assert!(err.contains("names trade"), "{err}");
     }
 
-    #[test]
-    fn admit_accepts_a_settle_from_either_party() {
-        let root = temp_root("settle-either");
-        let store = EvidenceStore::open(root).expect("store");
+    /// A store holding just an assignment (so joint-statement
+    /// tests start from a clean held set), with the buyer's cert
+    /// pinned and the seller's cert as the own cert.
+    fn store_with_assignment(tag: &str) -> (PathBuf, EvidenceStore, Parties, String, PathBuf) {
+        let root = temp_root(tag);
+        let store = EvidenceStore::open(root.clone()).expect("store");
         let p = parties();
         let assignment = assignment_bytes(&p, SUB_A);
         let trade_id = ht_statements::trade_id(&assignment);
@@ -983,25 +1202,156 @@ mod tests {
         store
             .admit_statement(&trade_id, "assignment", &assignment, &sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
             .expect("assignment admits");
-        let settle = SettleStatement {
+        store.pin_cert(&p.buyer_pub).expect("pin buyer");
+        let own_cert = root.join("own.asc");
+        std::fs::write(&own_cert, &p.seller_pub).expect("own cert");
+        (root, store, p, trade_id, own_cert)
+    }
+
+    fn settle_bytes(trade_id: &str) -> Vec<u8> {
+        SettleStatement {
             marketplace_id: MKT.into(),
-            trade_id: trade_id.clone(),
+            trade_id: trade_id.into(),
             refund_atomic: 1_000,
             return_required: false,
             month: "2026-11".into(),
         }
-        .to_bytes();
+        .to_bytes()
+    }
+
+    #[test]
+    fn settle_completes_only_with_both_parties_signatures() {
+        let (_root, store, p, trade_id, own_cert) = store_with_assignment("settle-joint");
+        let settle = settle_bytes(&trade_id);
+        // One party alone: the signature is HELD (a proposal),
+        // the load yields no settle event, and the fold cannot
+        // terminate on it (re-verification N1).
         let buyer_sig = sign(&p.buyer_sec, &settle);
         store
             .admit_statement(&trade_id, "settle", &settle, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
-            .expect("buyer-signed settle admits (either party)");
-        // A settle from a THIRD party still refuses.
+            .expect("one party's settle signature is held as a proposal");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("load with a settle proposal held");
+        assert!(
+            !events.iter().any(|t| matches!(t.event, TradeEvent::Settle(_))),
+            "a one-signature settle must not reach the fold"
+        );
+        let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
+        assert!(!folded.terminal, "a one-signature settle is never terminal");
+        // The other party countersigns the SAME bytes: complete.
+        let seller_sig = sign(&p.seller_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &seller_sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("countersignature admits");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("load completed settle");
+        assert!(
+            events.iter().any(|t| matches!(t.event, TradeEvent::Settle(_))),
+            "a two-signature settle reaches the fold"
+        );
+        let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
+        assert_eq!(folded.state, TradeState::Settled);
+        assert!(folded.terminal);
+        assert_eq!(folded.refund_atomic, Some(1_000));
+    }
+
+    #[test]
+    fn receipt_completes_only_with_both_parties_signatures() {
+        let (_root, store, p, trade_id, own_cert) = store_with_assignment("receipt-joint");
+        let receipt = ReceiptStatement {
+            marketplace_id: MKT.into(),
+            trade_id: trade_id.clone(),
+            seller_key_fingerprint: p.expected.seller_fpr.clone(),
+            buyer_key_fingerprint: p.expected.buyer_fpr.clone(),
+            month: "2026-11".into(),
+        }
+        .to_bytes();
+        // Seller signs alone: held as a proposal; the trade does
+        // not close.
+        let seller_sig = sign(&p.seller_sec, &receipt);
+        store
+            .admit_statement(&trade_id, "receipt", &receipt, &seller_sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("one party's receipt signature is held as a proposal");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("load with a receipt proposal held");
+        assert!(
+            !events.iter().any(|t| matches!(t.event, TradeEvent::Receipt(_))),
+            "a one-signature receipt must not reach the fold"
+        );
+        let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
+        assert_ne!(folded.state, TradeState::Closed);
+        assert!(!folded.terminal);
+        // The buyer countersigns the same bytes: the trade closes.
+        let buyer_sig = sign(&p.buyer_sec, &receipt);
+        store
+            .admit_statement(&trade_id, "receipt", &receipt, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("countersignature admits");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("load completed receipt");
+        assert!(
+            events.iter().any(|t| matches!(t.event, TradeEvent::Receipt(_))),
+            "a two-signature receipt reaches the fold"
+        );
+        let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
+        assert_eq!(folded.state, TradeState::Closed);
+        assert!(folded.terminal);
+    }
+
+    #[test]
+    fn joint_statement_from_a_third_party_is_refused_in_either_slot() {
+        let (_root, store, p, trade_id, _own_cert) = store_with_assignment("settle-third");
+        let settle = settle_bytes(&trade_id);
         let (third_sec, third_pub) = generate_test_cert("Third <t@example.com>").expect("third key");
+        // As the FIRST signature on a settle: refused.
         let third_sig = sign(&third_sec, &settle);
         let err = store
             .admit_statement(&trade_id, "settle", &settle, &third_sig, &third_pub, &p.expected, MKT, Network::Stagenet, None)
             .expect_err("third-party settle must refuse");
         assert!(err.contains("not the seller or buyer"), "{err}");
+        // As the COUNTERSIGNATURE on a held one-party settle:
+        // refused the same way.
+        let buyer_sig = sign(&p.buyer_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("buyer proposal held");
+        let err = store
+            .admit_statement(&trade_id, "settle", &settle, &third_sig, &third_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect_err("third-party countersignature must refuse");
+        assert!(err.contains("not the seller or buyer"), "{err}");
+    }
+
+    #[test]
+    fn load_reads_a_legacy_one_signature_settle_as_a_proposal() {
+        let (_root, store, p, trade_id, own_cert) = store_with_assignment("settle-legacy");
+        let settle = settle_bytes(&trade_id);
+        let dir = store.trade_dir(&trade_id);
+        // The pre-joint on-disk shape, placed by hand: one
+        // statement file, one unsuffixed signature (the seller's).
+        std::fs::write(dir.join("01-settle.txt"), &settle).expect("place settle");
+        std::fs::write(dir.join("01-settle.sig"), sign(&p.seller_sec, &settle)).expect("place sig");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("a legacy one-signature hold loads without error");
+        assert!(
+            !events.iter().any(|t| matches!(t.event, TradeEvent::Settle(_))),
+            "a legacy one-signature settle is a proposal, never terminal"
+        );
+        // But a per-party signature file that does not verify is
+        // refused at load, proposal or not.
+        std::fs::remove_file(dir.join("01-settle.sig")).expect("remove legacy sig");
+        std::fs::write(
+            dir.join("01-settle.seller.sig"),
+            "-----BEGIN PGP SIGNATURE-----\n\nAAAA\n-----END PGP SIGNATURE-----\n",
+        )
+        .expect("place bad sig");
+        let err = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect_err("a held signature that does not verify must refuse the load");
+        assert!(err.contains("does not verify"), "{err}");
     }
 
     #[test]
@@ -1010,11 +1360,15 @@ mod tests {
         {
             let (_root, store, p, trade_id, own_cert) = held_trade("load-unsigned");
             let dir = store.trade_dir(&trade_id);
-            // Remove the receipt's signature (the set is admitted
-            // and complete apart from this) and reload.
-            let sig = dir.join("04-receipt.sig");
-            assert!(sig.exists());
-            std::fs::remove_file(&sig).expect("remove sig");
+            // Remove the receipt's signatures — BOTH parties'
+            // files, since the receipt is a joint statement (the
+            // set is admitted and complete apart from this) — and
+            // reload.
+            for party in ["seller", "buyer"] {
+                let sig = dir.join(format!("04-receipt.{party}.sig"));
+                assert!(sig.exists(), "{party} signature held");
+                std::fs::remove_file(&sig).expect("remove sig");
+            }
             let err = store
                 .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
                 .expect_err("missing signature must refuse the load");
