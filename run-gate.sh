@@ -29,12 +29,18 @@ set -eu
 cd "$(dirname "$0")"
 
 # HT H2 first batch task 8 (re-verification N7): bind the run to
-# the tree it tests. The HEAD commit and the dirty-file count are
+# the tree it tests. The HEAD commit and the dirty counts are
 # printed before anything else, so a gate log — whose hash the
 # batch report records — can be tied to exactly one commit and
-# one clean/dirty state.
+# one clean/dirty state. HT H2 fix batch E8 (audit 3): the counts
+# are TRACKED changes and UNTRACKED files on separate lines —
+# the single lumped figure buried the signal it exists for (the
+# first batch's log recorded 27 before and after, while a
+# tracked file was modified mid-batch and the count did not move
+# at all).
 echo "gate tree: HEAD $(git rev-parse HEAD 2>/dev/null || echo unknown)"
-echo "gate tree: dirty files: $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+echo "gate tree: tracked changes: $(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
+echo "gate tree: untracked files: $(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')"
 
 if [ -z "${DATABASE_URL:-}" ]; then
     echo "gate preflight: DATABASE_URL is unset — refusing to run." >&2
