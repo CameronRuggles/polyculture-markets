@@ -27,15 +27,20 @@
 //!   back to that statement's signed date (see `fold_trade_timed`).
 //! - `Settled` and `Closed` are terminal: the fold ignores every
 //!   later statement (rule 4).
-//! - Two DIFFERENT complete settles are a conflict, not a race
-//!   (owner rule, Cameron 2026-10-21; close-out delta D3): a
-//!   settle is a jointly signed statement of final terms, and
-//!   renegotiation can produce two incompatible ones. The rule
-//!   is presence-based — if two or more distinct settles each
-//!   pass `check_settle`, the trade is `Conflicted` (terminal,
-//!   no agreed refund) whatever order they were held in. A
-//!   duplicated identical settle is one settle; an over-amount
-//!   settle is not complete and cannot create a conflict.
+//! - Two DIFFERENT complete TERMINAL statements are a conflict,
+//!   not a race (owner rules, Cameron 2026-10-21 close-out delta
+//!   D3, extended 2026-10-22 audit-3 E1/E5): the terminals are
+//!   the settle and the receipt, and a settle and a receipt are
+//!   different terminals by kind — the parties cannot both have
+//!   agreed a refund AND acknowledged the trade complete with
+//!   none. "Different" settles means different TERMS (refund +
+//!   return-required): identical terms re-signed, even in a
+//!   different month, are ONE settle outcome. Receipts carry
+//!   no terms and never conflict with each other. The rule is
+//!   presence-based — two or more different complete terminals
+//!   in the held set make the trade `Conflicted` (terminal, no
+//!   agreed refund) whatever order they were held in. An
+//!   over-amount settle is not complete and cannot conflict.
 //! - `Lapsed` is derived, never signed: the assignment's expiry
 //!   passes with neither payment nor a shipped statement held.
 //! - `payment_overdue` is derived, never signed (audit F18): an
@@ -95,12 +100,15 @@ pub enum TradeState {
     Settled,
     Closed,
     Lapsed,
-    /// Two or more DIFFERENT complete settles are held for the
-    /// trade: the parties signed incompatible final terms and
-    /// the fold will not pick one by arrival order — the trade
-    /// is in dispute (owner rule, Cameron 2026-10-21). Terminal:
-    /// no held statement resolves it; only the parties, or a
-    /// moderator replaying disclosed statements (§9), can.
+    /// Two or more DIFFERENT complete terminal statements are
+    /// held for the trade — two settles with different terms, or
+    /// a complete settle beside a complete receipt: the parties
+    /// signed incompatible endings and the fold will not pick
+    /// one by arrival order — the trade is in dispute (owner
+    /// rules, Cameron 2026-10-21 D3 and 2026-10-22 E1/E5).
+    /// Terminal: no held statement resolves it; only the
+    /// parties, or a moderator replaying disclosed statements
+    /// (§9), can.
     Conflicted,
 }
 
@@ -185,22 +193,40 @@ pub fn fold_trade_timed(events: &[TimedEvent], now: &str) -> Option<FoldedTrade>
         _ => None,
     })?;
 
-    // Owner rule (Cameron, 2026-10-21; close-out delta D3): count
-    // the DISTINCT complete settles in the whole held set before
-    // the walk. Two or more means the parties signed incompatible
-    // final terms — a conflict the fold surfaces identically in
-    // either held order, never a winner picked by arrival order.
-    // Identical duplicates count once; a settle failing
-    // `check_settle` is not complete and cannot conflict.
-    let mut distinct_settles: Vec<&SettleStatement> = Vec::new();
+    // Owner rules (Cameron, 2026-10-21 D3; 2026-10-22 E1/E5):
+    // survey the COMPLETE TERMINALS in the whole held set before
+    // the walk. A settle is complete when it passes
+    // `check_settle`; settles are told apart by their TERMS
+    // (refund + return-required) only — the same terms re-signed
+    // in another month are one outcome, not two. A receipt is
+    // complete when it names the assignment's own buyer and
+    // seller (the walk arm's condition); receipts carry no terms
+    // and never conflict with each other. Two or more DIFFERENT
+    // complete terminals — distinct-term settles, or a complete
+    // settle beside a complete receipt — are a conflict the fold
+    // surfaces identically in either held order, never a winner
+    // picked by arrival order.
+    let mut settle_terms: Vec<(u64, bool)> = Vec::new();
+    let mut complete_receipt = false;
     for timed in events {
-        if let TradeEvent::Settle(settle) = &timed.event {
-            if check_settle(assignment, settle) && !distinct_settles.contains(&settle) {
-                distinct_settles.push(settle);
+        match &timed.event {
+            TradeEvent::Settle(settle) => {
+                let terms = (settle.refund_atomic, settle.return_required);
+                if check_settle(assignment, settle) && !settle_terms.contains(&terms) {
+                    settle_terms.push(terms);
+                }
             }
+            TradeEvent::Receipt(receipt) => {
+                if receipt.buyer_key_fingerprint == assignment.buyer_key_fingerprint
+                    && receipt.seller_key_fingerprint == assignment.seller_key_fingerprint
+                {
+                    complete_receipt = true;
+                }
+            }
+            _ => {}
         }
     }
-    let conflicted = distinct_settles.len() >= 2;
+    let conflicted = settle_terms.len() >= 2 || (!settle_terms.is_empty() && complete_receipt);
 
     let mut paid = false;
     let mut shipped = false;
@@ -284,8 +310,9 @@ pub fn fold_trade_timed(events: &[TimedEvent], now: &str) -> Option<FoldedTrade>
         .and_then(|(d, _)| date_add_days(d, 30));
 
     if conflicted {
-        // No refund is named: the parties agreed two different
-        // ones, which is exactly the dispute. Like every terminal
+        // No refund is named: the parties' held endings disagree
+        // — two refunds, or a refund against a no-refund receipt
+        // — which is exactly the dispute. Like every terminal
         // state, a conflict supersedes the overdue flag.
         return Some(FoldedTrade {
             state: TradeState::Conflicted,
@@ -513,12 +540,26 @@ mod tests {
     }
 
     fn settle(refund_atomic: u64, return_required: bool) -> SettleStatement {
+        settle_in_month(refund_atomic, return_required, "2026-11")
+    }
+
+    fn settle_in_month(refund_atomic: u64, return_required: bool, month: &str) -> SettleStatement {
         SettleStatement {
             marketplace_id: MKT.into(),
             trade_id: TID.into(),
             refund_atomic,
             return_required,
-            month: "2026-11".into(),
+            month: month.into(),
+        }
+    }
+
+    fn receipt(month: &str) -> ReceiptStatement {
+        ReceiptStatement {
+            marketplace_id: MKT.into(),
+            trade_id: TID.into(),
+            seller_key_fingerprint: SELLER.into(),
+            buyer_key_fingerprint: BUYER.into(),
+            month: month.into(),
         }
     }
 
@@ -563,6 +604,114 @@ mod tests {
         let folded = fold_trade(&events, NOW).expect("trade");
         assert_eq!(folded.state, TradeState::Settled);
         assert!(folded.terminal);
+        assert_eq!(folded.refund_atomic, Some(100_000_000_000));
+    }
+
+    /// E1 (owner rule, Cameron 2026-10-22): a complete settle and
+    /// a complete receipt are DIFFERENT terminals by kind — the
+    /// parties cannot both have agreed a refund and acknowledged
+    /// the trade complete with none. Both held orders fold to the
+    /// identical Conflicted outcome.
+    #[test]
+    fn a_complete_settle_and_a_complete_receipt_conflict_in_either_order() {
+        let mk = |settle_first: bool| {
+            let settle_ev = TradeEvent::Settle(settle(100_000_000_000, false));
+            let receipt_ev = TradeEvent::Receipt(receipt("2026-11"));
+            let mut events = vec![
+                TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+                TradeEvent::Payment(PaymentRecord { txid: "aa".into(), proof: "x".into() }),
+                TradeEvent::Shipped(shipped("2026-10-22")),
+            ];
+            if settle_first {
+                events.push(settle_ev);
+                events.push(receipt_ev);
+            } else {
+                events.push(receipt_ev);
+                events.push(settle_ev);
+            }
+            events
+        };
+        let sr = fold_trade(&mk(true), NOW).expect("trade");
+        let rs = fold_trade(&mk(false), NOW).expect("trade");
+        assert_eq!(sr, rs, "the folded outcome must not depend on held order");
+        assert_eq!(sr.state, TradeState::Conflicted);
+        assert!(sr.terminal);
+        assert_eq!(sr.refund_atomic, None, "a conflict names no agreed refund");
+        assert!(sr.paid && sr.shipped);
+        assert_eq!(sr.issue_window_ends.as_deref(), Some("2026-11-21"));
+    }
+
+    /// E5 (owner rule, Cameron 2026-10-22): "different" settles
+    /// are settles with different TERMS. The same terms re-signed
+    /// in a different month are ONE settle outcome, not a
+    /// conflict — the trade settles, in either held order.
+    #[test]
+    fn same_terms_settles_signed_in_different_months_settle_in_either_order() {
+        let nov = settle_in_month(100_000_000_000, false, "2026-11");
+        let dec = settle_in_month(100_000_000_000, false, "2026-12");
+        assert_ne!(nov, dec, "the fixtures differ as statements (month), alike in terms");
+        for events in [
+            vec![
+                TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+                TradeEvent::Settle(nov.clone()),
+                TradeEvent::Settle(dec.clone()),
+            ],
+            vec![
+                TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+                TradeEvent::Settle(dec),
+                TradeEvent::Settle(nov),
+            ],
+        ] {
+            let folded = fold_trade(&events, NOW).expect("trade");
+            assert_eq!(folded.state, TradeState::Settled);
+            assert!(folded.terminal);
+            assert_eq!(folded.refund_atomic, Some(100_000_000_000));
+        }
+    }
+
+    /// E5's receipt clause: receipts carry no terms and never
+    /// conflict with each other — two complete receipts (even
+    /// signed in different months) close the trade.
+    #[test]
+    fn two_complete_receipts_close_and_never_conflict() {
+        for events in [
+            vec![
+                TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+                TradeEvent::Receipt(receipt("2026-11")),
+                TradeEvent::Receipt(receipt("2026-12")),
+            ],
+            vec![
+                TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+                TradeEvent::Receipt(receipt("2026-12")),
+                TradeEvent::Receipt(receipt("2026-11")),
+            ],
+        ] {
+            let folded = fold_trade(&events, NOW).expect("trade");
+            assert_eq!(folded.state, TradeState::Closed);
+            assert!(folded.terminal);
+            assert_eq!(folded.refund_atomic, None);
+        }
+    }
+
+    /// E1's completeness qualifier: a receipt naming OTHER
+    /// parties is not a complete terminal for this trade, so the
+    /// one complete settle governs, as before.
+    #[test]
+    fn a_settle_beside_a_receipt_naming_other_parties_settles() {
+        let foreign = ReceiptStatement {
+            marketplace_id: MKT.into(),
+            trade_id: TID.into(),
+            seller_key_fingerprint: SELLER.into(),
+            buyer_key_fingerprint: "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".into(),
+            month: "2026-11".into(),
+        };
+        let events = vec![
+            TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+            TradeEvent::Receipt(foreign),
+            TradeEvent::Settle(settle(100_000_000_000, false)),
+        ];
+        let folded = fold_trade(&events, NOW).expect("trade");
+        assert_eq!(folded.state, TradeState::Settled);
         assert_eq!(folded.refund_atomic, Some(100_000_000_000));
     }
 
