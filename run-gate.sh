@@ -84,6 +84,23 @@ rebuild_db() {
 
 echo "gate preflight: DATABASE_URL set, database reachable."
 
+# HT H2 fix batch E7 (audit 3): isolate the suites' runtime
+# output from the tree under test. Media files and message blobs
+# follow MEDIA_DIR / BLOB_DIR, whose defaults are relative to
+# each test binary's working directory — inside the source tree.
+# That is how runtime PNGs came to be committed under
+# marketplace/tests/security/media/ in the initial import (they
+# are the media suite's sanitizer output, not fixtures: nothing
+# reads them as input), and how gate runs kept dirtying the tree
+# they were measuring. The gate exports both to a fresh scratch
+# directory for the run; a caller's own exports are replaced —
+# the isolation is the gate's, not the caller's.
+GATE_SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/pcm-gate.XXXXXX")
+mkdir -p "$GATE_SCRATCH/media" "$GATE_SCRATCH/blobs"
+export MEDIA_DIR="$GATE_SCRATCH/media"
+export BLOB_DIR="$GATE_SCRATCH/blobs"
+echo "gate: runtime output isolated to $GATE_SCRATCH"
+
 rebuild_db
 cd marketplace
 cargo test -p security-tests
