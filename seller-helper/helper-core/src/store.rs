@@ -484,7 +484,11 @@ impl EvidenceStore {
     /// ledger already lives by — unreadable is never empty —
     /// applies to the directory too, because reading an unreadable
     /// store as empty is what let seeding lose sight of spent
-    /// destinations. A MISSING trades directory is a store that
+    /// destinations. The same rule reaches each ENTRY (audit 3,
+    /// E2): an entry whose type cannot be determined — a dangling
+    /// symlink, an entry removed mid-listing — is an error, never
+    /// a silent skip; only an entry KNOWN to be a non-directory
+    /// is skipped. A MISSING trades directory is a store that
     /// was never opened: no trades, no error.
     pub fn trade_ids(&self) -> Result<Vec<String>, String> {
         let trades_dir = self.root.join("trades");
@@ -506,7 +510,29 @@ impl EvidenceStore {
                     trades_dir.display()
                 )
             })?;
-            if entry.path().is_dir() {
+            // E2: decide from the entry's own type, and resolve a
+            // symlink's target explicitly. `path().is_dir()` would
+            // follow the link and swallow any stat failure as
+            // "not a directory", silently dropping the entry.
+            let file_type = entry.file_type().map_err(|e| {
+                format!(
+                    "cannot determine the type of an entry in the evidence store's trades directory {}: {e} — an unreadable store is never an empty one",
+                    trades_dir.display()
+                )
+            })?;
+            let is_dir = if file_type.is_symlink() {
+                std::fs::metadata(entry.path())
+                    .map_err(|e| {
+                        format!(
+                            "cannot stat {} in the evidence store's trades directory: {e} — an unreadable store is never an empty one",
+                            entry.path().display()
+                        )
+                    })?
+                    .is_dir()
+            } else {
+                file_type.is_dir()
+            };
+            if is_dir {
                 ids.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
@@ -1686,6 +1712,54 @@ mod tests {
         )
         .expect_err("status over an unreadable store must error");
         assert!(err.contains("cannot read"), "{err}");
+    }
+
+    #[test]
+    fn dangling_symlink_trade_entry_fails_loud() {
+        // E2 (audit 3, probes P3/P4): an entry whose type cannot
+        // be determined is an ERROR, never a silent skip. A
+        // dangling symlink is the deterministic shape: the link
+        // itself lists fine, but stat on its target fails for
+        // every user — the failure the pre-fix `path().is_dir()`
+        // swallowed, dropping the entry from the enumeration and
+        // shrinking the store under its readers.
+        let (root, store, _p, _trade_id, _own) = store_with_assignment("dangling");
+        let trades = root.join("trades");
+        std::os::unix::fs::symlink(root.join("no-such-target"), trades.join("trd_dangling"))
+            .expect("plant dangling symlink");
+
+        let err = store
+            .trade_ids()
+            .expect_err("a dangling trade entry must error, not vanish from the enumeration");
+        assert!(err.contains("cannot stat"), "{err}");
+        assert!(store.has_trades().is_err(), "has_trades must propagate the entry failure");
+
+        // Assignment refuses: the ledger load seller assign makes
+        // before seeding hears the enumeration error, so nothing
+        // is seeded over a store that cannot be fully read.
+        let err = PoolLedger::load_for_assign(&root.join("pool.json"), &store)
+            .expect_err("assign over a store with a dangling entry must refuse");
+        assert!(err.contains("cannot stat"), "{err}");
+    }
+
+    #[test]
+    fn symlinked_trade_entries_resolve_by_target() {
+        // E2 companion: a symlink whose target CAN be stat'd is
+        // judged by its target — a link to a trade directory
+        // enumerates as a trade; a link to a regular file is a
+        // KNOWN non-directory and skips, without error.
+        let (root, store, _p, trade_id, _own) = store_with_assignment("links");
+        let trades = root.join("trades");
+        std::os::unix::fs::symlink(trades.join(&trade_id), trades.join("trd_alias"))
+            .expect("link to a trade dir");
+        let plain = root.join("plain.txt");
+        std::fs::write(&plain, b"x").expect("plain file");
+        std::os::unix::fs::symlink(&plain, trades.join("not-a-trade")).expect("link to a file");
+
+        let ids = store.trade_ids().expect("resolvable links enumerate");
+        assert!(ids.contains(&"trd_alias".to_string()), "{ids:?}");
+        assert!(ids.contains(&trade_id), "{ids:?}");
+        assert!(!ids.contains(&"not-a-trade".to_string()), "{ids:?}");
     }
 
     #[test]
