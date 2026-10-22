@@ -987,3 +987,73 @@ uncommitted checker port and vectors), which sits outside the
 numbered findings — it is not F12. F19 is adjacent to F12 only
 in that both concern `blind_ht1`; its subject is the report's
 mutation-coverage sentence, not authorship.
+
+
+---
+
+# Corrections (audit 2) — appended 2026-10-21, HT H2 first batch task 6
+
+The re-verification of this stack (finding N5) found seven places
+where this report — or the re-verification pack that accompanied
+it — misdescribes the tree. The tree wins in every case. Each
+correction below names the misstatement as written and the form
+the tree actually has. Append-only: nothing above this section
+is edited.
+
+1. **The `--received-at` format.** Task 13b's section says
+   `helper buyer verify` gained `--received-at <unix-seconds>`
+   and that the `.received` sidecar stores "integer unix
+   seconds". The tree: the flag, the admit parameter and the
+   sidecar all take and store a canonical timestamp,
+   `YYYY-MM-DDTHH:MM:SSZ`, validated at admission and at load
+   (`domain::validate_canonical_timestamp`). Unix seconds are
+   refused — at `buyer verify` they fail *after* every §14 check
+   has passed, at the store's timestamp validation.
+
+2. **Sidecar integrity.** The same passage says "a hand-edited
+   sidecar is refused at load". The tree: only a sidecar that is
+   not a canonical timestamp is refused at load. A well-formed,
+   re-dated sidecar loads silently — sidecars are unsigned
+   witnessed evidence (owner decision Q2) and carry no integrity
+   check. The sentence should have said exactly that.
+
+3. **The overdue field name.** Task 13b's section says
+   `payment_overdue` trips when `now` passes the assignment's
+   `payment_due`. No field named `payment_due` exists anywhere
+   in the tree; the fold compares against the assignment's
+   `expires_at` (`ht_fold.rs`), as task 13b's own commit message
+   says.
+
+4. **Task 11's test name.** Task 11's section names the new
+   domain test `terms_version_rule_scoped_by_destination`. The
+   tree: the test is `terms_version_rule_bites`
+   (`crates/domain/src/ht_statements.rs`).
+
+5. **`ExpectedSigners::for_kind` does not exist.** The open-items
+   note after the close-out gate (item (4)) describes the
+   settle/receipt signer rule as "a recorded design choice in
+   `ExpectedSigners::for_kind`", and the closing summary repeats
+   the symbol. No such symbol exists in either tree: the
+   kind → expected-signer map lives in `parse_held_statement`
+   in `seller-helper/helper-core/src/store.rs`. (The behaviour
+   the note described was itself replaced by the two-signature
+   rule in close-out task 2 — re-verification N1.)
+
+6. **The restore test's pin route.** Task 10's section says the
+   matching-pin restore case in `ht_publish_gate` pins its terms
+   "(submitted through the real submit route)". The tree: the
+   test pins through the app-library function
+   `app::listings::submit_terms` — the function the submit route
+   calls, but no HTTP submit takes place in that test.
+
+7. **Listing-removal coverage.** The re-verification pack
+   (HT-H1-REVERIFICATION-PACK-2026-10-21.md) states that the
+   three assertions dropped in the Q3 case swap left behaviours
+   with "no other test exercis[ing] listing removal at all".
+   The tree: `media_disputes_audit` and `ht_publish_gate` both
+   exercise listing removal, and the stored-status assertion
+   survives in both. What had no coverage anywhere was narrower:
+   seller notification on takedown (`listing_removed`) and
+   refusal of a second remove (the `pre_takedown_status`
+   guard). That coverage is restored in a non-locked suite by
+   HT H2 first batch task 4.
