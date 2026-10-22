@@ -115,6 +115,36 @@ The script (idempotent — re-running it is the upgrade path):
    `http://127.0.0.1:8080/` on the VM until it answers, then prints
    the deployed binary's SHA-256.
 
+**First boot on a fresh host — create the identity files.** In
+the demo profile the binary NEVER mints its two identity files:
+it refuses to start (exit 2) when either is missing, so the
+step-8 health check cannot pass until both exist. (Only the
+development profile generates them.) After the script's first
+run has created the state directory and the `marketplace` user,
+create both files at the paths the env file names, then restart:
+
+```sh
+printf '%s' "$(openssl rand -hex 32)" \
+  | sudo tee /var/lib/marketplace/marketplace.key >/dev/null
+printf 'mkt_%s' "$(openssl rand -hex 16)" \
+  | sudo tee /var/lib/marketplace/marketplace.htid >/dev/null
+sudo chown marketplace:marketplace \
+  /var/lib/marketplace/marketplace.key /var/lib/marketplace/marketplace.htid
+sudo chmod 600 \
+  /var/lib/marketplace/marketplace.key /var/lib/marketplace/marketplace.htid
+sudo systemctl restart marketplace-demo
+```
+
+The key file is 32 bytes as 64 hex chars; the HT id file is
+`mkt_` plus 32 lowercase hex chars; both are mode 0600. The HT
+id may instead be fixed in the env file as `HT_MARKETPLACE_ID`
+(generate the same `mkt_...` string; then no id file is used).
+These files are the instance's permanent identity — back them
+up with the deployment (§8, docs/operations.md §2). On an
+UPGRADE re-run they already exist; never regenerate them, and
+for a restored instance always restore the recorded id, never
+a new one.
+
 If the health check fails: `journalctl -u marketplace-demo -n 100`.
 The most common cause is a config error printed at startup — the
 binary fails closed and names the offending variable.

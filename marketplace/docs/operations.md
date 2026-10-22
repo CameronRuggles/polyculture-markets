@@ -91,8 +91,21 @@ instance's `mkt_...` id, minted on first boot in the development
 profile and **required to already exist** in every other profile:
 minting a replacement would orphan every pinned terms statement
 and every configured helper, so the app refuses to start without
-it. An operator may instead fix the id with `HT_MARKETPLACE_ID`;
-then no id file is used.
+it (exit 2). An operator may instead fix the id with
+`HT_MARKETPLACE_ID`; then no id file is used.
+
+**First boot on a fresh instance** therefore includes creating
+the file *before* the first start: the content is `mkt_`
+followed by 32 lowercase hex characters (e.g. `openssl rand
+-hex 16` supplies the hex), one line, mode 0600, owned by the
+service account. The demo runbook (§5) carries the exact
+commands; it creates the key file at the same time, which
+follows the same must-already-exist rule outside the
+development profile (32 bytes as 64 hex chars, mode 0600).
+Generating the id string and setting it as `HT_MARKETPLACE_ID`
+instead is equivalent for a fresh instance. For an *existing*
+instance, none of this applies — restore the recorded id,
+never a new one.
 
 The id is **per-instance and permanent** — it never rotates and
 is never regenerated. It is not a secret, but it is
