@@ -1333,12 +1333,23 @@ fn production_profile_fails_closed() {
 
     // Development control: the same missing key file is generated and
     // the server starts.
+    //
+    // HT H2 first batch task 7 (re-verification N6): the control
+    // also points HT_ID_FILE_PATH away from the crate directory —
+    // taken from the environment when one is provided, else this
+    // test's own temp dir. Without it, every gate run minted a
+    // marketplace.htid into crates/app/ (the binary's CWD), an
+    // operator file leaking into the source tree.
+    let ht_id_path = std::env::var("HT_ID_FILE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| dir.join("marketplace.htid"));
     let mut child = {
         let mut c = std::process::Command::new(bin);
         c.env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("DATABASE_URL", &db_url)
             .env("KEY_FILE_PATH", &key_path)
+            .env("HT_ID_FILE_PATH", &ht_id_path)
             .env("BIND_ADDR", "127.0.0.1:0")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -1351,6 +1362,10 @@ fn production_profile_fails_closed() {
     let _ = child.wait();
     assert!(running, "the development profile must start");
     assert!(created, "development generates the key file as before");
+    assert!(
+        ht_id_path.exists(),
+        "development generates the HT id file at HT_ID_FILE_PATH, never in the crate dir"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

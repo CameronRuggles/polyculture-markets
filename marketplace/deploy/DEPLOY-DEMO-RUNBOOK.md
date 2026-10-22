@@ -153,13 +153,18 @@ network unencrypted.
 
 Four things make up the instance (see `docs/operations.md` §3).
 The key file is backed up **separately** from the rest (losing it
-is not survivable; losing any other single part is):
+is not survivable; losing any other single part is); the HT
+marketplace id file rides with it (per-instance and permanent —
+losing it orphans every pinned Hidden Trades statement, see
+`docs/operations.md` §2):
 
 ```sh
 # Database
 sudo -u postgres pg_dump marketplace_demo | gzip > ~/marketplace-demo-db-$(date +%F).sql.gz
 # Key file (mode 0600; store it somewhere at least as safe)
 sudo cp /var/lib/marketplace/marketplace.key ~/marketplace.key.bak-$(date +%F)
+# HT marketplace id file (per-instance, permanent; see above)
+sudo cp /var/lib/marketplace/marketplace.htid ~/marketplace.htid.bak-$(date +%F)
 # Message ciphertext files (BLOB_DIR) — without these, restored
 # conversations list their messages but every download 404s
 sudo tar czf ~/marketplace-demo-blobs-$(date +%F).tar.gz -C /var/lib/marketplace/blobs .
