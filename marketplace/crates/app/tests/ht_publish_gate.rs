@@ -231,20 +231,27 @@ async fn migration_0017_pauses_unpinned_published_listings_only() {
         .await
         .expect("connect scratch");
 
-    // Apply 0001..=0016 exactly as the gate does (file order).
+    // Apply the pre-0017 baseline exactly as the gate does (file
+    // order): migration files named STRICTLY BELOW 0017. (N9:
+    // this used to apply "everything except 0017" behind an
+    // exact file-count assertion, so the next migration would
+    // have been applied here by accident AND broken the count.
+    // The name filter states the baseline directly; the count is
+    // not pinned. 0017 itself is still applied below via
+    // include_str!, unchanged.)
     let mig_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
     let mut files: Vec<_> = std::fs::read_dir(mig_dir)
         .expect("read migrations dir")
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            name.len() >= 4 && name[..4].parse::<u32>().is_ok_and(|n| n < 17)
+        })
         .collect();
     files.sort();
-    assert_eq!(files.len(), 17, "16 pre-existing migrations + 0017");
     for f in &files {
-        if f.file_name().unwrap().to_string_lossy().starts_with("0017") {
-            continue;
-        }
         let sql = std::fs::read_to_string(f).expect("read migration");
         sqlx::raw_sql(&sql).execute(&pool).await.unwrap_or_else(|e| {
             panic!("applying {} failed: {e}", f.display());
