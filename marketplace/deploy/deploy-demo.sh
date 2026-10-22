@@ -1,148 +1,313 @@
 #!/bin/sh
-# deploy-demo.sh — idempotent deploy of the marketplace DEMO profile
-# (stagenet) to a single small VM. See DEPLOY-DEMO-RUNBOOK.md for the
-# full walkthrough this script belongs to.
+# deploy-demo.sh — build (unprivileged), install, and (re)start the
+# Polyculture Markets DEMO deployment (Stage 10 §18 profile tooling).
 #
-# What it does, in order, every run:
-#   1. Refuses to run if the env file selects mainnet (the demo
-#      tooling is stagenet-only; the binary independently refuses
-#      mainnet in the demo profile too — defense in depth).
-#   2. Builds the release binaries (marketplace-app, media-worker).
-#   3. Creates the marketplace system user and directories.
-#   4. Installs binaries to /usr/local/bin and the systemd unit.
-#   5. Installs the env file from env.demo.template ONLY IF ABSENT —
-#      an existing /etc/marketplace/marketplace.env is never
-#      overwritten (it holds the operator's filled-in secrets).
-#   6. Provisions the PostgreSQL role + database (idempotent).
-#   7. Applies migrations in glob order (each migration is applied
-#      at most once; a marker table records what ran).
-#   8. Restarts the unit and health-checks http://127.0.0.1:8080/
-#      until it answers, then prints the binary SHA-256.
+# DEMO / STAGENET ONLY. This script refuses to run against a
+# mainnet or production-profile environment — see the guard below.
+# Production deployment is a separate, reviewed procedure (§19).
 #
-# Re-running this script is the upgrade path: new binaries, pending
-# migrations, restart, health check. Nothing is ever downgraded and
-# the database is never dropped.
+# Run as root (sudo). Everything that must be root (installing
+# binaries, the env file, systemd, PostgreSQL role/database
+# administration) is root; everything that must NOT be root is not:
 #
-# Required env (operator-provided, never committed):
-#   MARKETPLACE_DB_PASSWORD — password for the PostgreSQL role the
-#   script creates/updates; must match DATABASE_URL in the env file.
+#   * The Rust build never runs as root (deployment audit DM3:
+#     cargo executes every dependency's build script; ~500 crates'
+#     worth of arbitrary code must not run with the key file and the
+#     database in reach). Builds happen as an unprivileged user in a
+#     throwaway copy of the source tree, or not at all: set
+#     MARKETPLACE_BIN_DIR to install prebuilt binaries instead.
+#   * Database migrations never run as the PostgreSQL superuser.
+#     They run as the dedicated role `marketplace_migrator`, which
+#     owns the demo database and its objects. The superuser is used
+#     only to create roles/the database and to hand over ownership.
+#   * The database password is read from a file
+#     (MARKETPLACE_DB_PASSWORD_FILE, mode 0600 recommended) and is
+#     passed to psql as a variable (:'pw'), never interpolated into
+#     SQL text and never placed on any command line (audit DL1: a
+#     password containing ' " $ / & broke the old sed/SQL
+#     interpolation, and the value was visible in the process
+#     list). MARKETPLACE_DB_PASSWORD remains as a fallback for
+#     callers that cannot use a file.
 #
-# Run as root on the target VM, from anywhere:
-#   sudo MARKETPLACE_DB_PASSWORD='...' sh deploy/deploy-demo.sh [SRC_DIR]
-# SRC_DIR defaults to the parent of this script's directory.
-
+# Layout installed:
+#   /usr/local/bin/marketplace-app, /usr/local/bin/media-worker
+#   /etc/systemd/system/marketplace-demo.service
+#   /etc/marketplace/marketplace.env   (0600, created once, never
+#                                       overwritten afterwards)
+#   /var/lib/marketplace/              (runtime state: key file,
+#                                       media/, blobs/)
+#
+# Usage:  sudo MARKETPLACE_DB_PASSWORD_FILE=/root/marketplace-db-password \
+#           MARKETPLACE_BUILD_USER=<your normal account> \
+#           deploy/deploy-demo.sh [path-to-marketplace-tree]
+#         sudo MARKETPLACE_DB_PASSWORD_FILE=... \
+#           MARKETPLACE_BIN_DIR=/path/to/prebuilt-binaries \
+#           deploy/deploy-demo.sh [path-to-marketplace-tree]
 set -eu
 
-SRC_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+SRC_DIR="${1:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
 ENV_FILE="/etc/marketplace/marketplace.env"
 ENV_TEMPLATE="$SRC_DIR/deploy/env.demo.template"
-UNIT_FILE="$SRC_DIR/deploy/marketplace-demo.service"
+UNIT_SRC="$SRC_DIR/deploy/marketplace-demo.service"
 APP_USER="marketplace"
+DB_NAME="marketplace_demo"
+MIGRATOR_ROLE="marketplace_migrator"
 STATE_DIR="/var/lib/marketplace"
+BIN_DIR="${MARKETPLACE_BIN_DIR:-}"
+BUILD_USER="${MARKETPLACE_BUILD_USER:-${SUDO_USER:-}}"
+BUILD_WORK=""
+SQL_TMP=""
+SMOKE_DIR=""
 
 say() { printf '%s\n' "deploy-demo: $*"; }
 die() { printf '%s\n' "deploy-demo: ERROR: $*" >&2; exit 1; }
+cleanup() {
+    if [ -n "$BUILD_WORK" ]; then rm -rf "$BUILD_WORK"; fi
+    if [ -n "$SQL_TMP" ]; then rm -f "$SQL_TMP"; fi
+    if [ -n "$SMOKE_DIR" ]; then rm -rf "$SMOKE_DIR"; fi
+}
+trap cleanup EXIT INT TERM
 
-[ "$(id -u)" = "0" ] || die "run as root (sudo)."
-[ -n "${MARKETPLACE_DB_PASSWORD:-}" ] || die "MARKETPLACE_DB_PASSWORD is not set (see runbook)."
+[ "$(id -u)" = "0" ] || die "run as root (sudo) — this installs system files and a systemd unit."
+
+# --- Database password: from a file, never interpolated -------------
+PW_FILE="${MARKETPLACE_DB_PASSWORD_FILE:-}"
+if [ -n "$PW_FILE" ]; then
+    [ -f "$PW_FILE" ] || die "MARKETPLACE_DB_PASSWORD_FILE=$PW_FILE does not exist."
+    DB_PASSWORD="$(cat "$PW_FILE")"
+    [ -n "$DB_PASSWORD" ] || die "password file $PW_FILE is empty."
+elif [ -n "${MARKETPLACE_DB_PASSWORD:-}" ]; then
+    DB_PASSWORD="$MARKETPLACE_DB_PASSWORD"
+    say "warning: password taken from the MARKETPLACE_DB_PASSWORD environment variable;"
+    say "         prefer MARKETPLACE_DB_PASSWORD_FILE so the secret never enters a process environment."
+else
+    die "set MARKETPLACE_DB_PASSWORD_FILE (preferred) or MARKETPLACE_DB_PASSWORD (see runbook)."
+fi
+
 [ -f "$ENV_TEMPLATE" ] || die "env template not found at $ENV_TEMPLATE"
-[ -f "$UNIT_FILE" ] || die "unit file not found at $UNIT_FILE"
+[ -f "$UNIT_SRC" ] || die "unit file not found at $UNIT_SRC"
 
-# --- 1. Stagenet-only guard ------------------------------------------------
-# Check the EFFECTIVE env file (the installed one if present, else
-# the template) before doing anything at all.
-EFFECTIVE_ENV="$ENV_FILE"
-[ -f "$EFFECTIVE_ENV" ] || EFFECTIVE_ENV="$ENV_TEMPLATE"
+# --- Demo-only guard --------------------------------------------------
+# A filled-in env file (once installed) wins over the template: never
+# let a stray template edit re-arm a production-configured host.
+EFFECTIVE_ENV="$ENV_TEMPLATE"
+[ -f "$ENV_FILE" ] && EFFECTIVE_ENV="$ENV_FILE"
 if grep -Eq '^[[:space:]]*INSTANCE_NETWORK[[:space:]]*=[[:space:]]*mainnet' "$EFFECTIVE_ENV"; then
-    die "the env file selects mainnet. The demo deploy tooling is stagenet-only; refusing."
+    die "effective env ($EFFECTIVE_ENV) is MAINNET — this script deploys the stagenet demo only."
 fi
 if grep -Eq '^[[:space:]]*DEPLOY_PROFILE[[:space:]]*=[[:space:]]*production' "$EFFECTIVE_ENV"; then
-    die "the env file selects the production profile. This script deploys the demo profile only; refusing."
+    die "effective env ($EFFECTIVE_ENV) uses the production profile — this script deploys the demo only."
 fi
 
-# --- 2. Build ----------------------------------------------------------------
-export PATH="$HOME/.cargo/bin:/root/.cargo/bin:$PATH"
-command -v cargo >/dev/null 2>&1 || die "cargo not found on PATH (install the pinned Rust toolchain first — see runbook)."
-say "building release binaries from $SRC_DIR ..."
-(cd "$SRC_DIR" && cargo build --release --locked -p app -p media-worker)
-APP_BIN="$SRC_DIR/target/release/marketplace-app"
-WORKER_BIN="$SRC_DIR/target/release/media-worker"
-[ -x "$APP_BIN" ] || die "release binary missing after build: $APP_BIN"
-[ -x "$WORKER_BIN" ] || die "release binary missing after build: $WORKER_BIN"
+# --- Bubblewrap: the worker sandbox ships ON (audit CM2) -------------
+# The demo env template sets MEDIA_WORKER_SANDBOX=bwrap, so the media
+# worker runs sandboxed (no network; a read-only root with only the
+# worker, its input and a per-job scratch dir). That needs bubblewrap
+# on the host — install it now, and the smoke test further down fails
+# the deploy if the sandbox does not actually confine the worker.
+# Silently shipping the worker unconfined is the failure this prevents.
+if ! command -v bwrap >/dev/null 2>&1; then
+    say "installing bubblewrap (the demo runs the media worker sandboxed)..."
+    apt-get update -qq && apt-get install -y bubblewrap \
+        || die "bubblewrap install failed — install it manually, or remove MEDIA_WORKER_SANDBOX=bwrap from the env template if this host truly cannot sandbox (the worker then runs unconfined; the threat model §T6 says what that means)."
+fi
+command -v bwrap >/dev/null 2>&1 || die "bubblewrap (bwrap) is required: the demo env enables the media worker sandbox."
+command -v curl >/dev/null 2>&1 || die "curl is required (service health check and the sandbox smoke test)."
 
-# --- 3. User + directories -----------------------------------------------------
+APP_BIN=""; WORKER_BIN=""
+if [ -n "$BIN_DIR" ]; then
+    # --- Prebuilt binaries: no build on this host at all --------------
+    APP_BIN="$BIN_DIR/marketplace-app"
+    WORKER_BIN="$BIN_DIR/media-worker"
+    [ -x "$APP_BIN" ] || die "prebuilt marketplace-app not found/executable in MARKETPLACE_BIN_DIR=$BIN_DIR"
+    [ -x "$WORKER_BIN" ] || die "prebuilt media-worker not found/executable in MARKETPLACE_BIN_DIR=$BIN_DIR"
+    say "using prebuilt binaries from $BIN_DIR (no build on this host)"
+else
+    # --- Build as an unprivileged user in a throwaway tree copy -----
+    # cargo is NEVER run as root (DM3). The default build user is the
+    # account that invoked sudo (the one whose ~/.cargo holds the
+    # toolchain); override with MARKETPLACE_BUILD_USER.
+    [ -n "$BUILD_USER" ] || die "refusing to run cargo as root: set MARKETPLACE_BUILD_USER=<unprivileged account> (default: \$SUDO_USER), or MARKETPLACE_BIN_DIR=<dir> to install prebuilt binaries instead."
+    [ "$BUILD_USER" != "root" ] || die "MARKETPLACE_BUILD_USER must not be root (the build never runs as root)."
+    id "$BUILD_USER" >/dev/null 2>&1 || die "build user '$BUILD_USER' does not exist on this host."
+    BUILD_WORK="$(mktemp -d /tmp/marketplace-build.XXXXXX)"
+    BUILD_SRC="$BUILD_WORK/src"
+    mkdir -p "$BUILD_SRC"
+    (cd "$SRC_DIR" && tar cf - --exclude=./target --exclude=./.git .) | (cd "$BUILD_SRC" && tar xf -)
+    chown -R "$BUILD_USER" "$BUILD_WORK"
+    say "building release binaries as $BUILD_USER in a throwaway copy of $SRC_DIR ..."
+    su "$BUILD_USER" -c "cd '$BUILD_SRC' && export PATH=\"\$HOME/.cargo/bin:\$PATH\" && { command -v cargo >/dev/null 2>&1 || { echo 'deploy-demo: ERROR: cargo not found for build user $BUILD_USER (runbook §2 installs it as that user)' >&2; exit 1; }; } && cargo build --release --locked -p app -p media-worker"
+    APP_BIN="$BUILD_SRC/target/release/marketplace-app"
+    WORKER_BIN="$BUILD_SRC/target/release/media-worker"
+    [ -x "$APP_BIN" ] && [ -x "$WORKER_BIN" ] || die "build finished but binaries are missing under $BUILD_SRC/target/release"
+fi
+
+# --- System user + dirs ------------------------------------------------
 if ! id "$APP_USER" >/dev/null 2>&1; then
-    useradd --system --home-dir "$STATE_DIR" --shell /usr/sbin/nologin "$APP_USER"
-    say "created system user $APP_USER"
+    useradd --system --home-dir "$STATE_DIR" --shell /usr/sbin/nologin "$APP_USER" 2>/dev/null \
+        || useradd --system --home-dir "$STATE_DIR" --shell /bin/false "$APP_USER"
 fi
-mkdir -p "$STATE_DIR/media" /etc/marketplace
+mkdir -p "$STATE_DIR/media" "$STATE_DIR/blobs" /etc/marketplace
 chown -R "$APP_USER:$APP_USER" "$STATE_DIR"
 chmod 750 "$STATE_DIR"
 
-# --- 4. Binaries + unit ----------------------------------------------------------
-install -m 0755 "$APP_BIN" /usr/local/bin/marketplace-app
-install -m 0755 "$WORKER_BIN" /usr/local/bin/media-worker
-install -m 0644 "$UNIT_FILE" /etc/systemd/system/marketplace-demo.service
+# --- Install binaries + unit -------------------------------------------
+install -o root -g root -m 0755 "$APP_BIN" /usr/local/bin/marketplace-app
+install -o root -g root -m 0755 "$WORKER_BIN" /usr/local/bin/media-worker
+install -o root -g root -m 0644 "$UNIT_SRC" /etc/systemd/system/marketplace-demo.service
 say "installed binaries and systemd unit"
 
-# --- 5. Env file (never overwrite) ------------------------------------------------
-if [ -f "$ENV_FILE" ]; then
+# --- Env file (created once; never overwrite a filled-in env) ----------
+# The DATABASE_URL line is produced by splicing the template line with
+# awk: the password is percent-encoded for the URL userinfo, so a
+# password containing ' " $ / & \ (or anything else) round-trips
+# byte-exact and never appears in plaintext in the env file.
+url_encode_pw() (
+    LC_ALL=C; export LC_ALL
+    _rest="$DB_PASSWORD"; _out=""
+    while [ -n "$_rest" ]; do
+        _c=$(printf '%s' "$_rest" | dd bs=1 count=1 2>/dev/null)
+        _rest=$(printf '%s' "$_rest" | dd bs=1 skip=1 2>/dev/null)
+        case "$_c" in
+            [A-Za-z0-9._~-]) _out="$_out$_c" ;;
+            *) _out="$_out$(printf '%%%02X' "'$_c")" ;;
+        esac
+    done
+    printf '%s' "$_out"
+)
+if [ ! -f "$ENV_FILE" ]; then
+    PW_ENC="$(url_encode_pw)"
+    install -o root -g root -m 0600 /dev/null "$ENV_FILE.tmp"
+    awk -v "repl=DATABASE_URL=postgres://marketplace:${PW_ENC}@127.0.0.1:5432/${DB_NAME}" \
+        '/^DATABASE_URL=/ { print repl; next } { print }' \
+        "$ENV_TEMPLATE" > "$ENV_FILE.tmp"
+    mv "$ENV_FILE.tmp" "$ENV_FILE"
+    say "env file written to $ENV_FILE (0600) — review before first start if you need changes"
+else
     say "env file $ENV_FILE already exists — left untouched"
-else
-    install -m 0600 "$ENV_TEMPLATE" "$ENV_FILE"
-    # Fill the database password placeholder from the operator env.
-    sed -i "s/CHANGE-ME/$MARKETPLACE_DB_PASSWORD/" "$ENV_FILE"
-    chown root:root "$ENV_FILE"
-    say "installed env file from template (fill in anything else marked CHANGE-ME, then re-run)"
 fi
 
-# --- 6. PostgreSQL role + database --------------------------------------------------
-DB_NAME="marketplace_demo"
-if su postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname = 'marketplace'\"" | grep -q 1; then
-    su postgres -c "psql -v ON_ERROR_STOP=1 -c \"ALTER ROLE marketplace WITH PASSWORD '$MARKETPLACE_DB_PASSWORD'\""
-else
-    su postgres -c "psql -v ON_ERROR_STOP=1 -c \"CREATE ROLE marketplace LOGIN PASSWORD '$MARKETPLACE_DB_PASSWORD'\""
+# --- Media worker sandbox smoke test (audit CM2) ------------------------
+# The shipped env turns the worker sandbox ON; prove it confines
+# BEFORE the service starts, or fail the deploy:
+#   (a) the real media-worker must sanitize a sample image inside the
+#       sandbox, run as the application user with the same bwrap shape
+#       crates/app/src/media.rs builds (media.rs uses --ro-bind-try
+#       for /lib64, which some distributions lack);
+#   (b) a probe "worker" in the same sandbox must FAIL to read a
+#       host file the app user can read outside it (and the key file,
+#       when it exists), and FAIL to open a network connection.
+SMOKE_DIR="$(mktemp -d /tmp/marketplace-smoke.XXXXXX)"
+mkdir -p "$SMOKE_DIR/job"
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' \
+    | base64 -d > "$SMOKE_DIR/sample.png"
+printf 'deploy-smoke-host-secret\n' > "$SMOKE_DIR/host-secret.txt"
+KEY_PROBE="$(grep -E '^[[:space:]]*KEY_FILE_PATH[[:space:]]*=' "$EFFECTIVE_ENV" | head -n 1 | cut -d= -f2- | tr -d '[:space:]')"
+[ -n "$KEY_PROBE" ] || KEY_PROBE="/var/lib/marketplace/marketplace.key"
+cat > "$SMOKE_DIR/probe.sh" <<EOF
+#!/usr/bin/sh
+# CM2 deploy smoke probe — runs where the media worker runs. Exit 0
+# only if the key file, a host-readable file and the network are ALL
+# unreachable from inside the sandbox.
+if cat "$KEY_PROBE" >/dev/null 2>&1; then echo "probe: KEY FILE READABLE in sandbox" >&2; exit 1; fi
+if cat "$SMOKE_DIR/host-secret.txt" >/dev/null 2>&1; then echo "probe: host file readable in sandbox" >&2; exit 1; fi
+if curl -m 3 -sf http://127.0.0.1:8080/ >/dev/null 2>&1; then echo "probe: NETWORK REACHABLE in sandbox" >&2; exit 1; fi
+cp "\$1" "\$2"
+echo 10x10
+EOF
+chown -R "$APP_USER:$APP_USER" "$SMOKE_DIR"
+SANDBOX_SHAPE="--unshare-net --die-with-parent --tmpfs / --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 --dev /dev"
+if ! su "$APP_USER" -s /bin/sh -c "bwrap $SANDBOX_SHAPE --ro-bind /usr/local/bin/media-worker /worker --ro-bind '$SMOKE_DIR/sample.png' /in --bind '$SMOKE_DIR/job' /work -- /worker /in /work/out.png" > "$SMOKE_DIR/worker.stdout" 2> "$SMOKE_DIR/worker.stderr"; then
+    cat "$SMOKE_DIR/worker.stderr" >&2 || true
+    die "sandbox smoke test FAILED: the media worker could not sanitize a sample image inside bwrap (see output above). The deploy stops here rather than shipping the worker unconfined."
 fi
-if ! su postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'\"" | grep -q 1; then
-    su postgres -c "createdb -O marketplace $DB_NAME"
-    say "created database $DB_NAME"
+[ -s "$SMOKE_DIR/job/out.png" ] || die "sandbox smoke test FAILED: the sandboxed worker produced no output file."
+if ! su "$APP_USER" -s /bin/sh -c "bwrap $SANDBOX_SHAPE --ro-bind '$SMOKE_DIR/probe.sh' /worker --ro-bind '$SMOKE_DIR/sample.png' /in --bind '$SMOKE_DIR/job' /work -- /usr/bin/sh /worker /in /work/probe.out" > "$SMOKE_DIR/probe.stdout" 2> "$SMOKE_DIR/probe.stderr"; then
+    cat "$SMOKE_DIR/probe.stderr" >&2 || true
+    die "sandbox smoke test FAILED: the probe worker escaped confinement (see output above). The deploy stops here rather than shipping a sandbox that does not confine."
 fi
+rm -rf "$SMOKE_DIR"; SMOKE_DIR=""
+say "media worker sandbox smoke test passed (worker sanitizes inside bwrap; key file and network unreachable inside it)"
 
-# --- 7. Migrations (glob order, each at most once) ----------------------------------
-su postgres -c "psql -d $DB_NAME -v ON_ERROR_STOP=1 -c \"
-  CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());\"" >/dev/null
-for f in "$SRC_DIR"/migrations/*.sql; do
-    v="$(basename "$f")"
-    applied="$(su postgres -c "psql -d $DB_NAME -tAc \"SELECT 1 FROM schema_migrations WHERE version = '$v'\"")"
-    if [ "$applied" = "1" ]; then
-        say "migration $v already applied — skipping"
+# --- PostgreSQL: roles, database, migrations ---------------------------
+# The postgres superuser is used only to create the two roles and the
+# database and to hand ownership to the migrator role. Everything
+# after that runs AS the migrator (SET ROLE), which owns the database
+# objects; schema changes never execute with superuser rights (DM3).
+#
+# The application role's password is set from a psql variable: the
+# value travels on psql's stdin from a mode-0600 temporary SQL file,
+# so it never appears in a command line, an SQL string literal, or
+# the process list (DL1). \set quoting rule: backslash escapes the
+# next character inside the single-quoted value.
+sql_escape() { printf '%s' "$1" | awk '{ gsub(/\\/, "\\\\"); gsub(/'"'"'/, "\\'"'"'"); print }'; }
+SQL_TMP="$(mktemp)"; chmod 600 "$SQL_TMP"   # removed by the exit trap as well
+{
+    printf "\\set pw '%s'\n" "$(sql_escape "$DB_PASSWORD")"
+    if [ "$(su postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='$APP_USER'\"")" = "1" ]; then
+        echo "ALTER ROLE $APP_USER WITH LOGIN PASSWORD :'pw';"
     else
-        say "applying migration $v"
-        su postgres -c "psql -d $DB_NAME -v ON_ERROR_STOP=1 -q -f '$f'"
-        su postgres -c "psql -d $DB_NAME -v ON_ERROR_STOP=1 -q -c \"INSERT INTO schema_migrations (version) VALUES ('$v')\"" >/dev/null
+        echo "CREATE ROLE $APP_USER LOGIN PASSWORD :'pw';"
     fi
-done
-# The app connects as the marketplace role; own what the migrations made.
-su postgres -c "psql -d $DB_NAME -v ON_ERROR_STOP=1 -q -c \"
-  GRANT ALL ON ALL TABLES IN SCHEMA public TO marketplace;
-  GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO marketplace;\"" >/dev/null
+} > "$SQL_TMP"
+if [ "$(su postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='$MIGRATOR_ROLE'\"")" != "1" ]; then
+    su postgres -c "psql -q -c \"CREATE ROLE $MIGRATOR_ROLE NOLOGIN\""
+    say "created migration role $MIGRATOR_ROLE"
+fi
+su postgres -c "psql -v ON_ERROR_STOP=1 -q -f '$SQL_TMP'"
+rm -f "$SQL_TMP"; SQL_TMP=""
+say "application role '$APP_USER' password set (via psql variable, from ${PW_FILE:-the environment})"
 
-# --- 8. Start + health check -------------------------------------------------------------
-systemctl daemon-reload
-systemctl enable --now marketplace-demo.service >/dev/null 2>&1 || true
-systemctl restart marketplace-demo.service
-say "waiting for the app to answer on http://127.0.0.1:8080/ ..."
-i=0
-while [ "$i" -lt 30 ]; do
-    if curl -fsS -o /dev/null http://127.0.0.1:8080/ 2>/dev/null; then
-        say "healthy: http://127.0.0.1:8080/ answers"
-        break
+if [ "$(su postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='$DB_NAME'\"")" != "1" ]; then
+    su postgres -c "createdb -O $MIGRATOR_ROLE $DB_NAME"
+    say "created database $DB_NAME (owner: $MIGRATOR_ROLE)"
+else
+    su postgres -c "psql -q -c \"ALTER DATABASE $DB_NAME OWNER TO $MIGRATOR_ROLE\""
+fi
+# Databases created by earlier versions of this script have their
+# tables owned by the postgres superuser; hand them to the migrator
+# so migrations run unprivileged there too (no-op on fresh installs).
+LEGACY_OWNED=$(su postgres -c "psql -d $DB_NAME -tAc \"SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner = 'postgres'\"")
+if [ "$LEGACY_OWNED" != "0" ]; then
+    su postgres -c "psql -d $DB_NAME -q -c \"REASSIGN OWNED BY postgres TO $MIGRATOR_ROLE\""
+    say "handed $LEGACY_OWNED legacy superuser-owned table(s) to $MIGRATOR_ROLE"
+fi
+
+AS_MIGRATOR="SET ROLE $MIGRATOR_ROLE"
+su postgres -c "psql -d $DB_NAME -v ON_ERROR_STOP=1 -q -c \"$AS_MIGRATOR\" -c \"CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())\""
+APPLIED=0; SKIPPED=0
+for f in "$SRC_DIR"/migrations/*.sql; do
+    v=$(basename "$f")
+    if [ "$(su postgres -c "psql -d $DB_NAME -tAq -c \"$AS_MIGRATOR\" -c \"SELECT 1 FROM schema_migrations WHERE version = '$v'\"" | grep -c '^1$')" = "1" ]; then
+        SKIPPED=$((SKIPPED+1)); continue
     fi
-    i=$((i + 1))
+    su postgres -c "psql -d $DB_NAME -v ON_ERROR_STOP=1 -q -c \"$AS_MIGRATOR\" -f '$f'"
+    su postgres -c "psql -d $DB_NAME -q -c \"$AS_MIGRATOR\" -c \"INSERT INTO schema_migrations (version) VALUES ('$v')\""
+    APPLIED=$((APPLIED+1))
+done
+# Application-role DML on everything the migrator owns (re-runnable).
+su postgres -c "psql -d $DB_NAME -q -c \"$AS_MIGRATOR\" -c \"GRANT ALL ON ALL TABLES IN SCHEMA public TO $APP_USER\" -c \"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $APP_USER\""
+say "migrations: $APPLIED applied, $SKIPPED already present (as role $MIGRATOR_ROLE, never superuser)"
+
+# --- Start / restart ----------------------------------------------------
+systemctl daemon-reload
+systemctl enable marketplace-demo.service >/dev/null 2>&1 || true
+systemctl restart marketplace-demo.service
+
+# --- Health check ---------------------------------------------------------
+HEALTHY=""
+for i in $(seq 1 30); do
+    if curl -fsS "http://127.0.0.1:8080/" >/dev/null 2>&1; then HEALTHY=1; break; fi
     sleep 2
 done
-[ "$i" -lt 30 ] || die "health check failed after 60s — inspect: journalctl -u marketplace-demo -n 100"
+if [ -n "$HEALTHY" ]; then
+    say "demo is up: http://127.0.0.1:8080/ (bind is loopback-only; front it per the runbook)"
+else
+    say "WARNING: service did not answer on :8080 within 60s — check: journalctl -u marketplace-demo -n 50" >&2
+    exit 1
+fi
 
-SHA="$(sha256sum /usr/local/bin/marketplace-app | awk '{print $1}')"
-say "deployed marketplace-app sha256: $SHA"
-say "done. Reach the demo through an SSH tunnel: ssh -L 8080:127.0.0.1:8080 <user>@<vm>"
+say "deployed binary sha256:"
+sha256sum /usr/local/bin/marketplace-app
+say "SOURCE_URL and /source: the env template points at the public repo;"
+say "if this instance serves other people, that line is your AGPL source offer — keep it set."

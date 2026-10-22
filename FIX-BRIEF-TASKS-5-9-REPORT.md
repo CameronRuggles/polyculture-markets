@@ -248,6 +248,25 @@ normally. Seed rows removed afterwards.
 - **Task 7 signature-shape check — not implemented**, for the locked-
   contract conflict documented under task 7 above. This is the only
   incomplete item.
+
+---
+
+## Addendum 2026-10-19 — task 7 signature-shape half CLOSED (superseded)
+
+The one incomplete item above is now closed, without code and
+without any locked-suite amendment. The Fix Verification (Media,
+Content, Disputes and Payment Tasks 5–9, 2026-10-19) reviewed the
+partial and ruled on the shape check: the locked suites use
+placeholder signatures it would reject, and real server-side
+signature verification (owner decision 2) replaces it — "drop it
+rather than amend the suites." The media verification fix batch
+(2026-10-19) records the closure here per task 6 of that brief:
+payment task 7 stands complete on its pool-cap-race half (already
+shipped), and the signature-shape half is **closed as superseded by
+decision 2**, not deferred and not pending a suite amendment. When
+the payments redesign lands the verifier, signature validity is
+checked for real, which is strictly stronger than the shape test
+this half would have added.
 - Tasks 1–4 untouched, as instructed. No migration was needed for
   any task (0008 already stores per-identity and per-batch network).
 - The tree is not `rustfmt`-clean at HEAD and was left so; new code

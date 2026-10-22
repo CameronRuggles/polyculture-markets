@@ -10,6 +10,9 @@ downloads/
 *.key
 *.keys
 marketplace.key
+# Per-instance runtime identity files (fix task 2): generated on
+# first boot beside the key file; never in history.
+marketplace.htid
 stage0-spike/fixtures-wallet/
 
 # Demo deploy record containing a plaintext gate password

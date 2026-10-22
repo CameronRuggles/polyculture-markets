@@ -15,9 +15,19 @@ unless noted):
 | `cert-bob.asc` | `54C8A581E49106123FB5CCBACED0A0143425A8E0` | recipient; signer of the disclosure message |
 | `cert-carol-v1.asc` | `346F063FB3DB1FB8EDB9F17D4065C0B2115BED30` | two encryption subkeys, both valid |
 | `cert-carol-v2-revoked-subkey.asc` | same primary | subkey `E82C05E4…E2632C4` revoked via `gpg --edit-key` → `revkey`; subkey `614E4F52…6E87C970` still valid |
-| `cert-dave-short-expiry.asc` | `61CD1CD1481CE46CF786B1A352DC295EC3B2A7A3` | whole cert expires 1 day after creation |
-| `cert-dave-extended.asc` | same primary | expiry extended to 2 years via `gpg --edit-key` → `expire` (signatures only, no new key material) |
-| `cert-dave-added-subkey.asc` | same primary | third key added with `--quick-add-key` (new key material) |
+| `cert-dave-short-expiry.asc` | `5A37E91C3A9C8A8BAAEB9503DD38B3DF073E742C` | whole cert expires 365 days after creation (2027-10-20) — renewed family, see below |
+| `cert-dave-extended.asc` | same primary | expiry extended to 2028-10-19 (signatures only, no new key material) |
+| `cert-dave-added-subkey.asc` | same primary | third key added (new key material) |
+
+The Dave family was renewed on 2026-10-21 (HT H1 audit fix task 3):
+the original family (`61CD1CD1…C3B2A7A3`, created 2026-10-19) had a
+1-day short cert that expired 2026-10-20, and its private keys were
+discarded by design, so renewal meant a new key family with the same
+shape (RSA 2048 primary [SC], RSA 2048 subkey [E], UID `Fixture dave`).
+The "short" window is now 365 days rather than 1 day: nothing in the
+suite asserts the duration, and a 1-day cert puts the suite back on a
+24-hour clock. Regeneration kit: `fixture-regen-dave-2026-10-20/` in
+the project root.
 
 Messages (alice → bob, also encrypted to alice; plaintexts are
 seeded-random base64 text at ~300 B / ~2 KB / ~40 KB so compression

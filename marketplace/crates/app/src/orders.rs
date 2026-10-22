@@ -168,6 +168,14 @@ pub async fn create_order_with_config(
         .fetch_one(pool)
         .await
         .map_err(|_| OrderError::NotFound)?;
+    // BL3: the listing's delivery/refund terms are bound into the
+    // terms file verbatim below — Unicode format characters
+    // (category Cf) in them are refused here, the one place terms
+    // text is consumed, so no stored value can carry direction
+    // tricks into a buyer's record of what was promised.
+    if crate::listings::validate_listing_terms(&delivery_terms, &refund_terms).is_err() {
+        return Err(OrderError::ListingNotAvailable);
+    }
     // Pin the seller's current key (§8/§9). No key, no orders.
     let seller_key = crate::keys::current_key(pool, seller_id)
         .await
@@ -559,29 +567,20 @@ pub async fn apply_action(
     if !order_can_transition(from, to, actor, evidence) {
         return Err(OrderError::TransitionDenied);
     }
-    if action == "accept" {
-        // §9: Requested -> AwaitingPayment requires an issued invoice.
-        // Direct Payments v1 disposition: for direct orders the gate is
-        // assignment-exists instead (which holds by construction for
-        // payment-enabled sellers, since allocation happens at
-        // creation). Orders without an assignment keep the original
-        // invoice behaviour exactly (Stage 4 locked suite).
-        let assigned = crate::payments::has_assignment(pool, order.id)
-            .await
-            .map_err(|_| OrderError::NotFound)?;
-        if !assigned {
-            let issued: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM invoices WHERE order_id = $1 AND state = 'Issued')",
-            )
-            .bind(order.id)
-            .fetch_one(pool)
-            .await
-            .map_err(|_| OrderError::NotFound)?;
-            if !issued {
-                return Err(OrderError::InvoiceRequired);
-            }
-        }
-    }
+    // BL1 amendment (2026-10-19): the §9 invoice gate on accept is
+    // REMOVED. It required an order without a payment assignment to
+    // have an invoice in state Issued before the seller could accept;
+    // the invoice system is retired and nothing issues invoices, so
+    // the gate made assignment-less (legacy, pre-Direct-Payments)
+    // orders unacceptable forever. Production orders always carry an
+    // assignment — allocation happens at creation and creation is
+    // refused when the pool is empty — so an accepted-but-unassigned
+    // order is reachable only for legacy rows, and no payment path
+    // opens for it: mark_paid still refuses unassigned orders with
+    // NoAssignment. The locked pins that asserted the gate
+    // (blind_stage4 §C, blind_direct_v1 amendment (e)) were amended
+    // the same day under the BL1 owner-decision chain; see
+    // BL1-TASK2-AMENDMENT-REPORT-2026-10-19.md.
     if matches!(action, "cancel" | "decline") && actor_id == order.seller_id {
         // Owner decision 2026-10-18: once a buyer payment report
         // (proof or manual) is on file, the order is never the

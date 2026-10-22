@@ -82,6 +82,22 @@ impl KeyFile {
         hmac(&self.master, label.as_bytes())
     }
 
+    /// Device-cookie MAC for one account (verification-fix V1,
+    /// OWASP's device-cookie pattern): a successful login sets a
+    /// long-lived cookie carrying HMAC-SHA256 (key-file subkey) over
+    /// the account id. A later login presenting a cookie whose MAC
+    /// verifies for the account is a browser that has logged in
+    /// before — the per-username failure budget, which exists to
+    /// stop strangers guessing, does not apply to it, so an attacker
+    /// who spends the budget cannot lock the owner out of a browser
+    /// they already use. The MAC is unforgeable without the key
+    /// file, and it authorizes nothing by itself: the passphrase
+    /// (and TOTP, when enrolled) is still verified in full.
+    pub fn device_cookie_mac(&self, account_id: i64) -> [u8; 32] {
+        let key = self.subkey("device-cookie-v1");
+        hmac(&key, &account_id.to_be_bytes())
+    }
+
     /// Buyer token for one (seller, buyer) pair: HMAC-SHA256 keyed by
     /// the key-file subkey over both ids. Deterministic per pair,
     /// unlinkable across sellers (the seller id is inside the MAC).
@@ -176,6 +192,14 @@ mod tests {
             hex::encode(k.buyer_token(10, 20)),
             "2733f03554b05efd7b0cae81250042db91e54310116d389af1f6adf3834241c2"
         );
+    }
+
+    #[test]
+    fn device_cookie_mac_is_account_specific() {
+        let k = kf();
+        assert_eq!(k.device_cookie_mac(7), k.device_cookie_mac(7), "deterministic per account");
+        assert_ne!(k.device_cookie_mac(7), k.device_cookie_mac(8), "bound to the account");
+        assert_ne!(k.device_cookie_mac(7), k.buyer_token(7, 7), "separate subkey from buyer tokens");
     }
 
     #[test]

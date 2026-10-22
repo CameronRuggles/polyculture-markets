@@ -25,7 +25,18 @@
 # Leaving the advisory armed here means that if the MySQL backend is
 # ever enabled, deny fails loudly. `cargo audit`, which scans the raw
 # lockfile, carries the ignore instead — see .cargo/audit.toml.
-ignore = []
+ignore = ["RUSTSEC-2026-0374"]
+# RUSTSEC-2026-0374 (basic-toml 0.1.10, "unmaintained") is the one
+# ignored advisory, accepted 2026-10-21 while landing PR #1, after CI's
+# deny step failed on it in both runs. It is an unmaintained notice
+# (upstream repository archived 2025-03), not a vulnerability, and the
+# advisory names no safe upgrade. basic-toml enters the graph only
+# through askama_derive (askama 0.12.1 -> app; verified with
+# `cargo tree -i basic-toml`), a proc-macro that runs at build time on
+# the build machine; it is not compiled into any shipped binary and
+# parses no untrusted input. Remove this ignore when askama is
+# upgraded to a release that no longer depends on basic-toml, or if
+# basic-toml ever gains a runtime consumer.
 # Yanked crates are errors by default in cargo-deny; keep that.
 
 [licenses]

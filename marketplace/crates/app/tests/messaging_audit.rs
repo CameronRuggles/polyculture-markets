@@ -56,7 +56,7 @@ const CERT_DAVE_ADDED: &str = include_str!("fixtures/gpg/cert-dave-added-subkey.
 const ALICE_FPR: &str = "698C2CE6489C747F1458C2BF35C511FEAF38F328";
 const BOB_FPR: &str = "54C8A581E49106123FB5CCBACED0A0143425A8E0";
 const CAROL_FPR: &str = "346F063FB3DB1FB8EDB9F17D4065C0B2115BED30";
-const DAVE_FPR: &str = "61CD1CD1481CE46CF786B1A352DC295EC3B2A7A3";
+const DAVE_FPR: &str = "5A37E91C3A9C8A8BAAEB9503DD38B3DF073E742C";
 
 const MSG_300_UNSIGNED: &str = include_str!("fixtures/gpg/msg-300-unsigned.asc");
 const MSG_300_SIGNED: &str = include_str!("fixtures/gpg/msg-300-signed.asc");
@@ -138,7 +138,7 @@ const CSRF: &str = "msgaudit-csrf";
 
 async fn pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    PgPoolOptions::new().max_connections(8).connect(&url).await.ok()
+    Some(PgPoolOptions::new().max_connections(8).connect(&url).await.expect("DATABASE_URL is set but the database is unreachable"))
 }
 
 fn uniq() -> String {
@@ -754,6 +754,38 @@ async fn disputed_order(pool: &PgPool, seller: i64, buyer: i64, listing: &str) -
 // Task 3 (MM1): disclosure by unwrap paste.
 // ---------------------------------------------------------------------------
 
+/// Verification-fix V4: a disclosure names the conversation
+/// message it unwraps; plant one directly (blob file + row) with a
+/// chosen arrival time and return its id.
+async fn plant_disclosable_message(
+    pool: &PgPool,
+    conversation_id: i64,
+    sender: i64,
+    recipient: i64,
+    bytes: &[u8],
+    received_unix: i64,
+) -> i64 {
+    let dir = app::messages::blob_dir();
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let blob_ref = format!("test-{}", uniq());
+    tokio::fs::write(dir.join(format!("{blob_ref}.asc")), bytes).await.unwrap();
+    sqlx::query_scalar(
+        "INSERT INTO encrypted_messages
+            (conversation_id, sender_id, recipient_id, recipient_key_id, blob_ref, length, received_at, expires_at)
+         VALUES ($1, $2, $3, 'A5C23E96999A1AF9', $4, $5, to_timestamp($6), to_timestamp($6) + interval '90 days')
+         RETURNING id",
+    )
+    .bind(conversation_id)
+    .bind(sender)
+    .bind(recipient)
+    .bind(blob_ref)
+    .bind(bytes.len() as i32)
+    .bind(received_unix as f64)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
     let Some(pool) = pool().await else { return };
@@ -761,8 +793,28 @@ async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
     purge_fixture_addresses(&pool).await;
     let srv = test_server(&pool).await;
     let (seller, buyer, listing) = shop(&pool).await;
-    let (_oid, _opub, dispute_id) = disputed_order(&pool, seller, buyer, &listing).await;
+    let (oid, _opub, dispute_id) = disputed_order(&pool, seller, buyer, &listing).await;
     let token = session_for(&pool, buyer).await;
+
+    // V4: name the message being disclosed. Its arrival is planted
+    // one hour after the fixture signature was created, so the pair
+    // satisfies the 24h freshness rule deterministically.
+    let conv = app::messages::find_or_create_for_order(&pool, oid, buyer, seller)
+        .await
+        .unwrap();
+    let sig_unix = app::keys::extract_unwrapped_message(CERT_BOB.as_bytes(), UNWRAP_BOB_SIGNED.as_bytes())
+        .and_then(|u| u.signature_created_unix)
+        .expect("the signed fixture carries a signature creation time");
+    let signed_mid = plant_disclosable_message(
+        &pool,
+        conv,
+        seller,
+        buyer,
+        UNWRAP_BOB_SIGNED.as_bytes(),
+        sig_unix + 3600,
+    )
+    .await;
+    let signed_mid_s = signed_mid.to_string();
 
     // The unwrap output of bob's signed message, sent with CRLF the
     // way a browser submits it: verifies against bob's pinned key.
@@ -770,7 +822,7 @@ async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
         srv.addr,
         &format!("/disputes/{dispute_id}/disclosures"),
         Some(&cookie(&token)),
-        &[("csrf", CSRF), ("unwrapped", &crlf(UNWRAP_BOB_SIGNED))],
+        &[("csrf", CSRF), ("unwrapped", &crlf(UNWRAP_BOB_SIGNED)), ("message_id", &signed_mid_s)],
     )
     .await;
     assert!(is_redirect(&r), "unwrap disclosure: {} {}", r.status, r.body);
@@ -788,11 +840,21 @@ async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
     assert!(page.body.contains("Evidence — signature verified"), "verified label shown");
 
     // An unwrapped but UNSIGNED message: stored as an unverified claim.
+    let unsigned_mid = plant_disclosable_message(
+        &pool,
+        conv,
+        seller,
+        buyer,
+        UNWRAP_BOB_UNSIGNED.as_bytes(),
+        sig_unix + 3600,
+    )
+    .await;
+    let unsigned_mid_s = unsigned_mid.to_string();
     let r = post_form(
         srv.addr,
         &format!("/disputes/{dispute_id}/disclosures"),
         Some(&cookie(&token)),
-        &[("csrf", CSRF), ("unwrapped", UNWRAP_BOB_UNSIGNED)],
+        &[("csrf", CSRF), ("unwrapped", UNWRAP_BOB_UNSIGNED), ("message_id", &unsigned_mid_s)],
     )
     .await;
     assert!(is_redirect(&r), "unsigned unwrap: {} {}", r.status, r.body);
@@ -806,7 +868,7 @@ async fn disclosure_unwrap_verified_and_unsigned_is_claim() {
         srv.addr,
         &format!("/disputes/{dispute_id}/disclosures"),
         Some(&cookie(&token)),
-        &[("csrf", CSRF), ("unwrapped", "this is not an unwrapped message")],
+        &[("csrf", CSRF), ("unwrapped", "this is not an unwrapped message"), ("message_id", &signed_mid_s)],
     )
     .await;
     assert!(is_redirect(&r), "garbage redirects with a message: {}", r.status);
@@ -935,7 +997,17 @@ async fn cert_refresh_accepts_new_signatures_only() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(stored, CERT_DAVE_EXTENDED.as_bytes(), "stored cert is the refresh");
+    // AMENDED (verification-fix V7, 2026-10-19): the stored
+    // certificate is the MERGE of the stored and submitted certs,
+    // not byte-equal to the submission — the old replace semantics
+    // let a stale export silently drop a revocation. What must
+    // hold now: the stored cert is still dave's key, it PASSES the
+    // upload policy (the short-expiry certificate on its own no
+    // longer does — the extension took effect), and it is not the
+    // pre-refresh bytes.
+    let info = app::keys::validate_cert(&stored).expect("the stored merged certificate validates");
+    assert_eq!(info.fingerprint, DAVE_FPR, "the refresh kept dave's key");
+    assert_ne!(stored, CERT_DAVE_SHORT.as_bytes(), "the refresh changed the stored certificate");
 
     // New key material (an added subkey): refused, stored cert kept.
     let r = refresh(CERT_DAVE_ADDED.to_string(), true).await;
@@ -950,7 +1022,7 @@ async fn cert_refresh_accepts_new_signatures_only() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(stored2, CERT_DAVE_EXTENDED.as_bytes());
+    assert_eq!(stored2, stored, "a refused refresh leaves the stored certificate untouched");
 
     // A different key entirely: refused.
     let r = refresh(CERT_BOB.to_string(), true).await;

@@ -216,6 +216,17 @@ fn packet_bytes(bytes: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
         return Err(EnvelopeError::NotEncrypted);
     }
     if let Some(start) = text.find("-----BEGIN PGP MESSAGE-----") {
+        // Nothing but whitespace may precede the BEGIN line (fix
+        // verification V8): the packet bytes are extracted here,
+        // but callers store the RAW submission as the message blob —
+        // text typed above the armor (a plaintext note like "the
+        // usual address, thanks") used to ride along into storage
+        // and delivery, readable by anyone with database or backup
+        // access in a system whose promise is ciphertext-only. The
+        // tail after the END line is checked the same way below.
+        if !text[..start].trim().is_empty() {
+            return Err(EnvelopeError::Malformed);
+        }
         let rest = &text[start + "-----BEGIN PGP MESSAGE-----".len()..];
         // Optional armor headers end at the first blank line. Lines
         // may end in LF or CRLF: browsers submit textarea content

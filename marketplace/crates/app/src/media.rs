@@ -12,6 +12,17 @@
 //! - **Concurrency cap.** A process-wide semaphore admits at most
 //!   `MAX_CONCURRENT_WORKERS` (2) workers at once; further uploads
 //!   queue instead of multiplying memory pressure.
+//! - **Per-job scratch.** Each job works in a fresh directory under
+//!   the pipeline tmp dir, deleted when the job ends. In the sandbox
+//!   that directory alone is bound at `/work`, so a worker can never
+//!   see another job's input or output.
+//! - **Bounded admission.** At most `MAX_CONCURRENT_WORKERS` running
+//!   plus `MAX_UPLOAD_QUEUE` (4) waiting jobs are in the system at
+//!   once. Admission is taken before an upload body is written to
+//!   disk (and the HTTP handler probes it before buffering the body
+//!   at all); past the bound the answer is `MediaError::Busy` →
+//!   HTTP 503, immediately. Uploads never pile up unbounded behind
+//!   the worker semaphore.
 //! - **Optional sandbox wrapper.** When the deployment sets
 //!   `MEDIA_WORKER_SANDBOX=bwrap` and provides bubblewrap, each
 //!   worker runs inside it: no network namespace, a tmpfs root with
@@ -35,9 +46,23 @@ use tokio::sync::Semaphore;
 /// CM2: at most this many media workers run at once, process-wide.
 pub const MAX_CONCURRENT_WORKERS: usize = 2;
 
+/// CM2 (fix verification): at most this many uploads may WAIT for a
+/// worker slot. Running + waiting is therefore bounded at
+/// `MAX_CONCURRENT_WORKERS + MAX_UPLOAD_QUEUE` (6) jobs in the
+/// system; an upload beyond that is refused (`MediaError::Busy`,
+/// HTTP 503) BEFORE its body is written anywhere, instead of piling
+/// up in memory behind the worker semaphore without limit — the
+/// exact hole the verification found in the first CM2 fix.
+pub const MAX_UPLOAD_QUEUE: usize = 4;
+
 fn worker_slots() -> &'static Semaphore {
     static SLOTS: OnceLock<Semaphore> = OnceLock::new();
     SLOTS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_WORKERS))
+}
+
+fn admission_slots() -> &'static Semaphore {
+    static SLOTS: OnceLock<Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_WORKERS + MAX_UPLOAD_QUEUE))
 }
 
 #[derive(Clone)]
@@ -52,6 +77,10 @@ pub enum MediaError {
     TooLarge,
     Rejected,
     WorkerFailed,
+    /// The bounded upload queue is full (CM2): the upload was
+    /// refused before its body was buffered or written to disk.
+    /// Callers answer 503.
+    Busy,
 }
 
 impl MediaPipeline {
@@ -89,6 +118,16 @@ impl MediaPipeline {
         let _ = tokio::fs::rename(&from, &to).await;
     }
 
+    /// True when every admission place (running + queued) is taken.
+    /// The upload handler probes this BEFORE buffering a request body,
+    /// so a saturated pipeline refuses excess uploads without reading
+    /// them at all. (A probe, by nature racy: the hard bound is the
+    /// admission permit taken inside `sanitize_with_timeout`, which
+    /// also answers `Busy` → 503 if the last place went meanwhile.)
+    pub fn admission_saturated(&self) -> bool {
+        admission_slots().try_acquire().is_err()
+    }
+
     /// Sanitize raw upload bytes. On success returns (stored_ref, width, height).
     pub async fn sanitize(&self, bytes: &[u8]) -> Result<(String, i32, i32), MediaError> {
         self.sanitize_with_timeout(bytes, Duration::from_secs(10)).await
@@ -104,11 +143,41 @@ impl MediaPipeline {
         if bytes.len() > 5 * 1024 * 1024 {
             return Err(MediaError::TooLarge);
         }
+        // CM2 (fix verification): admission BEFORE anything is
+        // written to disk. A job holds its admission permit for its
+        // whole life (running or queued for a worker), so at most
+        // MAX_CONCURRENT_WORKERS + MAX_UPLOAD_QUEUE uploads are ever
+        // in the system; the next one is refused at once.
+        let _admission = match admission_slots().try_acquire() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Err(MediaError::Busy),
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(MediaError::WorkerFailed),
+        };
         tokio::fs::create_dir_all(&self.tmp_dir).await.map_err(|_| MediaError::WorkerFailed)?;
         tokio::fs::create_dir_all(&self.media_dir).await.map_err(|_| MediaError::WorkerFailed)?;
         let stem = crate::db::public_id("");
-        let in_path = self.tmp_dir.join(format!("{stem}.in"));
-        let out_path = self.tmp_dir.join(format!("{stem}.out"));
+        // CM2 (fix verification): one scratch directory per job. The
+        // worker sees only its own job's files — in the sandbox this
+        // directory alone is bound at /work — and the whole directory
+        // is deleted when the job ends, on every exit path.
+        let job_dir = self.tmp_dir.join(&stem);
+        tokio::fs::create_dir_all(&job_dir).await.map_err(|_| MediaError::WorkerFailed)?;
+        let result = self.run_worker(&job_dir, &stem, bytes, timeout).await;
+        let _ = tokio::fs::remove_dir_all(&job_dir).await;
+        result
+    }
+
+    /// Run one worker job inside its private scratch directory
+    /// (`job_dir`, created by the caller; deleted by the caller).
+    async fn run_worker(
+        &self,
+        job_dir: &std::path::Path,
+        stem: &str,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<(String, i32, i32), MediaError> {
+        let in_path = job_dir.join("in");
+        let out_path = job_dir.join("out");
         tokio::fs::write(&in_path, bytes).await.map_err(|_| MediaError::WorkerFailed)?;
 
         // CM2: never more than MAX_CONCURRENT_WORKERS workers alive.
@@ -124,14 +193,9 @@ impl MediaPipeline {
         let run = cmd.output();
         let output = match tokio::time::timeout(timeout, run).await {
             Ok(Ok(o)) => o,
-            _ => {
-                let _ = tokio::fs::remove_file(&in_path).await;
-                return Err(MediaError::WorkerFailed);
-            }
+            _ => return Err(MediaError::WorkerFailed),
         };
-        let _ = tokio::fs::remove_file(&in_path).await;
         if !output.status.success() {
-            let _ = tokio::fs::remove_file(&out_path).await;
             return Err(MediaError::Rejected);
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -183,8 +247,13 @@ fn build_worker_command(
     if std::env::var("MEDIA_WORKER_SANDBOX").as_deref() == Ok("bwrap") {
         // Inside the sandbox the worker sees: /usr, /lib, /lib64
         // (read-only, for the dynamic loader), /dev, its own binary
-        // at /worker, the input at /in, and a scratch dir at /work
-        // (the pipeline tmp dir) holding the output. No network.
+        // at /worker, the input at /in, and the job's OWN scratch dir
+        // at /work (the output's parent — one directory per job, so
+        // concurrent workers cannot see each other's files). No
+        // network.
+        // /lib64 is bound with --ro-bind-try (fix verification CM2):
+        // some distributions have no /lib64 at all, and a plain
+        // --ro-bind of a missing source fails the whole spawn.
         let scratch = out_path.parent().unwrap_or(std::path::Path::new("/"));
         let out_name = out_path.file_name().unwrap_or_default();
         let mut cmd = tokio::process::Command::new("bwrap");
@@ -193,7 +262,7 @@ fn build_worker_command(
             .arg("--tmpfs").arg("/")
             .arg("--ro-bind").arg("/usr").arg("/usr")
             .arg("--ro-bind").arg("/lib").arg("/lib")
-            .arg("--ro-bind").arg("/lib64").arg("/lib64")
+            .arg("--ro-bind-try").arg("/lib64").arg("/lib64")
             .arg("--dev").arg("/dev")
             .arg("--ro-bind").arg(worker_path).arg("/worker")
             .arg("--ro-bind").arg(in_path).arg("/in")

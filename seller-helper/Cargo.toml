@@ -1,27 +1,38 @@
-# seller-helper — standalone seller tool for Direct Monero Payments v1.
+# The helper workspace (Alpha spec §14): three crates that build
+# together and are distributed as one tool —
+#   seller-helper  this package: the v1 seller library (config,
+#                  wallet RPC, batch generation) used by the legacy
+#                  seller commands.
+#   helper-core    the Hidden Trades library: statement handling,
+#                  buyer verify, the trade fold, the evidence store,
+#                  proof construction.
+#   helper-cli     the `helper` binary: seller and buyer modes.
 #
-# This crate is deliberately NOT a member of the marketplace workspace:
-# the empty [workspace] table below detaches it, so it builds entirely
-# on its own (`cargo build` in this directory) and can be distributed,
-# audited and rebuilt from source independently of the marketplace.
+# This workspace is deliberately NOT part of the marketplace
+# workspace: it builds entirely on its own (`cargo build` in this
+# directory) and can be distributed, audited and rebuilt from source
+# independently of the marketplace server. (Before the Alpha it was
+# a single crate; the empty [workspace] table that detached it is
+# now the member list below.)
 [package]
 name = "seller-helper"
 version = "0.1.0"
 edition = "2021"
-description = "Seller-side helper for Direct Monero Payments v1: pre-generates wallet-signed subaddresses via a local monero-wallet-rpc"
+description = "Seller-side helper library for Direct Monero Payments v1: pre-generates wallet-signed subaddresses via a local monero-wallet-rpc"
 license = "AGPL-3.0-or-later"
 
 [workspace]
-
-[[bin]]
-name = "seller-helper"
-path = "src/main.rs"
+members = [".", "helper-core", "helper-cli"]
 
 # Dependencies are kept minimal on purpose:
 # - `monero` (pinned to the same major the marketplace uses, 0.22) is the
-#   vetted crate used for address parsing / network / kind checks. No
-#   Monero cryptography is hand-rolled in this tool; signing happens in
-#   the seller's own wallet via RPC.
+#   vetted crate used for address parsing / network / kind checks. For
+#   the v1 commands in this crate, Monero signing happens in the seller's
+#   own wallet via RPC. (The Hidden Trades crates in this workspace are
+#   a different story: helper-core's proof.rs hand-rolls the OutProofV2
+#   construction from the reference algorithm — gated behind its
+#   non-default `proof-construction` feature — and statement signing is
+#   OpenPGP via sequoia, as everywhere in this build.)
 # - `serde` / `serde_json` for the config file, JSON-RPC and batch file.
 # - `md5` for HTTP Digest authentication against monero-wallet-rpc
 #   (Monero's epee server requires Digest auth when --rpc-login is set).

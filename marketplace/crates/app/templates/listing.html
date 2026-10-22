@@ -1,5 +1,8 @@
 <h1>{{ listing.title }}</h1>
 <p>{{ price_xmr }} XMR · {{ listing.category }} · seller <a href="/sellers/{{ listing.seller_public_id }}">{{ listing.seller_name }}</a></p>
+{% if let Some(lines) = terms_lines %}<p>{{ lines[0] }}<br>
+{{ lines[1] }}<br>
+{{ lines[2] }}</p>{% endif %}
 {% for m in media %}<p><img src="/media/{{ m.0 }}" width="{{ m.1 }}" height="{{ m.2 }}" alt="Listing image"></p>{% endfor %}
 <div>{{ description_html|safe }}</div>
 <p>Payment module: {{ listing.destination_module }} · Pricing: {{ listing.pricing_module }}</p>

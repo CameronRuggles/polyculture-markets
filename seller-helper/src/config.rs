@@ -159,7 +159,7 @@ pub fn default_config_path() -> PathBuf {
 pub fn load_config(path: &std::path::Path) -> Result<Config, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         format!(
-            "cannot read config {} ({e}); run `seller-helper init` first",
+            "cannot read config {} ({e}); run `helper seller init` first",
             path.display()
         )
     })?;

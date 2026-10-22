@@ -472,20 +472,39 @@ pub async fn unused_count(pool: &PgPool, seller_id: i64) -> Result<i64, PaymentE
 // Batch upload (all-or-nothing, one transaction)
 
 #[derive(Debug, serde::Deserialize)]
-struct BatchFile {
-    format: String,
-    marketplace_id: String,
-    network: String,
-    seller_id: String,
-    primary_address: String,
-    entries: Vec<BatchEntry>,
+pub struct BatchFile {
+    pub format: String,
+    pub marketplace_id: String,
+    pub network: String,
+    pub seller_id: String,
+    pub primary_address: String,
+    pub entries: Vec<BatchEntry>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct BatchEntry {
-    subaddress: String,
-    message: String,
-    signature: String,
+pub struct BatchEntry {
+    pub subaddress: String,
+    pub message: String,
+    pub signature: String,
+}
+
+/// The pure front end of batch upload (Modules Audit BL2): JSON
+/// parsing plus the header checks that need no database — format
+/// tag, marketplace id, network. `upload_batch` runs this first;
+/// it is a separate function so the fuzz targets exercise the
+/// exact parser the upload path uses, not a copy.
+pub fn parse_batch_header(batch_text: &str, cfg: &PaymentConfig) -> Result<BatchFile, PaymentError> {
+    let batch: BatchFile = serde_json::from_str(batch_text).map_err(|_| PaymentError::BadBatch)?;
+    if batch.format != "xmr-direct-batch-v1" {
+        return Err(PaymentError::WrongFormat);
+    }
+    if batch.marketplace_id != cfg.marketplace_id {
+        return Err(PaymentError::WrongMarketplace);
+    }
+    if batch.network != network_name(cfg.network) {
+        return Err(PaymentError::WrongNetwork);
+    }
+    Ok(batch)
 }
 
 /// Validate and store one uploaded batch. Every check runs before any
@@ -502,16 +521,7 @@ pub async fn upload_batch(
         // v1 ships no verifier; refuse rather than pretend to check.
         return Err(PaymentError::ServerCheckUnavailable);
     }
-    let batch: BatchFile = serde_json::from_str(batch_text).map_err(|_| PaymentError::BadBatch)?;
-    if batch.format != "xmr-direct-batch-v1" {
-        return Err(PaymentError::WrongFormat);
-    }
-    if batch.marketplace_id != cfg.marketplace_id {
-        return Err(PaymentError::WrongMarketplace);
-    }
-    if batch.network != network_name(cfg.network) {
-        return Err(PaymentError::WrongNetwork);
-    }
+    let batch = parse_batch_header(batch_text, cfg)?;
     let seller_pub = crate::db::public_id_of(pool, seller_id)
         .await?
         .ok_or(PaymentError::NotFound)?;

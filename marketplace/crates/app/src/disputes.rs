@@ -157,6 +157,15 @@ pub struct DisclosureView {
     pub signature_status: String, // verified | unverified_claim
     pub message: String,
     pub created_at: String,
+    /// Verification-fix V4: the two times the verification rule
+    /// compared, shown next to the disclosure so anyone reading it
+    /// can see WHY it carries its status — when the signature was
+    /// created, and when the message it unwraps arrived. `None` for
+    /// disclosures stored before they were tied to a message
+    /// (migration 0015) and for unverified claims with no good
+    /// signature.
+    pub signature_created_at: Option<String>,
+    pub message_received_at: Option<String>,
 }
 
 /// The cert a disclosed message must verify against: the OTHER party's
@@ -207,56 +216,18 @@ async fn other_party_cert(
     Ok(cert)
 }
 
-/// Submit a voluntary disclosure. `message` and `signature` are
-/// form-layer normalized (Q13) by the caller contract — this function
-/// applies `normalize_form_lines` itself so the verified bytes, the
-/// stored bytes, and the displayed bytes are the same bytes.
-pub async fn submit_disclosure(
-    pool: &PgPool,
-    kf: &KeyFile,
-    dispute_id: i64,
-    submitter_id: i64,
-    message_raw: &str,
-    signature_raw: &str,
-) -> Result<String, DisputeError> {
-    let dispute = get_dispute(pool, dispute_id).await?.ok_or(DisputeError::NotFound)?;
-    if dispute.state != "open" {
-        return Err(DisputeError::BadState);
-    }
-    let order = crate::orders::order_by_public_id(pool, &order_public_id(pool, dispute.order_id).await?)
-        .await
-        .ok_or(DisputeError::NotFound)?;
-    if submitter_id != order.buyer_id && submitter_id != order.seller_id {
-        return Err(DisputeError::Forbidden);
-    }
-    let message = normalize(message_raw)?;
-    let signature = normalize(signature_raw)?;
-    if message.is_empty() || signature.is_empty() || message.len() > 65_536 || signature.len() > 16_384 {
-        return Err(DisputeError::BadInput);
-    }
-    let cert = other_party_cert(pool, dispute.order_id, submitter_id).await?;
-    let verified = cert
-        .as_deref()
-        .map(|c| crate::keys::verify_detached(c, message.as_bytes(), signature.as_bytes()))
-        .unwrap_or(false);
-    let status = if verified { "verified" } else { "unverified_claim" };
-    let content = serde_json::to_vec(&DisclosureContent { message, signature })
-        .map_err(|_| DisputeError::Db)?;
-    let enc = kf.encrypt(&content);
-    sqlx::query(
-        "INSERT INTO disclosures (dispute_id, submitted_by, content_enc, signature_status)
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(dispute_id)
-    .bind(submitter_id)
-    .bind(&enc)
-    .bind(status)
-    .execute(pool)
-    .await
-    .map_err(|_| DisputeError::Db)?;
-    Ok(status.to_string())
-}
-
+/// RETIRED (owner decision 2026-10-18; applied 2026-10-19 in the
+/// verification-fix batch's locked-suite pass): the detached-
+/// signature `submit_disclosure` that used to sit here. It verified
+/// a message/signature pair against the other party's pinned key,
+/// but conversation messages are signed INLINE — no detached
+/// signature ever exists for them, so the function could only ever
+/// be exercised by tests, never by the product (the web layer has
+/// used the unwrap path below since MM1). The library surface now
+/// matches the product: `submit_disclosure_unwrapped` is the only
+/// way in. The locked Stage 9 disclosure scenarios were amended in
+/// the same pass to run through it.
+///
 /// Submit a disclosure as ONE paste: the output of
 /// `gpg --unwrap --armor` on the original encrypted message
 /// (messaging audit MM1). The pre-MM1 form asked for plaintext plus a
@@ -273,11 +244,25 @@ pub async fn submit_disclosure(
 /// (the proof artifact a moderator re-checks offline); the extracted
 /// plaintext is the displayed `message`. Returns the signature status
 /// ("verified" / "unverified_claim").
+///
+/// Verification-fix V4 (2026-10-19): the submitter also NAMES the
+/// conversation message being disclosed (`message_id`). Before this
+/// fix the check proved only "someone signed this text" — a signed
+/// message from another order, or one signed long before this
+/// order's conversation, was stored as verified evidence OF THIS
+/// DISPUTE. Now the named message must be in the disputed order's
+/// own conversation and sent by the other party, and `verified`
+/// additionally requires the signature to have been created within
+/// the 24 hours before that message arrived (and not after it):
+/// a party unwrapping a message they just received holds a fresh
+/// signature. Both times are stored on the row and shown on the
+/// dispute page.
 pub async fn submit_disclosure_unwrapped(
     pool: &PgPool,
     kf: &KeyFile,
     dispute_id: i64,
     submitter_id: i64,
+    message_id: i64,
     unwrapped_raw: &str,
 ) -> Result<String, DisputeError> {
     // Cap parity with the old pair (64 KiB message + 16 KiB
@@ -300,6 +285,26 @@ pub async fn submit_disclosure_unwrapped(
     if submitter_id != order.buyer_id && submitter_id != order.seller_id {
         return Err(DisputeError::Forbidden);
     }
+    let other = if submitter_id == order.buyer_id { order.seller_id } else { order.buyer_id };
+    // V4: the named message must belong to THIS order's conversation
+    // and have been sent by the other party — a disclosure unwraps a
+    // message the submitter RECEIVED in this conversation.
+    let named: Option<(i64, OffsetDateTime)> = sqlx::query_as(
+        "SELECT m.sender_id, m.received_at FROM encrypted_messages m
+           JOIN conversations c ON c.id = m.conversation_id
+          WHERE m.id = $1 AND c.order_id = $2",
+    )
+    .bind(message_id)
+    .bind(dispute.order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| DisputeError::Db)?;
+    let Some((sender_id, received_at)) = named else {
+        return Err(DisputeError::BadInput);
+    };
+    if sender_id != other {
+        return Err(DisputeError::BadInput);
+    }
     let cert = other_party_cert(pool, dispute.order_id, submitter_id).await?;
     let Some(extracted) = cert
         .as_deref()
@@ -311,7 +316,16 @@ pub async fn submit_disclosure_unwrapped(
     if extracted.plaintext.len() > 65_536 {
         return Err(DisputeError::BadInput);
     }
-    let status = if extracted.verified {
+    // V4 timing rule on top of the signature check.
+    let sig_created = extracted.signature_created_unix;
+    let timing_ok = match sig_created {
+        Some(created) => {
+            let received = received_at.unix_timestamp();
+            created <= received && created >= received - 24 * 60 * 60
+        }
+        None => false,
+    };
+    let status = if extracted.verified && timing_ok {
         "verified"
     } else {
         "unverified_claim"
@@ -322,24 +336,25 @@ pub async fn submit_disclosure_unwrapped(
     })
     .map_err(|_| DisputeError::Db)?;
     let enc = kf.encrypt(&content);
+    let sig_at = sig_created.and_then(|u| OffsetDateTime::from_unix_timestamp(u).ok());
     sqlx::query(
-        "INSERT INTO disclosures (dispute_id, submitted_by, content_enc, signature_status)
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO disclosures (dispute_id, submitted_by, content_enc, signature_status,
+                                  message_id, signature_created_at, message_received_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(dispute_id)
     .bind(submitter_id)
     .bind(&enc)
     .bind(status)
+    .bind(message_id)
+    .bind(sig_at)
+    .bind(received_at)
     .execute(pool)
     .await
     .map_err(|_| DisputeError::Db)?;
     Ok(status.to_string())
 }
 
-fn normalize(raw: &str) -> Result<String, DisputeError> {
-    let lines = modules_api::normalize_form_lines(raw).map_err(|_| DisputeError::BadInput)?;
-    Ok(lines.join("\n"))
-}
 
 async fn order_public_id(pool: &PgPool, order_id: i64) -> Result<String, DisputeError> {
     sqlx::query_scalar("SELECT public_id FROM orders WHERE id = $1")
@@ -354,8 +369,18 @@ pub async fn disclosures_for(
     kf: &KeyFile,
     dispute_id: i64,
 ) -> Result<Vec<DisclosureView>, DisputeError> {
-    let rows: Vec<(i64, i64, String, Vec<u8>, String, OffsetDateTime)> = sqlx::query_as(
-        "SELECT d.id, d.submitted_by, a.username, d.content_enc, d.signature_status, d.created_at
+    let rows: Vec<(
+        i64,
+        i64,
+        String,
+        Vec<u8>,
+        String,
+        OffsetDateTime,
+        Option<OffsetDateTime>,
+        Option<OffsetDateTime>,
+    )> = sqlx::query_as(
+        "SELECT d.id, d.submitted_by, a.username, d.content_enc, d.signature_status, d.created_at,
+                d.signature_created_at, d.message_received_at
            FROM disclosures d JOIN accounts a ON a.id = d.submitted_by
           WHERE d.dispute_id = $1 ORDER BY d.created_at",
     )
@@ -366,7 +391,7 @@ pub async fn disclosures_for(
     let f = time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
     Ok(rows
         .into_iter()
-        .map(|(id, by, username, enc, status, created)| {
+        .map(|(id, by, username, enc, status, created, sig_at, recv_at)| {
             let message = kf
                 .decrypt(&enc)
                 .and_then(|pt| serde_json::from_slice::<DisclosureContent>(&pt).ok())
@@ -379,6 +404,8 @@ pub async fn disclosures_for(
                 signature_status: status,
                 message,
                 created_at: created.format(&f).unwrap_or_default(),
+                signature_created_at: sig_at.map(|t| t.format(&f).unwrap_or_default()),
+                message_received_at: recv_at.map(|t| t.format(&f).unwrap_or_default()),
             }
         })
         .collect())

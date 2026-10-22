@@ -20,6 +20,7 @@ pub enum ReviewError {
     BadScore,
     TooLong,
     Empty,
+    FormatChars,
     EditWindowClosed,
     AlreadyReplied,
     NoReview,
@@ -73,6 +74,11 @@ pub async fn submit_review(
     }
     if text.chars().count() > cfg.review_max_chars {
         return Err(ReviewError::TooLong);
+    }
+    // BL3: no Unicode format characters (category Cf) in review
+    // text — it is displayed to other users verbatim.
+    if modules_api::contains_format_chars(text) {
+        return Err(ReviewError::FormatChars);
     }
     let existing: Option<(i64, OffsetDateTime)> =
         sqlx::query_as("SELECT id, created_at FROM reviews WHERE order_id = $1")
@@ -132,6 +138,10 @@ pub async fn seller_reply(
     }
     if text.chars().count() > cfg.review_max_chars {
         return Err(ReviewError::TooLong);
+    }
+    // BL3: the seller's reply is displayed verbatim too.
+    if modules_api::contains_format_chars(text) {
+        return Err(ReviewError::FormatChars);
     }
     let row: Option<(i64, Option<String>)> =
         sqlx::query_as("SELECT id, seller_reply FROM reviews WHERE order_id = $1")

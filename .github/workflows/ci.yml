@@ -1,0 +1,188 @@
+# CI — the automated backstop for the project's own rules (deployment
+# audit DM2). Runs on every push and pull request:
+#
+#   test            the full marketplace workspace suite (build
+#                   --locked + cargo test) against a real Postgres
+#                   service, seller-helper's suite included as its
+#                   own job below. The service starts EMPTY, so the
+#                   job first applies marketplace/migrations/*.sql
+#                   exactly as deploy/deploy-demo.sh does in
+#                   production (filename order, schema_migrations
+#                   bookkeeping) — the app never migrates on boot,
+#                   and no test suite creates the schema itself;
+#   security-tools  cargo audit + cargo deny for BOTH workspaces,
+#                   the Q8 Nettle crypto-backend guard, clippy;
+#   seller-helper   the standalone helper's build + tests;
+#   fuzz-smoke      the §22.5 bounded fuzz run (push/PR + weekly).
+#
+# This file supersedes marketplace/.github/workflows/security-tools.yml,
+# which sat where GitHub Actions never looks (workflows are only read
+# from .github/workflows at the REPOSITORY ROOT) and so never ran.
+# Its jobs were moved here and corrected for the repo-root layout
+# (the app tree is marketplace/ inside this repo; seller-helper is a
+# sibling directory, not ../seller-helper).
+#
+# Builds need Sequoia's Nettle backend (deploy/check-crypto-backend.sh
+# guards it). A stock runner's nettle-dev provides the headers and
+# pkg-config the local sandbox lacks, so the local
+# NETTLE_PREGENERATED_BINDINGS shim is unnecessary here — but if the
+# runner's nettle version drifts from production, pin it before
+# trusting a green run as a production signal.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly, so new advisories against the locked tree surface even
+    # when nothing in the repo changed.
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: marketplace test suite (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: marketplace_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: marketplace
+    env:
+      # The locked Stage 4 suite hardcodes this URL; keep the service
+      # credentials in lockstep with it.
+      DATABASE_URL: postgres://postgres:dev@localhost:5432/marketplace_dev
+      MEDIA_WORKER: ${{ github.workspace }}/marketplace/target/debug/media-worker
+      # MEDIA_DIR is set per-step below: the runner context is not
+      # available in job-level env (that invalid context failed the
+      # workflow at startup on its first live run, 2026-10-19).
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nettle-dev clang pkg-config postgresql-client
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build (locked, all targets)
+        run: cargo build --locked --workspace --all-targets
+      - name: Apply migrations (the service database starts empty)
+        # Mirrors deploy/deploy-demo.sh: plain SQL files in filename
+        # order, each recorded in schema_migrations. CI connects as
+        # the service superuser, so the deploy script's migrator-role
+        # separation does not apply here — the bookkeeping shape is
+        # kept so the CI database looks like a production one.
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+          for f in migrations/*.sql; do
+            v=$(basename "$f")
+            if [ "$(psql "$DATABASE_URL" -tAq -c "SELECT 1 FROM schema_migrations WHERE version = '$v'")" = "1" ]; then
+              continue
+            fi
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+            psql "$DATABASE_URL" -q -c "INSERT INTO schema_migrations (version) VALUES ('$v')"
+            echo "applied $v"
+          done
+      - name: Full test suite
+        env:
+          MEDIA_DIR: ${{ runner.temp }}/marketplace-media
+        run: |
+          mkdir -p "$MEDIA_DIR"
+          cargo test --locked --workspace
+
+  security-tools:
+    name: audit / deny / crypto guard / clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: marketplace
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nettle-dev clang pkg-config postgresql-client
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install cargo-audit and cargo-deny (prebuilt)
+        run: |
+          curl -sL https://github.com/RustSec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz | tar xz -C /tmp
+          sudo install -m755 /tmp/cargo-audit-x86_64-unknown-linux-musl-v0.22.2/cargo-audit /usr/local/bin/cargo-audit
+          curl -sL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          sudo install -m755 /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny /usr/local/bin/cargo-deny
+      - name: cargo audit (marketplace; ignore list in .cargo/audit.toml)
+        run: cargo audit
+      - name: cargo deny (marketplace)
+        run: cargo deny check
+      - name: cargo audit + deny (seller-helper)
+        working-directory: seller-helper
+        run: |
+          cargo audit
+          cargo deny check
+      - name: Crypto backend guard (Q8)
+        run: deploy/check-crypto-backend.sh
+      - name: Clippy (warnings are reported, not yet denied)
+        # The remaining warning backlog (type complexity, large Err
+        # variants, never-read DTO fields — see the 2026-10-17 report)
+        # is triaged but not zero, so this step does not use
+        # -D warnings yet. Promote it once the backlog is burned down.
+        run: cargo clippy --workspace --all-targets
+
+  seller-helper:
+    name: seller-helper build + tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: seller-helper
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang
+      - name: Install its pinned toolchain (if it pins one)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build (locked)
+        run: cargo build --locked
+      - name: Tests
+        run: cargo test --locked
+
+  fuzz-smoke:
+    name: fuzz smoke (60s per target)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: marketplace
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nettle-dev clang pkg-config
+      - name: Install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly
+          curl -sL https://github.com/rust-fuzz/cargo-fuzz/releases/download/0.13.2/cargo-fuzz-0.13.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp
+          sudo install -m755 /tmp/cargo-fuzz /usr/local/bin/cargo-fuzz
+      - name: Bounded fuzz smoke
+        working-directory: marketplace/fuzz
+        run: |
+          for t in envelope_validate envelope_keyref statements markup terms_file image_worker; do
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=60
+          done

@@ -410,6 +410,49 @@ pub fn validate_refresh(old_cert: &[u8], new_cert: &[u8]) -> Result<CertInfo, St
     Ok(new_info)
 }
 
+/// Merge a validated refresh INTO the stored certificate
+/// (verification-fix V7): the caller stores the MERGE, never the
+/// submission alone. `validate_refresh` checks the submission in
+/// isolation, so before this fix a user could submit an old export
+/// of their own certificate — one made before they revoked a
+/// subkey — and the stored copy would quietly lose the revocation,
+/// leaving a compromised subkey looking clean. Sequoia's
+/// `merge_public` unions the signature packets, so a revocation
+/// present in EITHER copy survives. The merged result must itself
+/// pass the full upload policy before it is stored.
+pub fn merged_refresh(old_cert: &[u8], new_cert: &[u8]) -> Result<Vec<u8>, String> {
+    let old = Cert::from_bytes(old_cert)
+        .map_err(|_| "The stored certificate could not be parsed.".to_string())?;
+    let new = Cert::from_bytes(new_cert)
+        .map_err(|_| "That is not a parseable OpenPGP certificate.".to_string())?;
+    let merged = old
+        .merge_public(new)
+        .map_err(|_| "The certificates could not be merged.".to_string())?;
+    // Serialize armored, matching what users paste and the DB
+    // stores everywhere else.
+    let bytes = {
+        use sequoia_openpgp::serialize::stream::{Armorer, Message};
+        let mut sink = Vec::new();
+        let message = Message::new(&mut sink);
+        let mut armorer = Armorer::new(message)
+            .kind(sequoia_openpgp::armor::Kind::PublicKey)
+            .build()
+            .map_err(|_| "The merged certificate could not be serialized.".to_string())?;
+        use sequoia_openpgp::serialize::Serialize as _;
+        merged
+            .serialize(&mut armorer)
+            .map_err(|_| "The merged certificate could not be serialized.".to_string())?;
+        armorer
+            .finalize()
+            .map_err(|_| "The merged certificate could not be serialized.".to_string())?;
+        sink
+    };
+    validate_cert(&bytes).map_err(|_| {
+        "The merged certificate is not usable under the upload policy.".to_string()
+    })?;
+    Ok(bytes)
+}
+
 /// Store a validated refresh: the current key row keeps its version
 /// and fingerprint; only the certificate bytes change (the fuller
 /// signature set supersedes the stored one).
@@ -440,12 +483,20 @@ pub async fn refresh_certificate(
 pub struct UnwrappedMessage {
     pub plaintext: String,
     pub verified: bool,
+    /// When the first good signature was created, from its own
+    /// creation-time subpacket, as a unix timestamp (verification-
+    /// fix V4: disclosures compare this against the named message's
+    /// arrival time — a signature far older than the message it
+    /// claims to unwrap cannot make the disclosure verified
+    /// evidence OF THAT MESSAGE). `None` with no good signature.
+    pub signature_created_unix: Option<i64>,
 }
 
 struct UnwrapHelper {
     cert: Cert,
     good: usize,
     bad: usize,
+    sig_created: Option<std::time::SystemTime>,
 }
 
 impl VerificationHelper for UnwrapHelper {
@@ -464,7 +515,24 @@ impl VerificationHelper for UnwrapHelper {
             if let MessageLayer::SignatureGroup { results } = layer {
                 for r in results {
                     match r {
-                        Ok(_) => self.good += 1,
+                        Ok(good) => {
+                            self.good += 1;
+                            if self.sig_created.is_none() {
+                                use sequoia_openpgp::packet::signature::subpacket::{
+                                    SubpacketTag, SubpacketValue,
+                                };
+                                if let Some(sp) = good
+                                    .sig
+                                    .hashed_area()
+                                    .subpacket(SubpacketTag::SignatureCreationTime)
+                                {
+                                    if let SubpacketValue::SignatureCreationTime(ts) = sp.value()
+                                    {
+                                        self.sig_created = Some((*ts).into());
+                                    }
+                                }
+                            }
+                        }
                         Err(_) => self.bad += 1,
                     }
                 }
@@ -485,7 +553,7 @@ pub fn extract_unwrapped_message(cert_bytes: &[u8], pasted: &[u8]) -> Option<Unw
     let policy = StandardPolicy::new();
     let mut verifier = VerifierBuilder::from_bytes(pasted)
         .ok()?
-        .with_policy(&policy, None, UnwrapHelper { cert, good: 0, bad: 0 })
+        .with_policy(&policy, None, UnwrapHelper { cert, good: 0, bad: 0, sig_created: None })
         .ok()?;
     let mut out = Vec::new();
     verifier.read_to_end(&mut out).ok()?;
@@ -493,6 +561,11 @@ pub fn extract_unwrapped_message(cert_bytes: &[u8], pasted: &[u8]) -> Option<Unw
     Some(UnwrappedMessage {
         plaintext: String::from_utf8_lossy(&out).into_owned(),
         verified: helper.good > 0 && helper.bad == 0,
+        signature_created_unix: helper.sig_created.map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        }),
     })
 }
 

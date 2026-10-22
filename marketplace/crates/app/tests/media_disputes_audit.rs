@@ -49,7 +49,7 @@ const CSRF: &str = "mediadisp-csrf";
 
 async fn pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    PgPoolOptions::new().max_connections(8).connect(&url).await.ok()
+    Some(PgPoolOptions::new().max_connections(8).connect(&url).await.expect("DATABASE_URL is set but the database is unreachable"))
 }
 
 fn uniq() -> String {
@@ -89,7 +89,10 @@ async fn make_account(pool: &PgPool, role: &str) -> (i64, String) {
 async fn enroll(pool: &PgPool, kf: &KeyFile, account_id: i64) -> Vec<u8> {
     let b32 = moderation::totp_begin(pool, kf, account_id).await.unwrap();
     let secret = totp::base32_decode(&b32).unwrap();
-    let c = code(&secret, 0);
+    // Enrollment confirmation consumes its step (owner decision
+    // 2026-10-18): confirm with the previous step's code so the
+    // current step stays fresh for gate presentations.
+    let c = code(&secret, -30);
     moderation::totp_confirm(pool, kf, account_id, &c).await.unwrap();
     assert!(moderation::totp_enrolled(pool, account_id).await.unwrap());
     secret
@@ -354,7 +357,13 @@ async fn takedown_blocks_seller_and_restore_only_touches_takedowns() {
     let found = app::listings::browse(&pool, None, None, 1).await.unwrap();
     assert!(!found.iter().any(|l| l.id == lid), "taken-down listing is not browsable");
 
-    // Restore returns the listing to its pre-takedown status.
+    // Restore clears the takedown and returns the listing to its
+    // pre-takedown status — with one deliberate exception since
+    // HT H1 audit fix task 10 (finding F14): a restore to
+    // 'published' re-checks the §4 terms publish gate, and this
+    // listing has no pinned terms, so it lands on 'paused' (the
+    // seller re-signs and re-publishes). The pinned case restoring
+    // to 'published' is covered in ht_publish_gate.rs.
     moderation::set_listing_removed(&pool, &lpub, moderator, false).await.expect("restore");
     let (status, taken_down): (String, bool) = sqlx::query_as(
         "SELECT status, taken_down_at IS NOT NULL FROM listings WHERE id = $1",
@@ -363,7 +372,7 @@ async fn takedown_blocks_seller_and_restore_only_touches_takedowns() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(status, "published", "restore returns the pre-takedown status");
+    assert_eq!(status, "paused", "restore to published is terms-gated (F14): no pin, so paused");
     assert!(!taken_down, "restore clears the takedown");
 
     // The seller's own removal is "withdrawn"; "removed" is refused.
@@ -486,8 +495,18 @@ async fn media_served_only_for_live_listings_and_quarantined_on_takedown() {
     .await;
     assert_eq!(r.status, 303, "restore POST redirects");
     assert!(srv.media_dir.join(&mref).exists(), "restore returns the file to the served folder");
+    // Since HT H1 audit fix task 10 (finding F14) the restore
+    // itself lands this listing on 'paused' — it has no pinned
+    // terms, and a restore to 'published' must pass the §4 gate —
+    // so the image is not public yet. The seller re-publishes
+    // (library primitive here, as elsewhere in this test; the
+    // gate lives on the web publish path) and the image is public
+    // again.
     let r = http(srv.addr, "GET", &path, None, None).await;
-    assert_eq!(r.status, 200, "restored listing image is public again");
+    assert_eq!(r.status, 404, "restored-to-paused listing image is not public (F14)");
+    app::listings::set_status(&pool, lid, seller, "published").await.unwrap();
+    let r = http(srv.addr, "GET", &path, None, None).await;
+    assert_eq!(r.status, 200, "re-published listing image is public again");
 
     srv.stop();
     cleanup(&pool, &[seller, buyer, moderator]).await;

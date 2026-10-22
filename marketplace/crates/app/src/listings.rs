@@ -38,6 +38,7 @@ pub enum ListingError {
     Category,
     DestinationModule,
     AutoInvoiceNeedsPool,
+    Terms,
 }
 
 /// Contract §8 signature: the price arrives already parsed to atomic units
@@ -55,7 +56,17 @@ pub fn validate_listing(
     if t.is_empty() || t.chars().count() > 120 || t.contains(['<', '>', '\n']) {
         return Err(ListingError::Title);
     }
+    // BL3: no Unicode format characters (category Cf — bidi
+    // overrides, zero-width characters, tag characters) in seller
+    // text: what the reader sees must be what the bytes say, in
+    // the catalogue and in the signed terms file alike.
+    if modules_api::contains_format_chars(t) {
+        return Err(ListingError::Title);
+    }
     if description.trim().is_empty() || description.chars().count() > 20_000 {
+        return Err(ListingError::Description);
+    }
+    if modules_api::contains_format_chars(description) {
         return Err(ListingError::Description);
     }
     if price_atomic == 0 {
@@ -98,6 +109,21 @@ fn row_to_listing(r: ListingRow) -> Listing {
 }
 
 type ListingRow = (i64, String, i64, String, String, String, String, i64, String, String, String, bool, String, bool);
+
+/// BL3: the per-listing delivery/refund terms get the same
+/// format-character rule as the title and description — they are
+/// bound into the buyer's terms file verbatim. (No current form
+/// writes these columns; the check runs where the terms are
+/// consumed, in order creation, so no path can carry Cf text
+/// into a terms file.)
+pub fn validate_listing_terms(delivery_terms: &str, refund_terms: &str) -> Result<(), ListingError> {
+    if modules_api::contains_format_chars(delivery_terms)
+        || modules_api::contains_format_chars(refund_terms)
+    {
+        return Err(ListingError::Terms);
+    }
+    Ok(())
+}
 
 pub async fn create_listing(
     pool: &PgPool,
@@ -362,4 +388,224 @@ mod tests {
             Err(ListingError::Category)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Signed listing terms v2 (Alpha spec §4; migration 0016): the
+// seller's helper produces a `marketplace-terms-v2` statement over
+// the listing's canonical terms text; the server verifies it against
+// the seller's pinned key and pins it per version. A listing cannot
+// be published without a current pinned version whose hash matches
+// the listing's current text (enforced at the publish path in web).
+
+/// One pinned terms version of a listing.
+#[derive(Debug, Clone)]
+pub struct TermsPin {
+    pub version: i64,
+    pub statement: String,
+    pub signature: String,
+    pub statement_sha256: String,
+    pub terms_sha256: String,
+    pub transit_risk: String,
+    pub remedy_cap_pct: i32,
+    pub payment_timing: String,
+}
+
+#[derive(Debug)]
+pub enum TermsError {
+    /// The statement does not parse as marketplace-terms-v2 for this
+    /// marketplace.
+    Malformed,
+    /// The statement names a different listing.
+    WrongListing,
+    /// The statement's version is not the next version for the
+    /// listing (versions pin in order, starting at 1).
+    Version,
+    /// The seller has no pinned key.
+    NoKey,
+    /// The statement's fingerprint is not the seller's current
+    /// pinned key.
+    KeyMismatch,
+    /// The statement does not bind the listing's current terms text.
+    TextMismatch,
+    /// The detached signature does not verify against the pinned key.
+    BadSignature,
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for TermsError {
+    fn from(e: sqlx::Error) -> Self {
+        TermsError::Db(e)
+    }
+}
+
+type TermsRow = (i64, String, String, String, String, String, i32, String);
+
+fn row_to_terms(r: TermsRow) -> TermsPin {
+    TermsPin {
+        version: r.0,
+        statement: r.1,
+        signature: r.2,
+        statement_sha256: r.3,
+        terms_sha256: r.4,
+        transit_risk: r.5,
+        remedy_cap_pct: r.6,
+        payment_timing: r.7,
+    }
+}
+
+const TERMS_COLS: &str = "version, statement, signature, statement_sha256, terms_sha256,
+    transit_risk, remedy_cap_pct, payment_timing";
+
+/// The listing's current (un-superseded) pinned terms, if any.
+pub async fn current_terms(pool: &PgPool, listing_id: i64) -> Result<Option<TermsPin>, sqlx::Error> {
+    let row: Option<TermsRow> = sqlx::query_as(&format!(
+        "SELECT {TERMS_COLS} FROM listing_terms_statements
+          WHERE listing_id = $1 AND superseded_at IS NULL"
+    ))
+    .bind(listing_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(row_to_terms))
+}
+
+/// The listing's canonical terms text (domain's one definition),
+/// from the listing's stored fields — the exact bytes whose
+/// SHA-256 the pinned terms statement binds, and the bytes the
+/// buyer's helper hashes at verify (§13/§14 check 3). Served to
+/// buyers as its own resource (audit F7: without it, no buyer
+/// could ever satisfy check 3 from what the site serves).
+pub async fn listing_terms_text_for(
+    pool: &PgPool,
+    listing: &Listing,
+) -> Result<String, sqlx::Error> {
+    let (delivery_terms, refund_terms): (String, String) = sqlx::query_as(
+        "SELECT delivery_terms, refund_terms FROM listings WHERE id = $1",
+    )
+    .bind(listing.id)
+    .fetch_one(pool)
+    .await?;
+    Ok(domain::ht_statements::listing_terms_text(
+        &listing.title,
+        &listing.description,
+        &delivery_terms,
+        &refund_terms,
+        listing.price_atomic as u64,
+    ))
+}
+
+/// The listing's canonical terms text's SHA-256.
+async fn listing_terms_digest(pool: &PgPool, listing: &Listing) -> Result<String, sqlx::Error> {
+    let text = listing_terms_text_for(pool, listing).await?;
+    Ok(domain::ht_statements::sha256_hex(text.as_bytes()))
+}
+
+/// Verify and pin a seller-submitted terms statement for `listing`
+/// (§4 rule 1: verified against the seller's pinned key, here and at
+/// every later version). On success the previous current version is
+/// superseded in the same transaction (it stays readable for 12
+/// months, §15.7).
+pub async fn submit_terms(
+    pool: &PgPool,
+    marketplace_id: &str,
+    listing: &Listing,
+    statement_text: &str,
+    signature_armored: &str,
+) -> Result<TermsPin, TermsError> {
+    let stmt = domain::ht_statements::parse_terms_statement(statement_text, marketplace_id)
+        .ok_or(TermsError::Malformed)?;
+    if stmt.listing_id != listing.public_id {
+        return Err(TermsError::WrongListing);
+    }
+    let (fpr, cert, _v) = crate::keys::current_key(pool, listing.seller_id)
+        .await?
+        .ok_or(TermsError::NoKey)?;
+    if stmt.seller_key_fingerprint != fpr {
+        return Err(TermsError::KeyMismatch);
+    }
+    if stmt.terms_sha256 != listing_terms_digest(pool, listing).await? {
+        return Err(TermsError::TextMismatch);
+    }
+    if !crate::keys::verify_detached(&cert, statement_text.as_bytes(), signature_armored.as_bytes()) {
+        return Err(TermsError::BadSignature);
+    }
+    let current = current_terms(pool, listing.id).await?;
+    let next = current.as_ref().map(|c| c.version + 1).unwrap_or(1);
+    if stmt.listing_version != next as u64 {
+        return Err(TermsError::Version);
+    }
+    let pin = TermsPin {
+        version: next,
+        statement: statement_text.to_string(),
+        signature: signature_armored.to_string(),
+        statement_sha256: domain::ht_statements::terms_statement_sha256(statement_text.as_bytes()),
+        terms_sha256: stmt.terms_sha256.clone(),
+        transit_risk: stmt.risk.transit_risk.as_str().to_string(),
+        remedy_cap_pct: stmt.risk.remedy_cap_pct as i32,
+        payment_timing: stmt.risk.payment_timing.as_str().to_string(),
+    };
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE listing_terms_statements SET superseded_at = now()
+          WHERE listing_id = $1 AND superseded_at IS NULL",
+    )
+    .bind(listing.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO listing_terms_statements
+            (listing_id, version, statement, signature, statement_sha256, terms_sha256,
+             transit_risk, remedy_cap_pct, payment_timing)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(listing.id)
+    .bind(pin.version)
+    .bind(&pin.statement)
+    .bind(&pin.signature)
+    .bind(&pin.statement_sha256)
+    .bind(&pin.terms_sha256)
+    .bind(&pin.transit_risk)
+    .bind(pin.remedy_cap_pct)
+    .bind(&pin.payment_timing)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(pin)
+}
+
+/// True when the listing has a current pinned terms version whose
+/// hash still matches the listing's current text — the publish gate
+/// (§4: verified at publish and at every edit; any text change
+/// without a re-signed statement fails this check).
+pub async fn terms_match_listing(pool: &PgPool, listing: &Listing) -> bool {
+    let (Ok(Some(pin)), Ok(digest)) = (
+        current_terms(pool, listing.id).await,
+        listing_terms_digest(pool, listing).await,
+    ) else {
+        return false;
+    };
+    pin.terms_sha256 == digest
+}
+
+/// The three risk fields in the spec's fixed display wording (§4),
+/// rendered beside the price wherever terms are pinned. The wording
+/// is the spec's exactly; only the cap number is substituted.
+pub fn terms_risk_lines(transit_risk: &str, remedy_cap_pct: i64, payment_timing: &str) -> [String; 3] {
+    let transit = match transit_risk {
+        "seller" => "If it's lost in the post, the seller refunds or reships.".to_string(),
+        "buyer" => "Once the seller signs that it shipped, loss in the post is yours.".to_string(),
+        _ => String::new(),
+    };
+    let remedy = if remedy_cap_pct == 0 {
+        "Sold as-is. No refund for quality or wrong-item complaints unless the listing itself is contradicted.".to_string()
+    } else {
+        format!("Raise an issue within 30 days of shipping and the seller has promised a refund of up to {remedy_cap_pct}%.")
+    };
+    let timing = match payment_timing {
+        "prepay" => "You pay before it ships.".to_string(),
+        "on_ship" => "You pay once the seller signs that it shipped.".to_string(),
+        "on_receipt" => "The seller ships first; you pay by the date in your assignment.".to_string(),
+        _ => String::new(),
+    };
+    [transit, remedy, timing]
 }

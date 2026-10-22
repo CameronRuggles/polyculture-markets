@@ -1,7 +1,12 @@
 //! domain — state machines, money, and canonical statements (spec §9, §10).
-//! Only the core changes state, and only through these transition tables
-//! (spec §3 invariant 10).
+//! Only the core changes v1 order/invoice state, and only through these
+//! transition tables (spec §3 invariant 10, v1 scope). Hidden Trades state
+//! is computed by the helpers from signed statements with the shared fold
+//! in this crate (the amended invariant (10), scoped to Hidden Trades —
+//! see docs/invariants.md, Scope paragraph, owner decision Q4 2026-10-21).
 
+pub mod ht_fold;
+pub mod ht_statements;
 pub mod markup;
 pub mod statements;
 
@@ -206,6 +211,49 @@ pub fn validate_canonical_timestamp(s: &str) -> bool {
         "[year]-[month]-[day]T[hour]:[minute]:[second]Z"
     );
     dt.format(&format).map(|out| out == s).unwrap_or(false)
+}
+
+/// Canonical calendar date `YYYY-MM-DD` (Alpha spec §5: the `date` /
+/// `month` fields of the Hidden Trades statements): exactly 10 bytes,
+/// a real calendar date, byte-identical on re-format. No trimming.
+pub fn validate_canonical_date(s: &str) -> bool {
+    parse_canonical_date(s).is_some()
+}
+
+/// The parsed form of [`validate_canonical_date`].
+pub fn parse_canonical_date(s: &str) -> Option<time::Date> {
+    if s.len() != 10 {
+        return None;
+    }
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    let d = time::Date::parse(s, &format).ok()?;
+    (d.format(&format).ok()? == s).then_some(d)
+}
+
+/// `date + days`, re-rendered canonically; `None` when the input is
+/// not a canonical date or the addition overflows the calendar.
+pub fn date_add_days(s: &str, days: u32) -> Option<String> {
+    let d = parse_canonical_date(s)?.checked_add(time::Duration::days(i64::from(days)))?;
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    d.format(&format).ok()
+}
+
+/// Canonical month `YYYY-MM` (Alpha spec §5: settle / receipt / vouch
+/// statements): exactly 7 bytes, month 01–12, byte-identical on
+/// re-format.
+pub fn validate_canonical_month(s: &str) -> bool {
+    if s.len() != 7 || s.as_bytes().get(4) != Some(&b'-') {
+        return false;
+    }
+    let (year, month) = s.split_at(4);
+    let month = &month[1..];
+    if !year.bytes().all(|b| b.is_ascii_digit()) || !month.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(month) = month.parse::<u8>() else {
+        return false;
+    };
+    (1..=12).contains(&month)
 }
 
 // ---------------------------------------------------------------------------

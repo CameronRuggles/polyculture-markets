@@ -57,6 +57,21 @@
 //!      the six action strings.
 //!    - `accept` by the seller on a Requested order with no issued invoice
 //!      yields InvoiceRequired. `accept` by the buyer is an error.
+//!      AMENDMENT (owner decision 2026-10-19 — BL1 completion,
+//!      task-2 remainder): the InvoiceRequired clause above is
+//!      SUPERSEDED — it is kept verbatim for the record. The owner
+//!      delegated the BL1 completion decision to Muse ("do
+//!      whatever you think is best", 2026-10-19), who authorized
+//!      the BL1 amendment pass and its extension to this file and
+//!      blind_direct_v1.rs. The §9 invoice gate in `apply_action`
+//!      was removed: the invoice system is retired, nothing issues
+//!      invoices, and the gate made assignment-less orders
+//!      unacceptable forever. The test
+//!      `c_accept_without_issued_invoice_yields_invoice_required`
+//!      below is kept visible in its original form, followed by
+//!      its replacement asserting the new behaviour (seller accept
+//!      succeeds into AwaitingPayment; buyer accept remains an
+//!      error). See BL1-TASK2-AMENDMENT-REPORT-2026-10-19.md.
 //!    - `decline`: seller moves Requested -> Declined and the new state is
 //!      persisted; buyer is refused with TransitionDenied.
 //!    - `cancel`: buyer cancels from Requested; seller cancelling from
@@ -1201,30 +1216,62 @@ async fn c_non_participant_gets_transition_denied_for_every_action() {
     assert_eq!(after.state, "Requested");
 }
 
+// AMENDED 2026-10-19 (BL1 completion, task-2 remainder — owner
+// decision chain: the owner delegated the BL1 completion decision
+// to Muse with "do whatever you think is best", 2026-10-19; the
+// amendment pass authorized on that delegation was extended to
+// this file and blind_direct_v1.rs). The original test is kept
+// visible, commented out in place; its replacement follows.
+//
+// #[tokio::test]
+// async fn c_accept_without_issued_invoice_yields_invoice_required() {
+//     let pool = pool().await;
+//     let shop = make_shop(&pool, 1_000_000).await;
+//     let (buyer_id, _) = make_account(&pool, "buyer", 72).await;
+//     let order = fresh_order(&pool, &shop, buyer_id).await;
+//
+//     // No invoice exists (invoice issuance is Stage 6/7 surface), so the
+//     // seller's accept must be refused with InvoiceRequired, per
+//     // contract §11: "until the payment stages, accept is always refused
+//     // with that reason".
+//     let err = apply_action(&pool, &order, "accept", shop.seller_id)
+//         .await
+//         .expect_err("accept without an issued invoice must be refused");
+//     assert!(matches!(err, OrderError::InvoiceRequired), "got {err:?}");
+//
+//     // The buyer attempting accept is an error too (wrong actor for the
+//     // Requested -> AwaitingPayment seller row). The documents do not pin
+//     // whether the actor check or the invoice guard fires first for a
+//     // wrong actor, so only the error itself is asserted here.
+//     assert!(apply_action(&pool, &order, "accept", buyer_id).await.is_err());
+//
+//     let after = order_by_public_id(&pool, &order.public_id).await.unwrap();
+//     assert_eq!(after.state, "Requested");
+// }
+
 #[tokio::test]
-async fn c_accept_without_issued_invoice_yields_invoice_required() {
+async fn c_accept_without_issued_invoice_succeeds_since_bl1_amendment() {
     let pool = pool().await;
     let shop = make_shop(&pool, 1_000_000).await;
     let (buyer_id, _) = make_account(&pool, "buyer", 72).await;
     let order = fresh_order(&pool, &shop, buyer_id).await;
 
-    // No invoice exists (invoice issuance is Stage 6/7 surface), so the
-    // seller's accept must be refused with InvoiceRequired, per
-    // contract §11: "until the payment stages, accept is always refused
-    // with that reason".
-    let err = apply_action(&pool, &order, "accept", shop.seller_id)
+    // Replacement for the test above (BL1 amendment, 2026-10-19):
+    // no invoice exists (nothing issues invoices since Direct
+    // Payments retired the invoice system), and with the §9 invoice
+    // gate removed from apply_action the seller's accept succeeds
+    // and the order moves to AwaitingPayment.
+    let state = apply_action(&pool, &order, "accept", shop.seller_id)
         .await
-        .expect_err("accept without an issued invoice must be refused");
-    assert!(matches!(err, OrderError::InvoiceRequired), "got {err:?}");
+        .expect("seller accept must succeed since the BL1 amendment");
+    assert!(matches!(state, OrderState::AwaitingPayment));
 
-    // The buyer attempting accept is an error too (wrong actor for the
-    // Requested -> AwaitingPayment seller row). The documents do not pin
-    // whether the actor check or the invoice guard fires first for a
-    // wrong actor, so only the error itself is asserted here.
+    // The buyer attempting accept is an error too (wrong actor for
+    // the Requested -> AwaitingPayment seller row).
     assert!(apply_action(&pool, &order, "accept", buyer_id).await.is_err());
 
     let after = order_by_public_id(&pool, &order.public_id).await.unwrap();
-    assert_eq!(after.state, "Requested");
+    assert_eq!(after.state, "AwaitingPayment");
 }
 
 #[tokio::test]

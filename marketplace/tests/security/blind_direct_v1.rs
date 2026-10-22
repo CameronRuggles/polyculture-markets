@@ -120,6 +120,25 @@
 //!       tests assert refusal + no order created + no pool entry
 //!       consumed, not a variant name.
 //!
+//! AMENDMENT (owner decision 2026-10-19 — BL1 completion, task-2
+//! remainder): A11's final clause — "the legacy no-assignment accept
+//! still yields InvoiceRequired per amendment (e)" — is SUPERSEDED.
+//! The owner was asked whether to authorize the BL1 amendment pass
+//! and delegated the decision ("do whatever you think is best",
+//! 2026-10-19); the decision was YES, and the pass was extended to
+//! this file and blind_stage4.rs for this item. The §9 invoice gate
+//! in `apply_action` was removed: the invoice system is retired,
+//! nothing issues invoices, and the gate made assignment-less
+//! (legacy, pre-Direct-Payments) orders unacceptable forever. The
+//! test `accept_on_legacy_order_still_requires_invoice` is kept
+//! visible below in its original form, followed by its replacement
+//! asserting the new behaviour: a legacy order's accept succeeds
+//! into AwaitingPayment with no invoice in existence, and
+//! mark_paid still refuses it with NoAssignment, so acceptance
+//! opens no payment path. A11 and the plain-language list below
+//! otherwise stand as originally locked; see
+//! BL1-TASK2-AMENDMENT-REPORT-2026-10-19.md.
+//!
 //! PLAIN-LANGUAGE ASSERTION LIST (grouped):
 //!   Pure helpers: payment_seller_id derives "acct-<32 hex>" from
 //!   "acct_<32 hex>" and rejects everything else; canonical_message
@@ -1831,20 +1850,54 @@ async fn mark_paid_state_and_assignment_guards() {
     assert!(mark_paid(&pool, &ghost, shop.seller_id, &cfg()).await.is_err());
 }
 
+// AMENDED 2026-10-19 (BL1 completion, task-2 remainder — owner
+// decision chain: the owner delegated the BL1 completion decision
+// to Muse with "do whatever you think is best", 2026-10-19; the
+// amendment pass authorized on that delegation was extended to
+// this file and blind_stage4.rs). The original test is kept
+// visible, commented out in place; its replacement follows.
+//
+// #[tokio::test]
+// async fn accept_on_legacy_order_still_requires_invoice() {
+//     // Amendment (e): orders without an assignment keep the Stage 4
+//     // behaviour — accept is refused with InvoiceRequired.
+//     let pool = pool().await;
+//     let legacy = make_shop(&pool).await;
+//     let buyer = make_buyer(&pool).await;
+//     let (order, _) = create_pay_order(&pool, &cfg(), buyer, &legacy)
+//         .await
+//         .unwrap();
+//     let err = apply_action(&pool, &order, "accept", legacy.seller_id)
+//         .await
+//         .expect_err("legacy accept without an issued invoice must be refused");
+//     assert!(matches!(err, OrderError::InvoiceRequired), "got {err:?}");
+// }
+
 #[tokio::test]
-async fn accept_on_legacy_order_still_requires_invoice() {
-    // Amendment (e): orders without an assignment keep the Stage 4
-    // behaviour — accept is refused with InvoiceRequired.
+async fn accept_on_legacy_order_succeeds_without_invoice_but_cannot_be_marked_paid() {
+    // Replacement for the test above (BL1 amendment, 2026-10-19):
+    // the §9 invoice gate in apply_action was removed — the invoice
+    // system is retired and nothing issues invoices — so a legacy
+    // (no-assignment) order's accept now succeeds into
+    // AwaitingPayment with no invoice in existence. No payment path
+    // opens: mark_paid still refuses the unassigned order with
+    // NoAssignment.
     let pool = pool().await;
     let legacy = make_shop(&pool).await;
     let buyer = make_buyer(&pool).await;
     let (order, _) = create_pay_order(&pool, &cfg(), buyer, &legacy)
         .await
         .unwrap();
-    let err = apply_action(&pool, &order, "accept", legacy.seller_id)
+    let state = apply_action(&pool, &order, "accept", legacy.seller_id)
         .await
-        .expect_err("legacy accept without an issued invoice must be refused");
-    assert!(matches!(err, OrderError::InvoiceRequired), "got {err:?}");
+        .expect("legacy accept must succeed since the BL1 amendment removed the invoice gate");
+    assert!(matches!(state, domain::OrderState::AwaitingPayment), "got {state:?}");
+    let order = order_by_public_id(&pool, &order.public_id).await.unwrap();
+    assert_eq!(order.state, "AwaitingPayment");
+    let err = mark_paid(&pool, &order, legacy.seller_id, &cfg())
+        .await
+        .expect_err("mark-paid without an assignment must be refused");
+    assert!(matches!(err, PaymentError::NoAssignment), "got {err:?}");
 }
 
 // =====================================================================

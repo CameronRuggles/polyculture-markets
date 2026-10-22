@@ -24,7 +24,7 @@
 //! locked blind suite can exercise the full truth table without
 //! touching process env.
 
-use modules_api::Network;
+use modules_api::{validate_public_id, Network};
 
 /// The exact `MAINNET_CONFIRM` value. Deliberately a sentence, not a
 /// boolean: it cannot be produced by a stray `=1`, a copied dev env
@@ -99,6 +99,16 @@ pub struct InstanceConfig {
     /// default must never drift ("vespiary-market", owner-approved
     /// 2026-10-15).
     pub marketplace_id: String,
+    /// HT_MARKETPLACE_ID — the Hidden Trades statement identity
+    /// (`mkt_` + 32 lowercase hex). Permanent per instance and
+    /// deliberately distinct from the v1 slug above: HT statements
+    /// pin this value byte-exact (the domain family's `mkt_` rule,
+    /// audit F1), so for the life of an instance it must never
+    /// drift. The operator may fix it via the environment (strictly
+    /// validated); otherwise `resolve` generates a fresh one and
+    /// main persists exactly one generation beside the key file
+    /// (htid.rs) — the key file's generated-once lifecycle.
+    pub ht_marketplace_id: String,
     /// SITE_NAME — shown in the header of every page.
     pub site_name: String,
     /// BIND_ADDR. Loopback by default in every profile.
@@ -109,11 +119,30 @@ pub struct InstanceConfig {
     pub dev_cookies: bool,
     /// REGISTRATIONS_OPEN.
     pub registrations_open: bool,
+    /// ACCOUNT_CAP — the most accounts this instance will ever
+    /// register (verification-fix V9: this reaches InstanceConfig
+    /// from the environment like every other instance limit; before
+    /// this fix the web layer's cap was hard-wired to None — off —
+    /// in main). None = no cap.
+    pub account_cap: Option<u64>,
     /// SOURCE_URL — where this instance's source code lives (AGPL).
     /// Shown on the /source page and in the footer when set.
     pub source_url: Option<String>,
     /// Build version, reported in the footer and on /limitations.
     pub version: &'static str,
+}
+
+/// A fresh Hidden Trades marketplace id: `mkt_` + 32 lowercase hex
+/// (16 random bytes) — exactly the shape
+/// `modules_api::validate_public_id` demands of every
+/// statement-family id. Generation happens here; permanence is
+/// main's job (htid.rs persists the first generation and every
+/// later start loads it back).
+pub(crate) fn generate_ht_marketplace_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("mkt_{}", hex::encode(bytes))
 }
 
 impl InstanceConfig {
@@ -157,6 +186,15 @@ impl InstanceConfig {
             Some(v) if !v.is_empty() => v,
             Some(_) => return Err(ConfigError::InvalidValue("MARKETPLACE_ID")),
         };
+        // HT_MARKETPLACE_ID: an operator-supplied value must already
+        // be a statement-family id — the slug, a truncated id, or
+        // uppercase hex would be refused by every HT parser on every
+        // statement, so it is refused here instead, at startup.
+        let ht_marketplace_id = match get("HT_MARKETPLACE_ID") {
+            None => generate_ht_marketplace_id(),
+            Some(v) if validate_public_id(&v, "mkt_") => v,
+            Some(_) => return Err(ConfigError::InvalidValue("HT_MARKETPLACE_ID")),
+        };
         let site_name = match get("SITE_NAME") {
             Some(v) if !v.is_empty() => v,
             _ => "Polyculture Markets".to_string(),
@@ -180,15 +218,24 @@ impl InstanceConfig {
             Some(v) if !v.is_empty() => Some(v),
             _ => None,
         };
+        let account_cap = match get("ACCOUNT_CAP") {
+            None => None,
+            Some(v) => match v.trim().parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => return Err(ConfigError::InvalidValue("ACCOUNT_CAP")),
+            },
+        };
 
         Ok(InstanceConfig {
             profile,
             network,
             marketplace_id,
+            ht_marketplace_id,
             site_name,
             bind_addr,
             dev_cookies,
             registrations_open,
+            account_cap,
             source_url,
             version: env!("CARGO_PKG_VERSION"),
         })
@@ -214,6 +261,24 @@ mod tests {
         let map: HashMap<String, String> =
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         InstanceConfig::resolve(&|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn account_cap_comes_from_the_environment() {
+        // V9: unset = no cap; a number = the cap; junk fails closed.
+        assert_eq!(resolve(&[]).unwrap().account_cap, None);
+        assert_eq!(
+            resolve(&[("ACCOUNT_CAP", "500")]).unwrap().account_cap,
+            Some(500)
+        );
+        assert_eq!(
+            resolve(&[("ACCOUNT_CAP", "lots")]).unwrap_err(),
+            ConfigError::InvalidValue("ACCOUNT_CAP")
+        );
+        assert_eq!(
+            resolve(&[("ACCOUNT_CAP", "-5")]).unwrap_err(),
+            ConfigError::InvalidValue("ACCOUNT_CAP")
+        );
     }
 
     #[test]
@@ -361,5 +426,45 @@ mod tests {
         );
         let c = resolve(&[("SOURCE_URL", "https://example.org/src")]).unwrap();
         assert_eq!(c.source_url.as_deref(), Some("https://example.org/src"));
+    }
+
+    #[test]
+    fn ht_marketplace_id_defaults_to_a_fresh_valid_id() {
+        // F1: with nothing set, resolution must still yield an id
+        // the HT statement parsers accept — never the v1 slug.
+        let a = resolve(&[]).unwrap();
+        let b = resolve(&[]).unwrap();
+        assert!(validate_public_id(&a.ht_marketplace_id, "mkt_"));
+        assert_ne!(
+            a.ht_marketplace_id, a.marketplace_id,
+            "the HT identity is distinct from the v1 slug"
+        );
+        assert_ne!(
+            a.ht_marketplace_id, b.ht_marketplace_id,
+            "each resolution generates; main persists one generation (htid.rs)"
+        );
+    }
+
+    #[test]
+    fn ht_marketplace_id_env_override_is_strict() {
+        let good = "mkt_0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            resolve(&[("HT_MARKETPLACE_ID", good)]).unwrap().ht_marketplace_id,
+            good
+        );
+        for bad in [
+            "vespiary-market",
+            "mkt_0123",
+            "mkt_0123456789ABCDEF0123456789ABCDEF",
+            "mkt_0123456789abcdef0123456789abcdeg",
+            "mkt_0123456789abcdef0123456789abcdef00",
+            "",
+        ] {
+            assert_eq!(
+                resolve(&[("HT_MARKETPLACE_ID", bad)]),
+                Err(ConfigError::InvalidValue("HT_MARKETPLACE_ID")),
+                "ht id {bad:?} must be refused at resolution, not by every statement"
+            );
+        }
     }
 }

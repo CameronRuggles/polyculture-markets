@@ -87,28 +87,33 @@ pub const TOTP_LOCK_MINUTES: i64 = 15;
 /// code observed once is useless to an attacker either way, and the
 /// legitimate holder racing their own code must not lock themselves
 /// out).
+///
+/// Verification-fix V5 (2026-10-19): the counter and the replay
+/// claim are ATOMIC. The first version read the count/step, decided
+/// in Rust, and wrote back — concurrent requests all read the same
+/// state, so a parallel burst of wrong codes counted as one failure
+/// and the same valid code presented twice at the same instant
+/// passed twice. Now the failure increment is a single
+/// `SET count = count + 1 ... RETURNING` guarded against a live
+/// lock, the lock trip is a conditional claim (exactly one caller
+/// owns the episode and its notice), and a step is accepted only
+/// through a conditional UPDATE that zero rows turn into a replay.
 pub async fn verify_totp_gate(
     pool: &PgPool,
     kf: &KeyFile,
     account_id: i64,
     presented_code: &str,
 ) -> Result<(), ModError> {
-    let row: Option<(
-        Option<Vec<u8>>,
-        Option<OffsetDateTime>,
-        Option<i64>,
-        i32,
-        Option<OffsetDateTime>,
-    )> = sqlx::query_as(
-        "SELECT totp_secret_enc, totp_enabled_at, totp_last_step, totp_fail_count,
-                totp_locked_until
-           FROM accounts WHERE id = $1",
-    )
-    .bind(account_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|_| ModError::Db)?;
-    let Some((secret_enc, enabled_at, last_step, fail_count, locked_until)) = row else {
+    let row: Option<(Option<Vec<u8>>, Option<OffsetDateTime>, Option<OffsetDateTime>)> =
+        sqlx::query_as(
+            "SELECT totp_secret_enc, totp_enabled_at, totp_locked_until
+               FROM accounts WHERE id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ModError::Db)?;
+    let Some((secret_enc, enabled_at, locked_until)) = row else {
         return Err(ModError::NotFound);
     };
     let (Some(enc), Some(_)) = (secret_enc, enabled_at) else {
@@ -135,47 +140,58 @@ pub async fn verify_totp_gate(
     let now_secs = now.unix_timestamp().max(0) as u64;
     match crate::totp::verify_step(&secret, presented_code, now_secs) {
         Some(step) => {
-            if let Some(last) = last_step {
-                if (step as i64) <= last {
-                    return Err(ModError::TotpReplayed);
-                }
-            }
-            sqlx::query(
+            // Claim the step atomically: the UPDATE lands only when
+            // no step >= this one has been accepted. Zero rows means
+            // a concurrent (or earlier) request already consumed it.
+            let claim = sqlx::query(
                 "UPDATE accounts SET totp_last_step = $2, totp_fail_count = 0,
                         totp_locked_until = NULL, totp_lock_notified_at = NULL
-                  WHERE id = $1",
+                  WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)",
             )
             .bind(account_id)
             .bind(step as i64)
             .execute(pool)
             .await
             .map_err(|_| ModError::Db)?;
-            Ok(())
+            if claim.rows_affected() == 1 {
+                Ok(())
+            } else {
+                Err(ModError::TotpReplayed)
+            }
         }
         None => {
-            let new_count = fail_count + 1;
+            // Increment atomically; the WHERE keeps a burst that
+            // trips the lock mid-flight from piling more counts onto
+            // the fresh episode (those attempts see the lock).
+            let new_count: Option<i32> = sqlx::query_scalar(
+                "UPDATE accounts SET totp_fail_count = totp_fail_count + 1
+                  WHERE id = $1 AND (totp_locked_until IS NULL OR totp_locked_until <= now())
+                  RETURNING totp_fail_count",
+            )
+            .bind(account_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| ModError::Db)?;
+            let Some(new_count) = new_count else {
+                return Err(ModError::TotpLocked);
+            };
             if new_count >= TOTP_FAILURE_LOCK_THRESHOLD {
                 // Trip the lock; reset the counter so the NEXT
                 // episode needs a fresh run of failures after the
-                // cool-down. Notify once per episode.
-                sqlx::query(
+                // cool-down. The conditional claim makes exactly one
+                // caller own the episode — and its ONE notice.
+                let trip = sqlx::query(
                     "UPDATE accounts SET totp_fail_count = 0,
-                            totp_locked_until = now() + make_interval(mins => $2)
-                      WHERE id = $1",
+                            totp_locked_until = now() + make_interval(mins => $2),
+                            totp_lock_notified_at = now()
+                      WHERE id = $1 AND (totp_locked_until IS NULL OR totp_locked_until <= now())",
                 )
                 .bind(account_id)
                 .bind(TOTP_LOCK_MINUTES as i32)
                 .execute(pool)
                 .await
                 .map_err(|_| ModError::Db)?;
-                let notified: Option<OffsetDateTime> =
-                    sqlx::query_scalar("SELECT totp_lock_notified_at FROM accounts WHERE id = $1")
-                        .bind(account_id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|_| ModError::Db)?
-                        .flatten();
-                if notified.is_none() {
+                if trip.rows_affected() == 1 {
                     let _ = crate::orders::notify(
                         pool,
                         account_id,
@@ -183,20 +199,7 @@ pub async fn verify_totp_gate(
                         "code checking locked for 15 minutes after 10 failed codes",
                     )
                     .await;
-                    let _ = sqlx::query(
-                        "UPDATE accounts SET totp_lock_notified_at = now() WHERE id = $1",
-                    )
-                    .bind(account_id)
-                    .execute(pool)
-                    .await;
                 }
-            } else {
-                sqlx::query("UPDATE accounts SET totp_fail_count = $2 WHERE id = $1")
-                    .bind(account_id)
-                    .bind(new_count)
-                    .execute(pool)
-                    .await
-                    .map_err(|_| ModError::Db)?;
             }
             Err(ModError::TotpInvalid)
         }
@@ -289,14 +292,18 @@ pub async fn totp_begin(pool: &PgPool, kf: &KeyFile, account_id: i64) -> Result<
 /// never silently replace a live secret — the only path off is
 /// `totp_disable`, which demands a current code.
 ///
-/// NOTE (locked-suite constraint): confirmation deliberately does
-/// NOT record the accepted step in `totp_last_step`. The locked
-/// Stage 9 gate suite confirms enrollment with the current code and
-/// then presents the SAME code at the step-up gate; consuming the
-/// step here would fail that suite. The gate is therefore the first
-/// consumer of a step, and everything after enrollment (login,
-/// step-up) is replay-protected. Flagged in the fix report for an
-/// owner-decision amendment if stricter semantics are wanted.
+/// AMENDED (owner decision 2026-10-18, applied 2026-10-19 in the
+/// verification-fix batch's locked-suite pass): confirmation DOES
+/// record the accepted step in `totp_last_step` — the enrollment
+/// code is consumed like any other. The earlier text of this note
+/// recorded why it did not: the locked Stage 9 suite confirmed with
+/// the current code and then presented the SAME code at the gate,
+/// so the enrollment code could be used twice. The owner decided
+/// to close that seam; the Stage 9 suite was amended in the same
+/// pass to expect the replay refusal and use the next step at the
+/// gate. The verification is step-exact and the activation is a
+/// conditional update, so a racing confirmation of the same step
+/// also resolves to exactly one success.
 pub async fn totp_confirm(pool: &PgPool, kf: &KeyFile, account_id: i64, code: &str) -> Result<(), ModError> {
     let row: Option<(Option<Vec<u8>>, Option<OffsetDateTime>)> = sqlx::query_as(
         "SELECT totp_pending_enc, totp_enabled_at FROM accounts WHERE id = $1",
@@ -316,18 +323,22 @@ pub async fn totp_confirm(pool: &PgPool, kf: &KeyFile, account_id: i64, code: &s
     };
     let secret = kf.decrypt(&enc).ok_or(ModError::Db)?;
     let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
-    if !crate::totp::verify(&secret, code, now) {
+    let Some(step) = crate::totp::verify_step(&secret, code, now) else {
         return Err(ModError::TotpInvalid);
-    }
-    sqlx::query(
+    };
+    let upd = sqlx::query(
         "UPDATE accounts SET totp_secret_enc = totp_pending_enc, totp_pending_enc = NULL,
-                totp_enabled_at = now()
-          WHERE id = $1",
+                totp_enabled_at = now(), totp_last_step = $2
+          WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)",
     )
     .bind(account_id)
+    .bind(step as i64)
     .execute(pool)
     .await
     .map_err(|_| ModError::Db)?;
+    if upd.rows_affected() == 0 {
+        return Err(ModError::TotpReplayed);
+    }
     Ok(())
 }
 
@@ -745,20 +756,24 @@ pub async fn close_account(
 /// pre-takedown status — it can never republish a listing the
 /// seller withdrew ('withdrawn'), because a withdrawn listing has
 /// no takedown to clear and restoring it is refused (BadInput).
+/// One exception, deliberate (HT H1 audit fix task 10, finding
+/// F14): a restore whose target is 'published' re-checks the §4
+/// terms publish gate, and lands on 'paused' when the gate fails —
+/// moderation restore is not a side door around the gate.
 pub async fn set_listing_removed(
     pool: &PgPool,
     listing_public_id: &str,
     moderator_id: i64,
     remove: bool,
 ) -> Result<(), ModError> {
-    let row: Option<(i64, i64, String, bool)> = sqlx::query_as(
-        "SELECT id, seller_id, status, taken_down_at IS NOT NULL FROM listings WHERE public_id = $1",
+    let row: Option<(i64, i64, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT id, seller_id, status, taken_down_at IS NOT NULL, pre_takedown_status FROM listings WHERE public_id = $1",
     )
     .bind(listing_public_id)
     .fetch_optional(pool)
     .await
     .map_err(|_| ModError::Db)?;
-    let Some((listing_id, seller_id, _status, taken_down)) = row else {
+    let Some((listing_id, seller_id, _status, taken_down, pre_takedown_status)) = row else {
         return Err(ModError::NotFound);
     };
     let action = if remove {
@@ -781,14 +796,33 @@ pub async fn set_listing_removed(
         if !taken_down {
             return Err(ModError::BadInput);
         }
+        // HT H1 audit fix task 10 (finding F14): a restore to
+        // 'published' must pass the same §4 publish gate as any
+        // other publish — a current terms pin whose hash matches
+        // the listing's text. A taken-down listing whose terms were
+        // never pinned (or no longer match) restores to 'paused'
+        // instead of slipping back into the catalogue through the
+        // moderation side door; the seller re-signs and
+        // re-publishes to bring it back.
+        let mut target = pre_takedown_status.as_deref().unwrap_or("published").to_string();
+        if target == "published" {
+            let listing = crate::listings::listing_by_public_id(pool, listing_public_id)
+                .await
+                .map_err(|_| ModError::Db)?
+                .ok_or(ModError::NotFound)?;
+            if !crate::listings::terms_match_listing(pool, &listing).await {
+                target = "paused".to_string();
+            }
+        }
         sqlx::query(
             "UPDATE listings
-                SET status = COALESCE(pre_takedown_status, 'published'),
+                SET status = $2,
                     pre_takedown_status = NULL,
                     taken_down_at = NULL, taken_down_by = NULL
               WHERE id = $1",
         )
         .bind(listing_id)
+        .bind(&target)
         .execute(pool)
         .await
         .map_err(|_| ModError::Db)?;

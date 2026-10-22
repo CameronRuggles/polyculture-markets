@@ -26,6 +26,28 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
+# Network egress denial (deployment audit DL2): the app only ever
+# talks to PostgreSQL on loopback (§15 — no telemetry, no webhooks;
+# media processing is local work). Deny all IP traffic except
+# localhost; this is the kernel's cgroup firewall and is
+# independent of RestrictAddressFamilies above (which limits the
+# socket families the process may create at all).
+# Measured with `systemd-analyze security --offline=yes` (systemd
+# 255): exposure 2.1 "OK" after these lines, 7.7 "EXPOSED" before —
+# the audit's bar was ≤ 3.0. The analyzer's remaining flags are
+# outside the brief (PrivateNetwork/PrivateUsers would break the
+# loopback/Postgres wiring; AF_INET/AF_UNIX must stay for it).
+IPAddressDeny=any
+IPAddressAllow=localhost
+TasksMax=256
+UMask=0077
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
 # Media worker containment (CM2): the in-code layers are kill-on-drop
 # on timeout and at most 2 concurrent workers. A memory ceiling is a
 # deployment measure — this caps the whole unit (app + workers).

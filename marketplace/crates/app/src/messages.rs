@@ -238,6 +238,42 @@ pub const MSG_DAILY_BUDGET_BYTES: i64 = 16 * 1024 * 1024;
 pub const MSG_CONVERSATION_MAX_MESSAGES: i64 = 1_000;
 pub const MSG_CONVERSATION_MAX_BYTES: i64 = 16 * 1024 * 1024;
 
+/// Verification-fix V9: the daily byte budget of an account that is
+/// less than a day old or has no completed order — the throwaway
+/// profile. Established accounts keep MSG_DAILY_BUDGET_BYTES.
+pub const MSG_NEW_ACCOUNT_DAILY_BUDGET_BYTES: i64 = 1024 * 1024;
+/// V9: instance-wide daily message-storage ceiling (default;
+/// override with MSG_GLOBAL_DAILY_CEILING_BYTES). Per-account
+/// budgets cannot bound total storage while accounts are free to
+/// create, so the instance as a whole also stops accepting message
+/// storage past this many bytes per rolling 24h.
+pub const MSG_GLOBAL_DAILY_CEILING_DEFAULT: i64 = 256 * 1024 * 1024;
+/// V9: free-disk floor for the blob volume (default; override with
+/// MSG_DISK_FLOOR_BYTES). Message storage is refused when accepting
+/// it would leave less free space than this on the blob volume —
+/// a full disk must not take the whole instance down.
+pub const MSG_DISK_FLOOR_DEFAULT: u64 = 1024 * 1024 * 1024;
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(default)
+}
+
+/// Free bytes on the filesystem holding `dir` (statvfs).
+fn free_bytes_on(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
 #[derive(Debug)]
 pub enum SendError {
     NoKey,            // sender or recipient has no registered key
@@ -251,6 +287,9 @@ pub enum SendError {
     BudgetExceeded,
     /// The conversation reached its message/byte cap (MM4).
     ConversationFull,
+    /// The instance-wide daily storage ceiling is reached, or the
+    /// blob volume is at its free-disk floor (verification-fix V9).
+    StorageCeiling,
     Db,
 }
 
@@ -332,6 +371,42 @@ pub async fn send_message(
         return Err(SendError::RateLimited);
     }
     if sent_last_day + ciphertext.len() as i64 > MSG_DAILY_BUDGET_BYTES {
+        return Err(SendError::BudgetExceeded);
+    }
+    // Verification-fix V9: instance-wide bounds, because per-account
+    // budgets cannot bound total storage while accounts are free to
+    // create. (1) A global daily ceiling across ALL senders.
+    // (2) A free-disk floor on the blob volume. (3) A smaller daily
+    // budget for throwaway accounts — under a day old, or with no
+    // completed order on either side.
+    let global_today: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(length), 0) FROM encrypted_messages
+          WHERE received_at > now() - interval '24 hours'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|_| SendError::Db)?;
+    let ceiling = env_i64("MSG_GLOBAL_DAILY_CEILING_BYTES", MSG_GLOBAL_DAILY_CEILING_DEFAULT);
+    if global_today + ciphertext.len() as i64 > ceiling {
+        return Err(SendError::StorageCeiling);
+    }
+    let floor = env_i64("MSG_DISK_FLOOR_BYTES", MSG_DISK_FLOOR_DEFAULT as i64).max(0) as u64;
+    if let Some(free) = free_bytes_on(&blob_dir()) {
+        if free.saturating_sub(ciphertext.len() as u64) < floor {
+            return Err(SendError::StorageCeiling);
+        }
+    }
+    let new_account: bool = sqlx::query_scalar(
+        "SELECT (SELECT created_at > now() - interval '24 hours' FROM accounts WHERE id = $1)
+              OR NOT EXISTS (SELECT 1 FROM orders
+                              WHERE (buyer_id = $1 OR seller_id = $1)
+                                AND state IN ('Completed', 'Resolved'))",
+    )
+    .bind(sender_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| SendError::Db)?;
+    if new_account && sent_last_day + ciphertext.len() as i64 > MSG_NEW_ACCOUNT_DAILY_BUDGET_BYTES {
         return Err(SendError::BudgetExceeded);
     }
     let (conv_count, conv_bytes): (i64, i64) = sqlx::query_as(

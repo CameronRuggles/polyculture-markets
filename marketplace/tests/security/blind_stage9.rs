@@ -952,15 +952,34 @@ impl GpgHome {
         assert!(out.status.success());
         out.stdout
     }
-    fn sign_detached(&self, fpr: &str, message: &[u8]) -> String {
+    /// An armored INLINE-signed message (BEGIN PGP MESSAGE) — the
+    /// shape `gpg --unwrap --armor` on a decrypted message produces,
+    /// and the shape the disclosure unwrap path consumes.
+    fn sign_inline_armored(&self, fpr: &str, message: &[u8]) -> String {
         let mf = self.dir.join(format!("msg-{:x}.bin", uniq128()));
         std::fs::write(&mf, message).unwrap();
         let sf = self.dir.join(format!("msg-{:x}.asc", uniq128()));
         self.run(&[
             "--armor",
-            "--detach-sign",
+            "--sign",
             "--local-user",
             fpr,
+            "--output",
+            sf.to_str().unwrap(),
+            mf.to_str().unwrap(),
+        ]);
+        std::fs::read_to_string(&sf).unwrap()
+    }
+    /// An armored LITERAL message — no signature, no encryption:
+    /// the shape `gpg --unwrap` leaves behind when the original
+    /// message was never signed.
+    fn store_armored(&self, message: &[u8]) -> String {
+        let mf = self.dir.join(format!("msg-{:x}.bin", uniq128()));
+        std::fs::write(&mf, message).unwrap();
+        let sf = self.dir.join(format!("msg-{:x}.asc", uniq128()));
+        self.run(&[
+            "--armor",
+            "--store",
             "--output",
             sf.to_str().unwrap(),
             mf.to_str().unwrap(),
@@ -992,6 +1011,7 @@ struct DisclosureFixture {
     seller_fpr: String,
     order: app::orders::Order,
     dispute_id: i64,
+    conversation_id: i64,
 }
 async fn disclosure_fixture(pool: &PgPool) -> DisclosureFixture {
     let (seller_id, seller_pub) = make_account(pool, "seller", 72).await;
@@ -1005,19 +1025,96 @@ async fn disclosure_fixture(pool: &PgPool) -> DisclosureFixture {
     let buyer_fpr = buyer_home.gen_key("blind9 buyer");
     register_key(pool, buyer, &buyer_home, &buyer_fpr).await;
     let (order, dispute_id) = disputed_order(pool, &shop, buyer).await;
-    DisclosureFixture { shop, buyer, buyer_home, buyer_fpr, seller_home, seller_fpr, order, dispute_id }
+    let conversation_id = app::messages::find_or_create_for_order(pool, order.id, buyer, seller_id)
+        .await
+        .expect("order conversation");
+    DisclosureFixture {
+        shop,
+        buyer,
+        buyer_home,
+        buyer_fpr,
+        seller_home,
+        seller_fpr,
+        order,
+        dispute_id,
+        conversation_id,
+    }
+}
+
+/// Plant a message row in the fixture's order conversation (blob
+/// file + row) with a chosen arrival time; returns the message id.
+/// (Added in the 2026-10-19 amendment: an unwrap disclosure NAMES
+/// the message it discloses.)
+async fn plant_order_message(
+    pool: &PgPool,
+    fx: &DisclosureFixture,
+    sender: i64,
+    recipient: i64,
+    recipient_fpr: &str,
+    bytes: &[u8],
+    received_unix: i64,
+) -> i64 {
+    let dir = app::messages::blob_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let blob_ref = format!("blind9-{:x}", uniq128());
+    std::fs::write(dir.join(format!("{blob_ref}.asc")), bytes).unwrap();
+    let key_id = &recipient_fpr[recipient_fpr.len() - 16..];
+    sqlx::query_scalar(
+        "INSERT INTO encrypted_messages
+            (conversation_id, sender_id, recipient_id, recipient_key_id, blob_ref, length, received_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7), to_timestamp($7) + interval '90 days')
+         RETURNING id",
+    )
+    .bind(fx.conversation_id)
+    .bind(sender)
+    .bind(recipient)
+    .bind(key_id)
+    .bind(blob_ref)
+    .bind(bytes.len() as i32)
+    .bind(received_unix as f64)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
 async fn disclosure_signed_by_other_party_is_verified_and_stored_encrypted() {
+    // AMENDED (owner decisions 2026-10-18, applied 2026-10-19 in
+    // the verification-fix batch's locked-suite pass): the original
+    // test submitted a DETACHED signature pair through the library
+    // function `disputes::submit_disclosure`. That function was
+    // owner-retired — the product has disclosed by UNWRAP since the
+    // MM1 messaging fix, because conversation messages are signed
+    // inline and no detached signature ever exists. The scenario is
+    // unchanged — a genuine other-party signature classifies
+    // verified — and now runs through the product's path,
+    // `submit_disclosure_unwrapped`, naming the planted message
+    // (V4: the message arrived an hour after its signature).
     let pool = pool().await;
     let kf = test_keyfile();
     let fx = disclosure_fixture(&pool).await;
     assert_eq!(fx.order.seller_fpr_pinned, fx.seller_fpr, "order pins the seller's registered key");
     let message = format!("Seller said delivery ships Friday, tracking follows. ref {:x}", uniq128());
-    // The BUYER discloses a message signed by the SELLER (the other party).
-    let sig = fx.seller_home.sign_detached(&fx.seller_fpr, message.as_bytes());
-    let status = disputes::submit_disclosure(&pool, &kf, fx.dispute_id, fx.buyer, &message, &sig)
+    // The BUYER discloses a message signed INLINE by the SELLER
+    // (the other party), pasted as unwrap output.
+    let paste = fx.seller_home.sign_inline_armored(&fx.seller_fpr, message.as_bytes());
+    let sig_unix = app::keys::extract_unwrapped_message(
+        &fx.seller_home.export_armored(&fx.seller_fpr),
+        paste.as_bytes(),
+    )
+    .and_then(|u| u.signature_created_unix)
+    .expect("the inline signature carries a creation time");
+    let mid = plant_order_message(
+        &pool,
+        &fx,
+        fx.shop.seller_id,
+        fx.buyer,
+        &fx.buyer_fpr,
+        paste.as_bytes(),
+        sig_unix + 3600,
+    )
+    .await;
+    let status = disputes::submit_disclosure_unwrapped(&pool, &kf, fx.dispute_id, fx.buyer, mid, &paste)
         .await
         .expect("disclosure submission must succeed");
     assert_eq!(status, "verified", "a genuine other-party signature must classify verified");
@@ -1037,28 +1134,81 @@ async fn disclosure_signed_by_other_party_is_verified_and_stored_encrypted() {
 
 #[tokio::test]
 async fn disclosure_self_signed_or_garbage_is_an_unverified_claim() {
+    // AMENDED (owner decisions 2026-10-18, applied 2026-10-19, same
+    // pass as the test above): the detached-signature originals map
+    // onto the unwrap path as follows. A disclosure signed by the
+    // SUBMITTER's own key (original: stored claim) is still a stored
+    // claim — its signature does not verify against the other
+    // party's pinned key. An UNSIGNED unwrapped message (original:
+    // the garbage-signature case) is likewise a stored claim holding
+    // the extracted plaintext. One expectation genuinely changed,
+    // and is asserted explicitly below: a paste that is not a
+    // readable OpenPGP message at all is REFUSED (BadInput) rather
+    // than stored — that has been the unwrap form's semantics since
+    // MM1, and the retired detached form's "anything is stored"
+    // behavior has no counterpart there.
     let pool = pool().await;
     let kf = test_keyfile();
     let fx = disclosure_fixture(&pool).await;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let message = format!("I definitely said this, trust me. ref {:x}", uniq128());
     // Signed by the SUBMITTER's own key: never evidence.
-    let own_sig = fx.buyer_home.sign_detached(&fx.buyer_fpr, message.as_bytes());
-    let status = disputes::submit_disclosure(&pool, &kf, fx.dispute_id, fx.buyer, &message, &own_sig)
+    let own_paste = fx.buyer_home.sign_inline_armored(&fx.buyer_fpr, message.as_bytes());
+    let mid = plant_order_message(
+        &pool,
+        &fx,
+        fx.shop.seller_id,
+        fx.buyer,
+        &fx.buyer_fpr,
+        own_paste.as_bytes(),
+        now_unix,
+    )
+    .await;
+    let status = disputes::submit_disclosure_unwrapped(&pool, &kf, fx.dispute_id, fx.buyer, mid, &own_paste)
         .await
         .expect("self-signed disclosure is stored as a claim, not an error");
     assert_eq!(status, "unverified_claim");
-    // Garbage signature from the seller as submitter.
-    let status = disputes::submit_disclosure(
+    // An unwrapped message with NO signature, from the seller as
+    // submitter (it unwraps to plaintext, but nothing in it is
+    // signed by the buyer).
+    let unsigned_paste = fx.seller_home.store_armored(b"Seller note about the order.");
+    let mid2 = plant_order_message(
+        &pool,
+        &fx,
+        fx.buyer,
+        fx.shop.seller_id,
+        &fx.seller_fpr,
+        unsigned_paste.as_bytes(),
+        now_unix,
+    )
+    .await;
+    let status = disputes::submit_disclosure_unwrapped(
         &pool,
         &kf,
         fx.dispute_id,
         fx.shop.seller_id,
-        "Seller note about the order.",
-        "-----BEGIN PGP SIGNATURE-----\n\nnot-a-real-signature\n-----END PGP SIGNATURE-----",
+        mid2,
+        &unsigned_paste,
     )
     .await
-    .expect("garbage signature is stored as a claim, not an error");
+    .expect("unsigned disclosure is stored as a claim, not an error");
     assert_eq!(status, "unverified_claim");
+    // Not a readable OpenPGP message at all: refused (see the
+    // amendment note above).
+    let err = disputes::submit_disclosure_unwrapped(
+        &pool,
+        &kf,
+        fx.dispute_id,
+        fx.buyer,
+        mid,
+        "this is not an unwrapped message",
+    )
+    .await
+    .expect_err("an unreadable paste is refused, not stored");
+    assert!(matches!(err, DisputeError::BadInput), "got {err:?}");
     let views = disputes::disclosures_for(&pool, &kf, fx.dispute_id).await.expect("disclosures_for");
     assert_eq!(views.len(), 2);
     assert!(views.iter().all(|v| v.signature_status == "unverified_claim"));
@@ -1066,13 +1216,31 @@ async fn disclosure_self_signed_or_garbage_is_an_unverified_claim() {
 
 #[tokio::test]
 async fn disclosure_nonparticipant_forbidden_and_resolved_dispute_bad_state() {
+    // AMENDED (owner decisions 2026-10-18, applied 2026-10-19, same
+    // pass as the tests above): same two refusals, exercised
+    // through the unwrap path that replaced the retired detached
+    // submission.
     let pool = pool().await;
     let kf = test_keyfile();
     let fx = disclosure_fixture(&pool).await;
     let stranger = make_buyer(&pool).await;
     let message = "A message from nobody involved.";
-    let sig = fx.seller_home.sign_detached(&fx.seller_fpr, message.as_bytes());
-    let err = disputes::submit_disclosure(&pool, &kf, fx.dispute_id, stranger, message, &sig)
+    let paste = fx.seller_home.sign_inline_armored(&fx.seller_fpr, message.as_bytes());
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mid = plant_order_message(
+        &pool,
+        &fx,
+        fx.shop.seller_id,
+        fx.buyer,
+        &fx.buyer_fpr,
+        paste.as_bytes(),
+        now_unix,
+    )
+    .await;
+    let err = disputes::submit_disclosure_unwrapped(&pool, &kf, fx.dispute_id, stranger, mid, &paste)
         .await
         .expect_err("only dispute participants may disclose");
     assert!(matches!(err, DisputeError::Forbidden), "got {err:?}");
@@ -1081,7 +1249,7 @@ async fn disclosure_nonparticipant_forbidden_and_resolved_dispute_bad_state() {
     disputes::resolve(&pool, &kf, &cfg(), fx.dispute_id, moderator, "delivered-confirmed")
         .await
         .unwrap();
-    let err = disputes::submit_disclosure(&pool, &kf, fx.dispute_id, fx.buyer, message, &sig)
+    let err = disputes::submit_disclosure_unwrapped(&pool, &kf, fx.dispute_id, fx.buyer, mid, &paste)
         .await
         .expect_err("disclosure is only allowed while the dispute is open");
     assert!(matches!(err, DisputeError::BadState), "got {err:?}");
@@ -1218,13 +1386,25 @@ async fn totp_enrollment_flow_require_totp_and_encrypted_storage() {
     let code = totp::code_at(&secret, now_secs());
     moderation::totp_confirm(&pool, &kf, mod_id, &code).await.expect("confirm with the current code");
     assert!(moderation::totp_enrolled(&pool, mod_id).await.expect("totp_enrolled"));
+    // AMENDMENT (owner decision 2026-10-18; applied 2026-10-19 in
+    // the verification-fix batch's locked-suite pass): enrollment
+    // confirmation now CONSUMES its step. The original flow below
+    // presented the SAME code at the step-up gate and expected it
+    // to pass ("the gate is the first consumer of a step"); under
+    // that rule one observed enrollment code could be used twice.
+    // The amended expectation: the enrollment code at the gate is a
+    // REPLAY, and the gate pass below uses the NEXT step's code.
+    let err = moderation::require_totp(&pool, &kf, mod_id, &code)
+        .await
+        .expect_err("the enrollment code was consumed by confirmation");
+    assert!(matches!(err, ModError::TotpReplayed), "got {err:?}");
     // require_totp: wrong code invalid, right code ok.
     let err = moderation::require_totp(&pool, &kf, mod_id, &wrong_code(&secret))
         .await
         .expect_err("wrong step-up code must be refused");
     assert!(matches!(err, ModError::TotpInvalid), "got {err:?}");
-    let code = totp::code_at(&secret, now_secs());
-    moderation::require_totp(&pool, &kf, mod_id, &code).await.expect("current code passes the gate");
+    let code = totp::code_at(&secret, now_secs() + 30);
+    moderation::require_totp(&pool, &kf, mod_id, &code).await.expect("the next step's code passes the gate");
     // Stored secret is encrypted: neither the base32 text nor the raw
     // secret bytes appear in accounts.totp_secret_enc.
     let enc: Vec<u8> = sqlx::query_scalar("SELECT totp_secret_enc FROM accounts WHERE id = $1")
@@ -1275,33 +1455,137 @@ async fn warn_sets_timestamp_audit_and_notice_but_account_stays_active() {
 async fn listing_removal_hides_from_browse_and_restore_returns_it() {
     let pool = pool().await;
     let moderator = make_moderator(&pool).await;
-    let (seller_id, _) = make_account(&pool, "seller", 72).await;
-    install_dummy_key(&pool, seller_id, &fingerprint(uniq128())).await;
-    let title = format!("Blind9Remove{:x}", uniq128());
-    let listing = make_listing(&pool, seller_id, &title).await;
-    let found = app::listings::browse(&pool, Some(&title), None, 1).await.unwrap();
-    assert!(found.iter().any(|l| l.public_id == listing.public_id), "published listing is browsable");
-    moderation::set_listing_removed(&pool, &listing.public_id, moderator, true)
+
+    // ---- Branch 1: restore WITH a matching signed-terms pin ----
+    // Seller with a REAL registered identity key (the blind_ht1
+    // terms_fixture construction), so a genuine signature can pin.
+    let (pinned_seller, _pinned_seller_pub) = make_account(&pool, "seller", 72).await;
+    let (seller_secret, seller_cert) =
+        helper_core::keys::generate_test_cert("Restore Seller <restoreseller@example.org>").unwrap();
+    let seller_fpr = helper_core::keys::fingerprint_of(&seller_cert).unwrap();
+    sqlx::query(
+        "INSERT INTO identity_keys (account_id, certificate, fingerprint, version, status, created_at) \
+         VALUES ($1, $2, $3, 1, 'current', now())",
+    )
+    .bind(pinned_seller)
+    .bind(seller_cert)
+    .bind(&seller_fpr)
+    .execute(&pool)
+    .await
+    .expect("insert seller identity key");
+    let pinned_title = format!("Restore Pinned {}", uniq_name());
+    let pinned = make_listing(&pool, pinned_seller, &pinned_title).await;
+
+    // Pin terms built over the listing's own stored fields, exactly
+    // as the blind_ht1 signed_terms construction builds them.
+    let pinned_listing = app::listings::listing_by_public_id(&pool, &pinned.public_id)
         .await
-        .expect("remove listing");
-    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
-        .bind(listing.internal_id)
+        .unwrap()
+        .unwrap();
+    let row = sqlx::query("SELECT delivery_terms, refund_terms FROM listings WHERE id = $1")
+        .bind(pinned.internal_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(status, "removed");
-    let found = app::listings::browse(&pool, Some(&title), None, 1).await.unwrap();
-    assert!(!found.iter().any(|l| l.public_id == listing.public_id), "a removed listing is absent from browse");
-    assert!(has_event(&pool, seller_id, "listing_removed").await, "the seller must be notified");
-    let err = moderation::set_listing_removed(&pool, &listing.public_id, moderator, true)
+    let delivery: String = row.get("delivery_terms");
+    let refund: String = row.get("refund_terms");
+    let terms_text = domain::ht_statements::listing_terms_text(
+        &pinned_listing.title,
+        &pinned_listing.description,
+        &delivery,
+        &refund,
+        pinned_listing.price_atomic as u64,
+    );
+    let stmt = domain::ht_statements::TermsStatement {
+        marketplace_id: MARKETPLACE_ID.into(),
+        listing_id: pinned.public_id.clone(),
+        listing_version: 1,
+        seller_key_fingerprint: seller_fpr.clone(),
+        terms_sha256: domain::ht_statements::sha256_hex(terms_text.as_bytes()),
+        risk: domain::ht_statements::RiskTerms {
+            transit_risk: domain::ht_statements::TransitRisk::Seller,
+            remedy_cap_pct: 25,
+            payment_timing: domain::ht_statements::PaymentTiming::Prepay,
+        },
+    };
+    let stmt_bytes = stmt.to_bytes();
+    let sig = helper_core::keys::sign_detached(&seller_secret, None, &stmt_bytes).unwrap();
+    let stmt_text = String::from_utf8(stmt_bytes).unwrap();
+    app::listings::submit_terms(&pool, MARKETPLACE_ID, &pinned_listing, &stmt_text, &sig)
         .await
-        .expect_err("removing an already-removed listing must be refused");
-    assert!(matches!(err, ModError::BadInput), "got {err:?}");
-    moderation::set_listing_removed(&pool, &listing.public_id, moderator, false)
+        .expect("valid signed terms pin to the listing");
+    assert!(
+        app::listings::terms_match_listing(&pool, &pinned_listing).await,
+        "the pinned terms must match the listing before takedown"
+    );
+
+    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
+        .bind(pinned.internal_id)
+        .fetch_one(&pool)
         .await
-        .expect("restore listing");
-    let found = app::listings::browse(&pool, Some(&title), None, 1).await.unwrap();
-    assert!(found.iter().any(|l| l.public_id == listing.public_id), "a restored listing returns to browse");
+        .unwrap();
+    assert_eq!(status, "published", "the pinned fixture listing starts published");
+    let found = app::listings::browse(&pool, Some(pinned_title.as_str()), None, 1).await.unwrap();
+    assert!(found.iter().any(|l| l.public_id == pinned.public_id), "a published listing is browsable before takedown");
+
+    moderation::set_listing_removed(&pool, &pinned.public_id, moderator, true)
+        .await
+        .expect("moderator takedown of the pinned listing");
+    let found = app::listings::browse(&pool, Some(pinned_title.as_str()), None, 1).await.unwrap();
+    assert!(!found.iter().any(|l| l.public_id == pinned.public_id), "a taken-down listing must leave browse");
+
+    moderation::set_listing_removed(&pool, &pinned.public_id, moderator, false)
+        .await
+        .expect("moderator restore of the pinned listing");
+    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
+        .bind(pinned.internal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "published", "restore with a matching pin returns the pre-takedown status");
+    let found = app::listings::browse(&pool, Some(pinned_title.as_str()), None, 1).await.unwrap();
+    assert!(found.iter().any(|l| l.public_id == pinned.public_id), "restored with a matching pin, the listing returns to browse");
+
+    // ---- Branch 2: restore with NO matching pin ----
+    // The plain make_listing shape: published, with nothing pinned.
+    let (plain_seller, _plain_seller_pub) = make_account(&pool, "seller", 72).await;
+    install_dummy_key(&pool, plain_seller, &fingerprint(uniq128())).await;
+    let plain_title = format!("Restore Unpinned {}", uniq_name());
+    let plain = make_listing(&pool, plain_seller, &plain_title).await;
+    let plain_listing = app::listings::listing_by_public_id(&pool, &plain.public_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !app::listings::terms_match_listing(&pool, &plain_listing).await,
+        "the unpinned fixture listing must start with no matching pinned terms"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
+        .bind(plain.internal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "published", "the unpinned fixture listing starts published");
+    let found = app::listings::browse(&pool, Some(plain_title.as_str()), None, 1).await.unwrap();
+    assert!(found.iter().any(|l| l.public_id == plain.public_id), "a published listing is browsable before takedown");
+
+    moderation::set_listing_removed(&pool, &plain.public_id, moderator, true)
+        .await
+        .expect("moderator takedown of the unpinned listing");
+    let found = app::listings::browse(&pool, Some(plain_title.as_str()), None, 1).await.unwrap();
+    assert!(!found.iter().any(|l| l.public_id == plain.public_id), "a taken-down listing must leave browse");
+
+    moderation::set_listing_removed(&pool, &plain.public_id, moderator, false)
+        .await
+        .expect("moderator restore of the unpinned listing");
+    let status: String = sqlx::query_scalar("SELECT status FROM listings WHERE id = $1")
+        .bind(plain.internal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "paused", "restore without a matching pin leaves the listing paused");
+    let found = app::listings::browse(&pool, Some(plain_title.as_str()), None, 1).await.unwrap();
+    assert!(!found.iter().any(|l| l.public_id == plain.public_id), "restored without a matching pin, the listing stays out of browse");
 }
 
 /// Insert a live session and one unused payment-pool entry for `seller`.
