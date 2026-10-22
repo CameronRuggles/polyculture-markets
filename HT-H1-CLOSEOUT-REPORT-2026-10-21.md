@@ -298,3 +298,15 @@ F12 evidence correctly. That file is not touched by this
 correction. This section is append-only; the original
 paragraph above is left as written, errors included, so the
 record shows both.
+---
+## Owner close-out calls and H1 closure — 2026-10-21
+
+The three owner calls left open by the close-out delta re-verification were given by Cameron on 2026-10-21 (MDT):
+
+- 22:23 — signed off the restated v1 invariant (9) in `marketplace/docs/invariants.md`: a destination is stored only after the core verifies a seller signature binding it to the seller's pinned key and validates the address with the in-process address parser; the wallet-RPC `validate_address` cross-check named in the original v1 wording is not built (threat model T2).
+- 22:28 — accepted F6 as a formal H2 hand-off: the receipt-time fold has no live input in H1 and must be proven or fixed when H2 wires receipt intake.
+- 22:29 — accepted the OutProofV2 spike gate's move from H1 to H2 proof intake: binary acceptance on a real stagenet node is a hard entry condition for H2 proof intake, and the tx-proof path ships in no command until it passes.
+
+With the auditor's delta re-verification at `e4e899c` and these owner calls, **HT Stage H1 is CLOSED as of 2026-10-21**.
+
+Carried into H2's first batch: fix-brief tasks 4–10 (N3–N9), delta findings D2 and D3 (D3 needs its deterministic rule decided before settle intake is built), the F6 live-proof hand-off, and the OutProofV2 stagenet binary-acceptance gate at proof intake. The optional question whether `blind_ht1` receives a blind re-authoring in H2 remains an owner call for later; it is not an H1 close condition.
