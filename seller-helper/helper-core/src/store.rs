@@ -692,7 +692,10 @@ impl EvidenceStore {
     /// `<stem>.sig` written before the joint shape existed —
     /// counted as the evidence of whichever party it verifies
     /// against, so an old one-signature hold loads as exactly
-    /// what it is: a proposal, never a terminal state.
+    /// what it is: a proposal, never a terminal state. A legacy
+    /// file duplicating a per-party signature is checked against
+    /// both parties (already-counted ones included) and accepted
+    /// as the same evidence (close-out delta D2).
     fn joint_signature_state(
         &self,
         dir: &Path,
@@ -733,23 +736,31 @@ impl EvidenceStore {
             any_signature = true;
             let sig = std::fs::read_to_string(&legacy)
                 .map_err(|e| format!("cannot read {}: {e}", legacy.display()))?;
-            let mut counted = false;
+            // Verify against BOTH parties — including a party
+            // whose slot a per-party file already filled. A legacy
+            // file that merely DUPLICATES a per-party signature
+            // (the same signature held under both names, e.g. a
+            // trade spanning the joint-shape rename) is consistent
+            // history, not a forgery. The old loop skipped taken
+            // slots and then reported such a signature as
+            // verifying for NEITHER party, refusing the whole load
+            // (close-out delta D2, the auditor's probe). The error
+            // below is only for a legacy signature that verifies
+            // for neither party while the statement is not already
+            // complete on its per-party files.
+            let mut verifies_for_someone = seller_signed && buyer_signed;
             for (fpr, slot) in [
                 (expected.seller_fpr.as_str(), &mut seller_signed),
                 (expected.buyer_fpr.as_str(), &mut buyer_signed),
             ] {
-                if *slot {
-                    continue;
-                }
                 if let Ok(cert) = self.resolve_cert(fpr, own_cert) {
                     if crate::keys::verify_detached(&cert, text.as_bytes(), sig.as_bytes()) {
                         *slot = true;
-                        counted = true;
-                        break;
+                        verifies_for_someone = true;
                     }
                 }
             }
-            if !counted && !(seller_signed && buyer_signed) {
+            if !verifies_for_someone {
                 return Err(format!(
                     "{name}'s signature does not verify against either party's pinned certificate: the held set is not trusted"
                 ));
@@ -1342,6 +1353,56 @@ mod tests {
         let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
         assert_eq!(folded.state, TradeState::Closed);
         assert!(folded.terminal);
+    }
+
+    #[test]
+    fn legacy_sig_duplicating_a_per_party_sig_still_loads() {
+        // Close-out delta D2 — the auditor's probe, made
+        // permanent. A store spanning the joint-shape rename can
+        // hold the seller's settle signature under BOTH names (the
+        // legacy unsuffixed file and the per-party file — the same
+        // signature). The loader must count it once, as the
+        // seller's proposal; the old joint check skipped the taken
+        // seller slot, tried the legacy bytes against the buyer
+        // only, and refused the whole load claiming the signature
+        // verified for neither party.
+        let (_root, store, p, trade_id, own_cert) = store_with_assignment("legacy-dup");
+        let settle = settle_bytes(&trade_id);
+        let seller_sig = sign(&p.seller_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &seller_sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("seller's settle signature is held as a proposal");
+        // Plant the legacy copy of the same signature beside the
+        // per-party file the admit just wrote.
+        let dir = store.trade_dir(&trade_id);
+        let per_party = std::fs::read_dir(&dir)
+            .expect("trade dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.ends_with("-settle.seller.sig"))
+            .expect("per-party settle signature on disk");
+        let stem = per_party.trim_end_matches(".seller.sig");
+        std::fs::copy(dir.join(&per_party), dir.join(format!("{stem}.sig")))
+            .expect("plant the legacy duplicate");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("a legacy duplicate of a held signature must not refuse the load");
+        assert!(
+            !events.iter().any(|t| matches!(t.event, TradeEvent::Settle(_))),
+            "one party's signature — however many files hold it — is a proposal, not a settle"
+        );
+        // The buyer countersigns: the trade settles on the same
+        // held set, with the agreed refund.
+        let buyer_sig = sign(&p.buyer_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("countersignature admits");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("load completed settle");
+        let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
+        assert_eq!(folded.state, TradeState::Settled);
+        assert_eq!(folded.refund_atomic, Some(1_000));
     }
 
     #[test]
