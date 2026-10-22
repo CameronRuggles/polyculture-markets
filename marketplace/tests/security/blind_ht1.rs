@@ -575,19 +575,117 @@ fn fold_lapsed_and_terminals_ignore_later_statements() {
     assert_eq!(f.state, TradeState::Shipped, "a shipped statement defeats lapse");
     let f = fold(&[a.clone(), ev_payment()], "2026-12-02T00:00:00Z");
     assert_eq!(f.state, TradeState::Paid, "payment defeats lapse");
-    // Terminal: Closed ignores a later settle; Settled ignores a
-    // later receipt (§6 rule 4).
+    // Terminal precedence is decided by OUTCOME, not by held order
+    // (§6 rule 4, as re-ruled by the owner 2026-10-21/22): one
+    // complete terminal alone decides the trade; two DIFFERENT
+    // complete terminals conflict, in either held order; a second
+    // terminal identical in outcome is the same terminal, not a
+    // conflict; and once a terminal state is reached, later
+    // statements that are not complete terminals change nothing.
+    //
+    // Pin 1 — the receipt side.
+    let f = fold(
+        &[a.clone(), ev_payment(), ev_receipt()],
+        "2026-11-02T00:00:00Z",
+    );
+    assert_eq!(f.state, TradeState::Closed, "a lone complete receipt closes");
+    assert_eq!(f.refund_atomic, None);
+    assert!(f.terminal);
+    let f = fold(
+        &[a.clone(), ev_payment(), ev_receipt(), ev_receipt()],
+        "2026-11-02T00:00:00Z",
+    );
+    assert_eq!(
+        f.state,
+        TradeState::Closed,
+        "a duplicated receipt is the same receipt, not a second terminal"
+    );
+    let f = fold(
+        &[a.clone(), ev_payment(), ev_receipt(), ev_shipped("2026-10-22")],
+        "2026-11-02T00:00:00Z",
+    );
+    assert_eq!(
+        f.state,
+        TradeState::Closed,
+        "a later statement that is not a complete terminal changes nothing"
+    );
     let f = fold(
         &[a.clone(), ev_payment(), ev_receipt(), ev_settle(1)],
         "2026-11-02T00:00:00Z",
     );
-    assert_eq!(f.state, TradeState::Closed);
-    assert_eq!(f.refund_atomic, None);
+    assert_eq!(
+        f.state,
+        TradeState::Conflicted,
+        "receipt held first, settle second: two different complete terminals conflict"
+    );
+    assert!(f.terminal);
+    // Pin 2 — the settle side.
+    let f = fold(
+        &[a.clone(), ev_payment(), ev_settle(5)],
+        "2026-11-02T00:00:00Z",
+    );
+    assert_eq!(f.state, TradeState::Settled, "a lone complete settle settles");
+    assert_eq!(f.refund_atomic, Some(5), "on that settle's terms");
+    assert!(f.terminal);
+    // The same settle terms signed again in a later month — so,
+    // different statement bytes — are the same settle outcome.
+    let mut resigned = ev_settle(5);
+    if let TradeEvent::Settle(s) = &mut resigned {
+        s.month = "2026-12".into();
+    }
+    let f = fold(
+        &[a.clone(), ev_payment(), ev_settle(5), resigned],
+        "2026-11-02T00:00:00Z",
+    );
+    assert_eq!(
+        f.state,
+        TradeState::Settled,
+        "identical settle terms re-signed are one settle, not a conflict"
+    );
+    assert_eq!(f.refund_atomic, Some(5));
+    let f = fold(
+        &[a.clone(), ev_payment(), ev_settle(5), ev_shipped("2026-10-22")],
+        "2026-11-02T00:00:00Z",
+    );
+    assert_eq!(
+        f.state,
+        TradeState::Settled,
+        "a later statement that is not a complete terminal changes nothing"
+    );
     let f = fold(
         &[a.clone(), ev_payment(), ev_settle(5), ev_receipt()],
         "2026-11-02T00:00:00Z",
     );
-    assert_eq!(f.state, TradeState::Settled);
+    assert_eq!(
+        f.state,
+        TradeState::Conflicted,
+        "settle held first, receipt second: two different complete terminals conflict"
+    );
+    assert!(f.terminal);
+    // Two complete settles on DIFFERENT terms conflict as well —
+    // whether the refund differs, or only the return term does.
+    let f = fold(
+        &[a.clone(), ev_payment(), ev_settle(5), ev_settle(10)],
+        "2026-11-02T00:00:00Z",
+    );
+    assert_eq!(
+        f.state,
+        TradeState::Conflicted,
+        "two settles with different refunds conflict"
+    );
+    let mut return_settle = ev_settle(5);
+    if let TradeEvent::Settle(s) = &mut return_settle {
+        s.return_required = true;
+    }
+    let f = fold(
+        &[a.clone(), ev_payment(), ev_settle(5), return_settle],
+        "2026-11-02T00:00:00Z",
+    );
+    assert_eq!(
+        f.state,
+        TradeState::Conflicted,
+        "two settles differing only in return-required conflict"
+    );
     // A return shipment is not the outbound shipment.
     let f = fold(&[a.clone(), ev_return()], "2026-11-06T00:00:00Z");
     assert_eq!(f.state, TradeState::Assigned);
