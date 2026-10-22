@@ -333,8 +333,10 @@ impl EvidenceStore {
     /// signature that is already held is a no-op. An admit of
     /// DIFFERENT bytes under the same kind is a separate proposal
     /// with its own sequence number: two competing settles can
-    /// both be held, and held order decides which completed one
-    /// the fold reaches first. Every check in
+    /// both be held — and held order decides NOTHING about the
+    /// outcome: two different complete terminals are a conflict
+    /// under the owner's rules (D3; E1/E5), and identical terms
+    /// are one outcome however many statements carry them. Every check in
     /// [`EvidenceStore::admit_statement`] (parse, trade-id,
     /// party, signature) has already run for the presented
     /// signature before this is called; the received-at sidecar

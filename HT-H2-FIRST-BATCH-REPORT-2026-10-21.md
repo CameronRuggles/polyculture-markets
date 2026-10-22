@@ -378,3 +378,73 @@ widened only the duplicate case, as the finding specified.
   blind-authored equivalents if the owner wants them locked
   (task 5) — is H2 work, as is the parked decision on whether
   `blind_ht1` gets a blind re-authoring.
+
+## Corrections (audit 3)
+
+Appended 2026-10-22 by the HT H2 fix batch (append-only, like
+audit 2's corrections to the H1 report). The dcddf14
+re-verification found no code defect behind any of these, but
+six statements in this report are wrong or imprecise as
+records; each is corrected beside the true statement, verified
+against the tree before writing.
+
+1. **§3 task 4's "covered twice".** The report said the stored-
+   status assertion was "already covered twice
+   (`media_disputes_audit`, `ht_ordering`)". No target named
+   `ht_ordering` exists. The two places are
+   `media_disputes_audit` and `ht_publish_gate` — the latter
+   asserts the stored `'removed'` status at lines 136 and 349.
+   The conclusion (the assertion was not duplicated) stands.
+
+2. **§3 task 6's role-map attribution.** The correction to the
+   H1 fix report said "there is no `ExpectedSigners::for_kind`
+   symbol (the role map is returned by
+   `ht_statements::parse_held_statement`)". No symbol named
+   `parse_held_statement` exists in `ht_statements`; the
+   function is the private `parse_held_statement` in
+   `seller-helper/helper-core/src/store.rs`.
+
+3. **§3 task 7's verification method.** The report said
+   acceptance was verified by "`git status` for `crates/app/`
+   byte-identical before and after the gate run". `git status`
+   can show no such thing for `marketplace.htid`: `.gitignore`
+   line 15 lists the filename, so the file is invisible to git
+   status wherever it lands. The claim itself was re-proved by
+   the re-verification's method — a filename search of the tree
+   after a full gate run finds no `marketplace.htid` anywhere —
+   but the method named in this report could not have shown it.
+
+4. **§3 D3's "nothing depends on held order".** The report said
+   "`paid`, `shipped` and the issue window are computed over
+   the FULL held set", so that "nothing about the outcome
+   depends on held order". State and refund do not depend on
+   order; the issue window can. `shipped_effective` is set by
+   the FIRST held outbound shipped statement only, so where
+   two held shipped statements disagree on the ship date,
+   `issue_window_ends` follows whichever was held first. The
+   sentence holds for `paid` and `shipped` (set-valued over the
+   full set) and not for the window.
+
+5. **The stale rule in the code's own docs.** §3's D3 entry
+   superseded first-complete-wins in the fold, but the doc
+   comment on `admit_joint_statement` in
+   `seller-helper/helper-core/src/store.rs` still said "held
+   order decides which completed one the fold reaches first".
+   Corrected at its source by the fix batch (E9): the comment
+   now restates the conflict rule.
+
+6. **§4's "media fixtures" and manifest scope.** §4 called the
+   five tracked files under `marketplace/tests/security/media/`
+   "media fixtures". They are not fixtures: they are runtime
+   output (one shared SHA-256, the media suite's sanitizer
+   output for a fixed input, under random-hex names) committed
+   in the initial import, and nothing in the tree reads them as
+   input. The fix batch removes them under the owner's ruling
+   (E7), with its own pre/post manifest. Separately, §4's
+   manifest scope was narrower than the close-out manifest's
+   without saying so: the close-out manifest also pinned
+   `marketplace/crates/envelope/tests/blind_stage5.rs`
+   (`390e13a75f8e64de1939f25c5eda8d0e78fa5f009640d1deafe443567031511b`),
+   which is outside §4's "every file under
+   `marketplace/tests/security/**` plus invariants" scope and
+   is unchanged by this batch and the fix batch alike.
