@@ -152,7 +152,7 @@ fn seller_side_trade(fx: &Fixture) -> String {
     // Fetch what the conversation would carry from the seller's
     // own records.
     let store = helper_core::store::EvidenceStore::open(fx.seller_store.clone()).unwrap();
-    let ids = store.trade_ids();
+    let ids = store.trade_ids().expect("readable store lists its trades");
     assert_eq!(ids.len(), 1, "exactly one trade in the seller store");
     let trade_id = ids[0].clone();
     let tdir = store.trade_dir(&trade_id);

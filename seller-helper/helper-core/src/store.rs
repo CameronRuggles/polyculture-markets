@@ -424,6 +424,11 @@ impl EvidenceStore {
     /// This is how a caller learns the trade's two parties (the
     /// fingerprints admission and load check against). A held
     /// assignment that no longer parses is an error, not an absence.
+    /// Absence itself is precise (re-verification N8): no trade
+    /// directory, or a readable directory holding no assignment
+    /// file, is `Ok(None)`; a directory that exists but cannot be
+    /// READ is an error — never a silent "no assignment held",
+    /// which callers would fold as an empty trade.
     pub fn load_assignment(
         &self,
         trade_id: &str,
@@ -431,18 +436,28 @@ impl EvidenceStore {
         network: Network,
     ) -> Result<Option<ht_statements::AssignmentStatement>, String> {
         let dir = self.trade_dir(trade_id);
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with("-assignment.txt") {
-                    let raw = std::fs::read(entry.path())
-                        .map_err(|e| format!("cannot read {name}: {e}"))?;
-                    let text = String::from_utf8(raw)
-                        .map_err(|_| format!("stored assignment in {name} is not UTF-8"))?;
-                    return ht_statements::parse_assignment_statement(&text, marketplace_id, network)
-                        .map(Some)
-                        .ok_or_else(|| format!("stored assignment in {name} no longer parses"));
-                }
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "cannot read the trade directory {}: {e} — an unreadable store is never an absent assignment",
+                    dir.display()
+                ))
+            }
+        };
+        for entry in rd {
+            let entry = entry
+                .map_err(|e| format!("cannot list the trade directory {}: {e}", dir.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with("-assignment.txt") {
+                let raw = std::fs::read(entry.path())
+                    .map_err(|e| format!("cannot read {name}: {e}"))?;
+                let text = String::from_utf8(raw)
+                    .map_err(|_| format!("stored assignment in {name} is not UTF-8"))?;
+                return ht_statements::parse_assignment_statement(&text, marketplace_id, network)
+                    .map(Some)
+                    .ok_or_else(|| format!("stored assignment in {name} no longer parses"));
             }
         }
         Ok(None)
@@ -463,23 +478,48 @@ impl EvidenceStore {
         write_atomic(&path, json.as_bytes())
     }
 
-    /// All trade ids with a store directory, sorted.
-    pub fn trade_ids(&self) -> Vec<String> {
+    /// All trade ids with a store directory, sorted. A trades
+    /// directory that exists but cannot be READ is an error, not
+    /// an empty store (re-verification N8): the F5 rule the pool
+    /// ledger already lives by — unreadable is never empty —
+    /// applies to the directory too, because reading an unreadable
+    /// store as empty is what let seeding lose sight of spent
+    /// destinations. A MISSING trades directory is a store that
+    /// was never opened: no trades, no error.
+    pub fn trade_ids(&self) -> Result<Vec<String>, String> {
+        let trades_dir = self.root.join("trades");
+        let rd = match std::fs::read_dir(&trades_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(format!(
+                    "cannot read the evidence store's trades directory {}: {e} — an unreadable store is never an empty one",
+                    trades_dir.display()
+                ))
+            }
+        };
         let mut ids = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(self.root.join("trades")) {
-            for entry in rd.flatten() {
-                if entry.path().is_dir() {
-                    ids.push(entry.file_name().to_string_lossy().into_owned());
-                }
+        for entry in rd {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "cannot list the evidence store's trades directory {}: {e}",
+                    trades_dir.display()
+                )
+            })?;
+            if entry.path().is_dir() {
+                ids.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
         ids.sort();
-        ids
+        Ok(ids)
     }
 
-    /// Whether the store holds any trade directory at all.
-    pub fn has_trades(&self) -> bool {
-        !self.trade_ids().is_empty()
+    /// Whether the store holds any trade directory at all. The
+    /// read failure propagates (N8): a caller deciding "fresh
+    /// start" from this answer must hear about an unreadable
+    /// store, not inherit a silent `false`.
+    pub fn has_trades(&self) -> Result<bool, String> {
+        Ok(!self.trade_ids()?.is_empty())
     }
 
     /// Load a trade's held events in held order, RE-VERIFYING the
@@ -816,7 +856,7 @@ fn collect_assignment_destinations(
     network: Network,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut spent = std::collections::BTreeMap::new();
-    for trade_id in store.trade_ids() {
+    for trade_id in store.trade_ids()? {
         if let Some(assignment) = store.load_assignment(&trade_id, marketplace_id, network)? {
             spent.insert(assignment.destination.to_string(), trade_id);
         }
@@ -850,7 +890,10 @@ impl PoolLedger {
         path: &Path,
         store: &EvidenceStore,
     ) -> Result<PoolLedger, String> {
-        if !path.exists() && store.has_trades() {
+        // has_trades propagates a store read failure (N8): an
+        // unreadable store refuses here too, instead of reading
+        // as "no trades held" and seeding fresh over it.
+        if !path.exists() && store.has_trades()? {
             return Err(format!(
                 "the pool ledger at {} is missing but the evidence store holds trades: the ledger is the only record of which destinations are spent — restore it (the batch file re-seeds safely: seeding never resurrects a spent address) before assigning",
                 path.display()
@@ -1463,6 +1506,78 @@ mod tests {
         let empty_store = EvidenceStore::open(empty_root.clone()).expect("store");
         PoolLedger::load_for_assign(&empty_root.join("pool.json"), &empty_store)
             .expect("missing ledger over an empty store is fine");
+    }
+
+    #[test]
+    fn trade_ids_match_the_open_store() {
+        // N8: an untouched store enumerates as empty as a FINDING
+        // (from a readable — here not-yet-created — directory),
+        // never as a fallback for a failed read.
+        let empty_root = temp_root("ids-match-empty");
+        let empty_store = EvidenceStore::open(empty_root).expect("store");
+        assert_eq!(empty_store.trade_ids().expect("readable store"), Vec::<String>::new());
+        assert_eq!(empty_store.has_trades().expect("readable store"), false);
+        // An absent assignment on a readable store is Ok(None) —
+        // the absent end of the absent-vs-unreadable distinction.
+        assert!(
+            empty_store
+                .load_assignment("trd_none", MKT, Network::Stagenet)
+                .expect("readable store")
+                .is_none(),
+            "no trade directory means no assignment held"
+        );
+
+        // After a trade is admitted, enumeration names exactly it.
+        let (_root, store, _p, trade_id, _own) = store_with_assignment("ids-match");
+        assert_eq!(store.trade_ids().expect("readable store"), vec![trade_id]);
+        assert_eq!(store.has_trades().expect("readable store"), true);
+    }
+
+    #[test]
+    fn unreadable_trades_directory_fails_loud() {
+        let (root, store, _p, trade_id, _own) = store_with_assignment("unreadable");
+        // Replace the trades directory with a regular file: every
+        // read under it now fails. (A chmod would not stop a
+        // root-running test suite; a file where a directory
+        // belongs fails for every user.)
+        let trades = root.join("trades");
+        std::fs::remove_dir_all(&trades).expect("clear trades");
+        std::fs::write(&trades, b"not a directory").expect("block trades");
+
+        let err = store.trade_ids().expect_err("an unreadable trades directory must error");
+        assert!(err.contains("cannot read"), "{err}");
+        assert!(
+            store.has_trades().is_err(),
+            "has_trades must propagate the read failure, not answer false"
+        );
+
+        // The assignment load distinguishes present-but-unreadable
+        // from absent: this trade's assignment EXISTS on disk, so
+        // an Ok(None) here would silently fold an empty trade.
+        let err = store
+            .load_assignment(&trade_id, MKT, Network::Stagenet)
+            .expect_err("an unreadable trade directory must error, not read as absent");
+        assert!(err.contains("cannot read"), "{err}");
+
+        // Assignment refuses: a missing pool ledger over a store
+        // that cannot even be read is not a fresh start either
+        // (this is the call seller assign makes before seeding).
+        let err = PoolLedger::load_for_assign(&root.join("pool.json"), &store)
+            .expect_err("assign over an unreadable store must refuse");
+        assert!(err.contains("cannot read"), "{err}");
+
+        // Status propagates the store-level error, so the CLI
+        // prints its ERROR row instead of "No trades in the
+        // evidence store" (the call seller/buyer status makes).
+        let err = crate::verify::trade_status(
+            &store,
+            MKT,
+            Network::Stagenet,
+            "2026-11-15T00:00:00Z",
+            None,
+        )
+        .expect_err("status over an unreadable store must error");
+        assert!(err.contains("cannot read"), "{err}");
     }
 
     #[test]

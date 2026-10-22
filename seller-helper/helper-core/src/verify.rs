@@ -200,16 +200,21 @@ pub type TradeStatusRow = (String, Result<Option<domain::ht_fold::FoldedTrade>, 
 /// `helper buyer status` / `helper seller status`. Each trade's
 /// held set is re-verified at load (audit F4): the parties come
 /// from the trade's own assignment, certificates resolve against
-/// `own_cert` (the holder's key) and the pins.
+/// `own_cert` (the holder's key) and the pins. Enumerating the
+/// store is the one failure that cannot become a per-trade row
+/// (re-verification N8): if the trades directory cannot be read
+/// this returns Err and the caller prints an ERROR row for the
+/// store — "no trades" is a finding about a READABLE store,
+/// never a fallback for an unreadable one.
 pub fn trade_status(
     store: &crate::store::EvidenceStore,
     marketplace_id: &str,
     network: Network,
     now: &str,
     own_cert: Option<&std::path::Path>,
-) -> Vec<TradeStatusRow> {
+) -> Result<Vec<TradeStatusRow>, String> {
     let mut out = Vec::new();
-    for trade_id in store.trade_ids() {
+    for trade_id in store.trade_ids()? {
         let row = (|| -> Result<Option<domain::ht_fold::FoldedTrade>, String> {
             let Some(assignment) = store.load_assignment(&trade_id, marketplace_id, network)?
             else {
@@ -224,7 +229,7 @@ pub fn trade_status(
         })();
         out.push((trade_id, row));
     }
-    out
+    Ok(out)
 }
 
 /// The fields-level view other checks share (kept public for the
