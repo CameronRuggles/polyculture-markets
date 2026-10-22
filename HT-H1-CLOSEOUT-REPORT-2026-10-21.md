@@ -256,3 +256,45 @@ reads, N9's migration-count test) ride with H2's first batch, as
 the brief assigns them. H1 closes when the re-verification
 auditor confirms tasks 1–3 and the owner makes the three calls
 above.
+
+---
+
+## Correction (2026-10-21) — F12 evidence paragraph, two false specifics
+
+Found by the external auditor's close-out delta re-verification
+at `e4e899c` (finding **D1**). The F12 evidence paragraph above
+(the "Task 1" section) contains two specifics that are false:
+
+> "`tests/security/blind_ht1.rs` landed at 19:52:59Z and **was
+> extended at 20:19:53Z**"
+
+> "Git-verified again in this batch (commit times and **the
+> single later touch of `blind_ht1.rs`, by fix task 2's CRLF
+> case, `664cf63`**)"
+
+The git-verified facts (re-checked with `git log` on the file
+and `git show --stat 664cf63` when this correction was written):
+
+- Exactly **one** commit has ever touched
+  `marketplace/tests/security/blind_ht1.rs` in the whole
+  history: `096add5` (2026-10-20T19:52:59Z, "HT H1 (gate):
+  blind_ht1 locked suite — 24/24"). The file was created in
+  that commit and never extended or otherwise modified
+  afterwards; no commit at 20:19:53Z touched it.
+- `664cf63` (2026-10-21T19:49:10Z) is "HT H1 fix task 2: a
+  real mkt_ marketplace id per instance (audit F1)". It changed
+  `marketplace/crates/app/src/config.rs`, `htid.rs`, `lib.rs`,
+  `main.rs` and `web.rs`, `marketplace/crates/app/templates/seller.html`,
+  and two app test files. It is not a CRLF case and did not
+  touch `blind_ht1.rs`.
+
+The balance of the F12 paragraph stands: the implementation
+commits (19:16:23Z, 19:28:47Z, 2026-10-20) precede the suite's
+single landing at 19:52:59Z, which is the fact F12 rests on.
+
+The F12 closure itself is unaffected: it stands on the
+appendix in `HT-H1-FIX-REPORT-2026-10-21.md`, which states the
+F12 evidence correctly. That file is not touched by this
+correction. This section is append-only; the original
+paragraph above is left as written, errors included, so the
+record shows both.
