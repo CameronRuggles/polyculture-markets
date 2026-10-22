@@ -1406,6 +1406,53 @@ mod tests {
     }
 
     #[test]
+    fn two_distinct_complete_settles_conflict_whichever_was_admitted_first() {
+        // D3 at the store level — the auditor's probe, made
+        // permanent: the same two complete settles admitted into
+        // two fresh stores in opposite orders used to fold to
+        // Settled(100) one way and Settled(50) the other. Both
+        // stores must now fold to the same Conflicted outcome.
+        let run = |tag: &str, a_first: bool| {
+            let (_root, store, p, trade_id, own_cert) = store_with_assignment(tag);
+            let mk_settle = |refund: u64, return_required: bool| {
+                ht_statements::SettleStatement {
+                    marketplace_id: MKT.into(),
+                    trade_id: trade_id.clone(),
+                    refund_atomic: refund,
+                    return_required,
+                    month: "2026-11".into(),
+                }
+                .to_bytes()
+            };
+            let settle_a = mk_settle(100_000_000_000, false);
+            let settle_b = mk_settle(50_000_000_000, true);
+            let order: [&[u8]; 2] =
+                if a_first { [&settle_a, &settle_b] } else { [&settle_b, &settle_a] };
+            for bytes in order {
+                let seller_sig = sign(&p.seller_sec, bytes);
+                store
+                    .admit_statement(&trade_id, "settle", bytes, &seller_sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
+                    .expect("seller's signature held");
+                let buyer_sig = sign(&p.buyer_sec, bytes);
+                store
+                    .admit_statement(&trade_id, "settle", bytes, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
+                    .expect("buyer's countersignature held");
+            }
+            let events = store
+                .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+                .expect("load both settles");
+            fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold")
+        };
+        let ab = run("conflict-ab", true);
+        let ba = run("conflict-ba", false);
+        assert_eq!(ab.state, TradeState::Conflicted);
+        assert_eq!(ba.state, TradeState::Conflicted);
+        assert_eq!(ab, ba, "held order must not change the folded outcome");
+        assert!(ab.terminal);
+        assert_eq!(ab.refund_atomic, None);
+    }
+
+    #[test]
     fn joint_statement_from_a_third_party_is_refused_in_either_slot() {
         let (_root, store, p, trade_id, _own_cert) = store_with_assignment("settle-third");
         let settle = settle_bytes(&trade_id);

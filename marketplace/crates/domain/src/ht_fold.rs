@@ -27,6 +27,15 @@
 //!   back to that statement's signed date (see `fold_trade_timed`).
 //! - `Settled` and `Closed` are terminal: the fold ignores every
 //!   later statement (rule 4).
+//! - Two DIFFERENT complete settles are a conflict, not a race
+//!   (owner rule, Cameron 2026-10-21; close-out delta D3): a
+//!   settle is a jointly signed statement of final terms, and
+//!   renegotiation can produce two incompatible ones. The rule
+//!   is presence-based — if two or more distinct settles each
+//!   pass `check_settle`, the trade is `Conflicted` (terminal,
+//!   no agreed refund) whatever order they were held in. A
+//!   duplicated identical settle is one settle; an over-amount
+//!   settle is not complete and cannot create a conflict.
 //! - `Lapsed` is derived, never signed: the assignment's expiry
 //!   passes with neither payment nor a shipped statement held.
 //! - `payment_overdue` is derived, never signed (audit F18): an
@@ -86,13 +95,20 @@ pub enum TradeState {
     Settled,
     Closed,
     Lapsed,
+    /// Two or more DIFFERENT complete settles are held for the
+    /// trade: the parties signed incompatible final terms and
+    /// the fold will not pick one by arrival order — the trade
+    /// is in dispute (owner rule, Cameron 2026-10-21). Terminal:
+    /// no held statement resolves it; only the parties, or a
+    /// moderator replaying disclosed statements (§9), can.
+    Conflicted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoldedTrade {
     pub state: TradeState,
-    /// A terminal state (`Settled` / `Closed`) was reached; every
-    /// later statement was ignored (rule 4).
+    /// A terminal state (`Settled` / `Closed` / `Conflicted`)
+    /// was reached; the outcome is final (rule 4).
     pub terminal: bool,
     pub paid: bool,
     pub shipped: bool,
@@ -169,6 +185,23 @@ pub fn fold_trade_timed(events: &[TimedEvent], now: &str) -> Option<FoldedTrade>
         _ => None,
     })?;
 
+    // Owner rule (Cameron, 2026-10-21; close-out delta D3): count
+    // the DISTINCT complete settles in the whole held set before
+    // the walk. Two or more means the parties signed incompatible
+    // final terms — a conflict the fold surfaces identically in
+    // either held order, never a winner picked by arrival order.
+    // Identical duplicates count once; a settle failing
+    // `check_settle` is not complete and cannot conflict.
+    let mut distinct_settles: Vec<&SettleStatement> = Vec::new();
+    for timed in events {
+        if let TradeEvent::Settle(settle) = &timed.event {
+            if check_settle(assignment, settle) && !distinct_settles.contains(&settle) {
+                distinct_settles.push(settle);
+            }
+        }
+    }
+    let conflicted = distinct_settles.len() >= 2;
+
     let mut paid = false;
     let mut shipped = false;
     // The shipped statement's effective date, and whether it came
@@ -226,12 +259,18 @@ pub fn fold_trade_timed(events: &[TimedEvent], now: &str) -> Option<FoldedTrade>
                 }
             }
             TradeEvent::Settle(settle) => {
-                if check_settle(assignment, settle) {
+                // A conflict suppresses every positional terminal
+                // (here and in the receipt arm): the walk runs
+                // over the full held set so `paid`, `shipped` and
+                // the window describe all of it, and the conflict
+                // outcome below is identical in either held order.
+                if !conflicted && check_settle(assignment, settle) {
                     terminal = Some((TradeState::Settled, Some(settle.refund_atomic)));
                 }
             }
             TradeEvent::Receipt(receipt) => {
-                if receipt.buyer_key_fingerprint == assignment.buyer_key_fingerprint
+                if !conflicted
+                    && receipt.buyer_key_fingerprint == assignment.buyer_key_fingerprint
                     && receipt.seller_key_fingerprint == assignment.seller_key_fingerprint
                 {
                     terminal = Some((TradeState::Closed, None));
@@ -243,6 +282,21 @@ pub fn fold_trade_timed(events: &[TimedEvent], now: &str) -> Option<FoldedTrade>
     let issue_window_ends = shipped_effective
         .as_ref()
         .and_then(|(d, _)| date_add_days(d, 30));
+
+    if conflicted {
+        // No refund is named: the parties agreed two different
+        // ones, which is exactly the dispute. Like every terminal
+        // state, a conflict supersedes the overdue flag.
+        return Some(FoldedTrade {
+            state: TradeState::Conflicted,
+            terminal: true,
+            paid,
+            shipped,
+            refund_atomic: None,
+            issue_window_ends,
+            payment_overdue: false,
+        });
+    }
 
     if let Some((state, refund)) = terminal {
         return Some(FoldedTrade {
@@ -456,5 +510,84 @@ mod tests {
         let folded = fold_trade(&ev, "2026-11-02T00:00:00Z").expect("trade");
         assert!(!folded.payment_overdue);
         assert_eq!(folded.state, TradeState::Lapsed);
+    }
+
+    fn settle(refund_atomic: u64, return_required: bool) -> SettleStatement {
+        SettleStatement {
+            marketplace_id: MKT.into(),
+            trade_id: TID.into(),
+            refund_atomic,
+            return_required,
+            month: "2026-11".into(),
+        }
+    }
+
+    /// D3 (owner rule, Cameron 2026-10-21): two DIFFERENT complete
+    /// settles are a conflict in either held order — the auditor's
+    /// probe made permanent. The whole folded outcome, not just
+    /// the state, must be identical across orders (paid/shipped
+    /// are computed over the full held set, not a prefix).
+    #[test]
+    fn two_distinct_complete_settles_conflict_in_either_order() {
+        let a = settle(100_000_000_000, false);
+        let b = settle(50_000_000_000, true);
+        let mk = |first: SettleStatement, second: SettleStatement| {
+            vec![
+                TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+                TradeEvent::Payment(PaymentRecord { txid: "aa".into(), proof: "x".into() }),
+                TradeEvent::Shipped(shipped("2026-10-22")),
+                TradeEvent::Settle(first),
+                TradeEvent::Settle(second),
+            ]
+        };
+        let ab = fold_trade(&mk(a.clone(), b.clone()), NOW).expect("trade");
+        let ba = fold_trade(&mk(b, a), NOW).expect("trade");
+        assert_eq!(ab, ba, "the folded outcome must not depend on held order");
+        assert_eq!(ab.state, TradeState::Conflicted);
+        assert!(ab.terminal);
+        assert_eq!(ab.refund_atomic, None, "a conflict names no agreed refund");
+        assert!(ab.paid && ab.shipped);
+        assert_eq!(ab.issue_window_ends.as_deref(), Some("2026-11-21"));
+    }
+
+    /// D3: the same settle held twice is ONE settle (a duplicate
+    /// travels when a statement is re-sent), never a conflict.
+    #[test]
+    fn a_duplicated_settle_still_settles() {
+        let a = settle(100_000_000_000, false);
+        let events = vec![
+            TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+            TradeEvent::Settle(a.clone()),
+            TradeEvent::Settle(a),
+        ];
+        let folded = fold_trade(&events, NOW).expect("trade");
+        assert_eq!(folded.state, TradeState::Settled);
+        assert!(folded.terminal);
+        assert_eq!(folded.refund_atomic, Some(100_000_000_000));
+    }
+
+    /// D3: an over-amount settle is not complete (§6 caps the
+    /// refund at the price), so it cannot conflict with the one
+    /// complete settle — in either order.
+    #[test]
+    fn one_complete_settle_and_one_over_amount_settle_settles() {
+        let good = settle(100_000_000_000, false);
+        let over = settle(250_000_000_001, false);
+        for events in [
+            vec![
+                TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+                TradeEvent::Settle(good.clone()),
+                TradeEvent::Settle(over.clone()),
+            ],
+            vec![
+                TradeEvent::Assignment(assignment(PaymentTiming::Prepay, FAR_FUTURE_EXPIRY)),
+                TradeEvent::Settle(over),
+                TradeEvent::Settle(good.clone()),
+            ],
+        ] {
+            let folded = fold_trade(&events, NOW).expect("trade");
+            assert_eq!(folded.state, TradeState::Settled);
+            assert_eq!(folded.refund_atomic, Some(100_000_000_000));
+        }
     }
 }
