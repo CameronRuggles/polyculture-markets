@@ -10,6 +10,16 @@ license = "AGPL-3.0-or-later"
 name = "marketplace-app"
 path = "src/main.rs"
 
+# HT H2 first batch task 5 (re-verification N4): the invariants
+# scope guards were written by the implementer under the owner's
+# reviewed fix brief — not blind-authored — so they never belonged
+# in the locked tests/security package. They live in this crate's
+# tests instead (the ht/ subdirectory keeps HT guards together);
+# what they assert is unchanged.
+[[test]]
+name = "ht_invariants_scope"
+path = "tests/ht/ht_invariants_scope.rs"
+
 [dependencies]
 modules-api = { path = "../modules-api" }
 domain = { path = "../domain" }

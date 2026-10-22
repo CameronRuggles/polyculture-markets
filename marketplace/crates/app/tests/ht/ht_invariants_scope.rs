@@ -19,10 +19,14 @@
 //!   lives), this suite fails.
 //!
 //! Authorship note: this file is fix-batch scaffolding written
-//! under the owner's reviewed fix brief (the blind_*.rs suites are
-//! untouched); from here on it is locked like the rest of this
-//! directory, and future locked suites follow the Q3 rule — a
-//! separate blind author.
+//! by the implementer under the owner's reviewed fix brief — it
+//! is NOT blind-authored. It originally sat in the locked
+//! tests/security package, claiming a locked status it had not
+//! earned; HT H2 first batch task 5 (re-verification N4) moved
+//! it here, into the app crate's own tests, where
+//! implementer-written guards belong. The blind_*.rs suites are
+//! untouched by the move; future LOCKED suites follow the Q3
+//! rule — a separate blind author.
 //!
 //! DB tests require DATABASE_URL; skipped silently when unset, and
 //! the pool helper panics when it is set but unreachable (fix task
