@@ -931,3 +931,59 @@ OutProofV2 rig re-run (owner-side); (4) the
 `ExpectedSigners::for_kind` design note. H2 still waits on
 the auditor's re-verification of this stack plus the spike
 re-run.
+
+
+---
+
+# Appendix — Closure mapping for every Audit 1 finding (F1–F19)
+
+Added 2026-10-21 by the H1 close-out batch (task 1 of the
+re-verification fix brief). The re-verification of `869c954`
+found F12 and F19 unaccounted for: neither number appears in
+this report, the pack, any commit message, or the tree, because
+the fix stack was executed against Audit 1's 13-task brief
+while the audit report itself was never in the tree. Audit 1's
+text has since been recovered from the auditor's report as
+delivered by the owner, and its definitions are Audit 1's own
+(severity/grade as given there). This appendix is append-only;
+nothing above it is edited. Where a finding's disposition is a
+correction of record rather than code, the table says so —
+inventing a code closure for a process or accuracy finding
+would repeat the failure this appendix exists to close.
+
+| Finding | Audit 1 (severity) — what it was | Closed by | Status |
+| --- | --- | --- | --- |
+| F1 | High — the app's only marketplace id is the slug, but the terms parser demands `mkt_` + 32 hex; no terms pin can succeed on a default instance | Task 2 (`664cf63`; gitignore follow-up `dd43338`) | Closed |
+| F2 | High — `terms_submit` passes textarea text raw; browser CRLF is rejected by the byte gate | Task 1 (`69a4b68`) | Closed |
+| F3 | High — the app suite passes without a database; the expired Dave fixture hid behind the silent skips | Tasks 3a/3b/3c (`d3a621f`, `38918f4`) | Closed (gate-log binding + two non-DB skips are re-verification N7 — H2 batch) |
+| F4 | Medium — the evidence store does not enforce "signature-checked": signature optional, unverified, never re-checked at load | Tasks 6+7 (`40ac455`); the settle/receipt signer rule within it was found defective at re-verification (N1) and is corrected by close-out task 2 of this batch — see `HT-H1-CLOSEOUT-REPORT-2026-10-21.md` | Closed (with the N1 correction) |
+| F5 | Medium — the pool ledger's reuse refusal is not durable (silent empty ledger, racy seeding, no lock) | Tasks 6+7 (`40ac455`) | Closed (store read-failure paths are re-verification N8 — H2 batch) |
+| F6 | Medium — the issue window uses dates the signers assert about themselves | Task 13b (`f819cc4`, `1df6758`; helper half in `40ac455`), owner decision Q2 | **Partial, as declared**: the receipt-time fold is unit-proven, but in H1 the only intake is the assignment, so shipped/issue receipt times have no live input (re-verification N15). Owner acceptance of the partial as an H2 hand-off is a remaining close condition |
+| F7 | Medium — the buyer cannot obtain the canonical terms text verify check 3 hashes | Task 5 (`fa7526d`) | Closed |
+| F8 | Medium — amended (9)/(10) false about the live tree, (11) contradicts (10), no locked test | Task 13a (`9eaa05e`), owner decision Q4 | Closed (the v1 (9) quote carried into the Scope paragraph asserts a never-built control — re-verification N2 — corrected by close-out task 3 of this batch; owner sign-off on the wording still pending) |
+| F9 | Low — `--seller-cert` pinned before its fingerprint is compared | Tasks 6+7 (`40ac455`), exercised by task 8 (`4acfa4b`) | Closed (pin timing relative to checks 2–6 is re-verification N13, Info) |
+| F10 | Low — status silently drops a trade whose files no longer parse | Tasks 6+7 (`40ac455`) | Closed (directory-level read failures are re-verification N8 — H2 batch) |
+| F11 | Low — the terms version rule (§4 rule 5) is unenforced | Task 11 (`0ed7fd4`) | Closed |
+| F12 | Process — `blind_ht1` was written and committed by the implementer, after the implementation commits (see the evidence note below); the H1 report's "authored first" claim cannot be shown | No code closure exists or is possible: the fact is historical. Disposition: (a) correction of record — the "authored first / gate-first" claim is withdrawn (the re-verification pack records the process finding and the builder's acceptance of it); (b) owner decision Q3, ratified in this report: a separate blind author for locked HT suites from H2 on; (c) worked demonstration under that rule: the `blind_stage9` restore case re-authored blind (`92f76d7`), its plain-language assertion list published in this report | Addressed by process adoption + correction of record. `blind_ht1` itself remains implementer-authored; its residual blind-spot risk was carried in H1 by Audit 1's full line-read of the H1 code |
+| F13 | Low — the six new commands and `init` have no automated test; the helper signs statements it never parses back | Tasks 6+7 parse-back (`40ac455`) + task 8 CLI integration tests (`4acfa4b`) | Closed |
+| F14 | Low — two routes reach "published" without terms (pre-H1 listings; moderator restore) | Task 10 (`7d5ca43`, migration 0017), owner decision Q5 | Closed (coverage accounting, the 0017-test shape and the pause/match divergence are re-verification N3/N9/N10 — H2 batch) |
+| F15 | Medium — the H1 report's counting method omits `blind_stage5`; the correct post-H1 total is 609/0/9, not 574/0/6 | Task 4 (`7f6bf3a`) + the recorded gates in this report (`28ce3d0`, hash correction `c49e2b4`, close-out re-run at `869c954`) | Closed: the re-verification's independent static count reproduces the recorded gate exactly (628/0/9 marketplace, 31/0/0 seller-helper). Gate-log tree binding is re-verification N7 — H2 batch |
+| F16 | Low — "Assignment verified" sits next to "Pay X XMR" | Task 12 (`73e38ad`) | Closed |
+| F17 | Low — the v1 binary rename (`seller-helper` → `helper seller`) left stale docs and a false manifest comment | Task 12 (`73e38ad`) | Closed |
+| F18 | Low (suspected, spec §6) — the fold ignores `payment_timing`; an unpaid on_receipt trade never flags | Task 13b (`f819cc4`, `1df6758`; `PAYMENT OVERDUE` status line in `40ac455`) | Closed as a mechanism (unit-proven); in H1 it is unreachable end-to-end because no shipped statement can yet enter a store — live input arrives with H2 intake |
+| F19 | Info — the H1 report overstates `blind_ht1`'s mutation coverage | No code closure: Audit 1 verified the parsers do enforce order, so this is report accuracy only. Disposition: correction of record, made here — the shared mutations are LF, blank line, extra field, marketplace, spacing, CRLF and indent (`blind_ht1.rs:267-289` at `d21c523`); key order is tested for the receipt only, and bad digests for two statements. The H1 report's broader phrasing was wrong | Corrected by this record; the H1 report itself is history and is not edited |
+
+**Evidence note (F12).** The commit times are in this repo's
+own history: the implementation commits `d6f5229` and
+`6ca69ef` at 2026-10-20T19:16:23Z and `624ca2f` at
+19:28:47Z precede the locked-suite commit `096add5`
+(`blind_ht1`, 19:52:59Z). Audit 1's reading of that order was
+correct, and the fix report's earlier silence on F12/F19 was
+an accounting gap, not a disagreement.
+
+**Note on the re-verification auditor's guesses.** Task 9 of
+the fix brief answers Audit 1's spike-verdict ruling (the
+uncommitted checker port and vectors), which sits outside the
+numbered findings — it is not F12. F19 is adjacent to F12 only
+in that both concern `blind_ht1`; its subject is the report's
+mutation-coverage sentence, not authorship.
