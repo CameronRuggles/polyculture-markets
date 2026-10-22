@@ -770,11 +770,16 @@ impl EvidenceStore {
             // history, not a forgery. The old loop skipped taken
             // slots and then reported such a signature as
             // verifying for NEITHER party, refusing the whole load
-            // (close-out delta D2, the auditor's probe). The error
-            // below is only for a legacy signature that verifies
-            // for neither party while the statement is not already
-            // complete on its per-party files.
-            let mut verifies_for_someone = seller_signed && buyer_signed;
+            // (close-out delta D2, the auditor's probe). But the
+            // neither-party refusal itself is unconditional
+            // (audit 3, E4): it follows this function's own doc
+            // rule — a signature file that does not verify is an
+            // error — so a foreign legacy signature refuses the
+            // load even when the per-party files already complete
+            // the statement. An earlier shape seeded the check
+            // with the per-party completeness and waved exactly
+            // that file through.
+            let mut verifies_for_someone = false;
             for (fpr, slot) in [
                 (expected.seller_fpr.as_str(), &mut seller_signed),
                 (expected.buyer_fpr.as_str(), &mut buyer_signed),
@@ -1429,6 +1434,54 @@ mod tests {
         let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
         assert_eq!(folded.state, TradeState::Settled);
         assert_eq!(folded.refund_atomic, Some(1_000));
+    }
+
+    #[test]
+    fn foreign_legacy_sig_beside_a_complete_statement_refuses_the_load() {
+        // E4 (audit 3, probe P5): the neither-party refusal is
+        // unconditional. A complete settle (both per-party files
+        // held) with a THIRD party's signature planted at the
+        // legacy path must refuse the load: a held signature file
+        // that verifies for neither party is an error by the
+        // loader's own doc rule, and per-party completeness is
+        // not a pardon. (The D2 duplicate — the same signature
+        // under both names — still loads; see the test above.)
+        let (_root, store, p, trade_id, own_cert) = store_with_assignment("legacy-foreign");
+        let settle = settle_bytes(&trade_id);
+        let seller_sig = sign(&p.seller_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &seller_sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("seller's settle signature held");
+        let buyer_sig = sign(&p.buyer_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("buyer's countersignature completes the settle");
+        // Sanity: without the plant, the complete settle loads
+        // and settles.
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("complete settle loads");
+        let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
+        assert_eq!(folded.state, TradeState::Settled);
+        // Plant a third party's signature over the same bytes at
+        // the legacy path.
+        let (mallory_sec, _mallory_pub) =
+            generate_test_cert("Mallory <mallory@example.com>").expect("third key");
+        let foreign_sig = sign(&mallory_sec, &settle);
+        let dir = store.trade_dir(&trade_id);
+        let per_party = std::fs::read_dir(&dir)
+            .expect("trade dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.ends_with("-settle.seller.sig"))
+            .expect("per-party settle signature on disk");
+        let stem = per_party.trim_end_matches(".seller.sig");
+        std::fs::write(dir.join(format!("{stem}.sig")), foreign_sig)
+            .expect("plant the foreign legacy signature");
+        let err = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect_err("a legacy signature verifying for neither party must refuse the load");
+        assert!(err.contains("does not verify against either party"), "{err}");
     }
 
     #[test]
