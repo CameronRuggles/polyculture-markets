@@ -14,6 +14,13 @@
 //! the pool helper panics when it is set but unreachable (fix task
 //! 3b). The migration test runs against its own scratch database so
 //! it can apply the migration files itself.
+//!
+//! HT H2 first batch task 4 (re-verification finding N3) adds
+//! section 3: the takedown coverage the Q3 blind_stage9 case swap
+//! dropped — seller notification on takedown, and refusal of a
+//! second takedown (the `pre_takedown_status` guard) — restored
+//! here, in a NON-locked suite, until a blind-authored stage9
+//! case re-locks it under Q3.
 
 use app::moderation;
 use domain::ht_statements as hs;
@@ -274,4 +281,78 @@ async fn migration_0017_pauses_unpinned_published_listings_only() {
     let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
         .execute(&admin)
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Takedown coverage restored (re-verification N3; H2 first batch
+// task 4). The pre-swap blind_stage9 case asserted these alongside
+// the stored status; the swap kept only the stored status, leaving
+// notification and the double-remove guard with no coverage
+// anywhere. They live here (non-locked) until H2's Q3 re-authoring
+// re-locks them.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn takedown_notifies_the_seller() {
+    let Some(pool) = pool().await else { return };
+    let seller = make_account(&pool, "seller").await;
+    let moderator = make_account(&pool, "moderator").await;
+    let (lid, lpub) = make_listing(&pool, seller, "published").await;
+
+    moderation::set_listing_removed(&pool, &lpub, moderator, true)
+        .await
+        .expect("takedown");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM notifications
+          WHERE account_id = $1 AND event_type = 'listing_removed' AND object_ref = $2",
+    )
+    .bind(seller)
+    .bind(&lpub)
+    .fetch_one(&pool)
+    .await
+    .expect("count notifications");
+    assert_eq!(count, 1, "a takedown notifies the seller with a listing_removed event");
+    cleanup(&pool, seller, lid, moderator).await;
+}
+
+#[tokio::test]
+async fn second_takedown_is_refused_and_pre_takedown_status_survives() {
+    let Some(pool) = pool().await else { return };
+    let seller = make_account(&pool, "seller").await;
+    let moderator = make_account(&pool, "moderator").await;
+    let (lid, lpub) = make_listing(&pool, seller, "published").await;
+
+    moderation::set_listing_removed(&pool, &lpub, moderator, true)
+        .await
+        .expect("first takedown");
+    let err = moderation::set_listing_removed(&pool, &lpub, moderator, true)
+        .await
+        .expect_err("a second takedown of an already-removed listing must be refused");
+    assert!(
+        matches!(err, moderation::ModError::BadInput),
+        "the second takedown is refused with BadInput, got {err:?}"
+    );
+    let (status, pre): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, pre_takedown_status FROM listings WHERE id = $1",
+    )
+    .bind(lid)
+    .fetch_one(&pool)
+    .await
+    .expect("listing row");
+    assert_eq!(status, "removed");
+    assert_eq!(
+        pre.as_deref(),
+        Some("published"),
+        "the refused second takedown must not overwrite pre_takedown_status with 'removed'"
+    );
+    // The restore still reads the preserved status: 'published'
+    // re-checks the §4 terms gate (F14) and, unpinned, lands on
+    // 'paused'. Had pre_takedown_status been clobbered with
+    // 'removed', the restore would have returned the listing to
+    // 'removed' instead.
+    moderation::set_listing_removed(&pool, &lpub, moderator, false)
+        .await
+        .expect("restore");
+    assert_eq!(status_of(&pool, lid).await, "paused");
+    cleanup(&pool, seller, lid, moderator).await;
 }
