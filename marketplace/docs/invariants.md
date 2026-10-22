@@ -12,10 +12,12 @@ order decode/checksum → network → kind → torsion-free keys, with primary
 and integrated addresses rejected; (8) no destination is ever assigned to
 more than one invoice (unique constraint, one global `destinations`
 table); (9) a destination is stored only after the core verifies a seller
-signature binding it to the seller's pinned key and cross-checks it with
-the wallet-RPC `validate_address` second parser, disagreement meaning
-reject + security event; (10) only the core changes order/invoice state,
-through the §9 transition tables. Invariant (11) belongs to that v1 scope:
+signature binding it to the seller's pinned key and validates the address
+with the in-process address parser — the wallet-RPC `validate_address`
+cross-check named in the original v1 wording is not built (threat model
+T2; the server runs no wallet and has no wallet-RPC client); (10) only
+the core changes order/invoice state, through the §9 transition tables.
+Invariant (11) belongs to that v1 scope:
 it speaks of orders and Paid, which are v1 concepts — under Hidden Trades
 there is no server-side order for a payment report to move. Read with this
 scoping, the amended (9)/(10) and (11) do not contradict each other: they
