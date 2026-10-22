@@ -286,7 +286,15 @@ fn cmd_status(args: &legacy::Args) -> Result<(), String> {
         Ok(rows) => rows,
         Err(e) => {
             println!("(evidence store)  ERROR: {e}");
-            return Ok(());
+            // E11 (audit 3): a store-level failure is a FAILED
+            // command — the row printed but the process exited 0,
+            // so a script checking the exit code was told the
+            // status succeeded while looking at a broken store.
+            // Per-trade ERROR rows (F10) in the loop below keep
+            // exit 0: that trade is reported and the rest of the
+            // status is real. When the store itself cannot be
+            // read there is no status to succeed at.
+            return Err("the evidence store could not be read; no status was produced".into());
         }
     };
     if rows.is_empty() {

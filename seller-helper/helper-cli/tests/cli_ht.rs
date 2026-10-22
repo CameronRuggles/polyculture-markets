@@ -307,3 +307,43 @@ fn refused_verify_with_wrong_seller_cert_leaves_no_pin() {
     let pin_file = pins_dir.join(format!("{}.asc", fx.seller_fpr));
     assert!(pin_file.exists(), "the matching certificate is pinned after a good verify");
 }
+
+#[test]
+fn status_over_an_unreadable_store_prints_the_error_row_and_fails() {
+    // E11 (audit 3): the `(evidence store) ERROR:` row exists at
+    // the CLI since N8, but the command exited 0 — a script
+    // checking the exit code was told the status succeeded while
+    // looking at a broken store. A store-level error row now
+    // comes with a non-zero exit; per-trade F10 rows keep exit 0
+    // (the healthy statuses here and in the end-to-end test pin
+    // the success side).
+    let fx = fixture("status-error");
+    let _trade_id = seller_side_trade(&fx);
+    // Control: the healthy store's status succeeds.
+    let out = run(&["seller", "status", "--core-config", p(&fx.seller_cfg)]);
+    assert!(out.status.success(), "healthy seller status failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("state=Assigned"), "{}", stdout(&out));
+
+    // Plant an entry whose type cannot be determined inside the
+    // trades directory (a dangling symlink — E2's shape): the
+    // enumeration fails, so status can only print the store row.
+    std::os::unix::fs::symlink(
+        fx.dir.join("no-such-target"),
+        fx.seller_store.join("trades").join("trd_dangling"),
+    )
+    .unwrap();
+    let out = run(&["seller", "status", "--core-config", p(&fx.seller_cfg)]);
+    let text = stdout(&out);
+    assert!(text.contains("(evidence store)  ERROR:"), "{text}");
+    assert!(
+        !out.status.success(),
+        "a store-level ERROR row must exit non-zero, got {:?}: {text}",
+        out.status.code()
+    );
+
+    // Buyer status is the same command over the buyer's own
+    // store; that store is healthy, so it still succeeds — the
+    // failure belongs to the store, not the mode.
+    let out = run(&["buyer", "status", "--core-config", p(&fx.buyer_cfg)]);
+    assert!(out.status.success(), "healthy buyer status failed: {}", stderr(&out));
+}
