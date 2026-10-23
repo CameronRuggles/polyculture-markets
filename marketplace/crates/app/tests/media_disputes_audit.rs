@@ -347,7 +347,7 @@ async fn takedown_blocks_seller_and_restore_only_touches_takedowns() {
     .await
     .unwrap();
     assert!(taken_down, "the takedown is recorded in its own field");
-    assert_eq!(status, "removed", "locked-suite pin: status reads 'removed' while taken down");
+    assert_eq!(status, "removed", "status reads 'removed' while taken down");
 
     // The seller cannot republish — or change the status at all.
     for target in ["published", "draft", "paused", "withdrawn"] {

@@ -273,13 +273,30 @@ fn cmd_status(args: &legacy::Args) -> Result<(), String> {
     let network = cfg.network_enum().ok_or("helper config network is not a statement network name")?;
     let store = EvidenceStore::open(cfg.store_dir.clone())?;
     let now = helper_core::now_canonical();
-    let rows = helper_core::verify::trade_status(
+    // N8: a store whose trades directory cannot be read prints an
+    // ERROR row for the store — never "No trades in the evidence
+    // store", which would report a broken store as an empty one.
+    let rows = match helper_core::verify::trade_status(
         &store,
         &cfg.marketplace_id,
         network,
         &now,
         Some(cfg.cert_file.as_path()),
-    );
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            println!("(evidence store)  ERROR: {e}");
+            // E11 (audit 3): a store-level failure is a FAILED
+            // command — the row printed but the process exited 0,
+            // so a script checking the exit code was told the
+            // status succeeded while looking at a broken store.
+            // Per-trade ERROR rows (F10) in the loop below keep
+            // exit 0: that trade is reported and the rest of the
+            // status is real. When the store itself cannot be
+            // read there is no status to succeed at.
+            return Err("the evidence store could not be read; no status was produced".into());
+        }
+    };
     if rows.is_empty() {
         println!("No trades in the evidence store.");
         return Ok(());

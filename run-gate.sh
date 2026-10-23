@@ -28,6 +28,20 @@ set -eu
 
 cd "$(dirname "$0")"
 
+# HT H2 first batch task 8 (re-verification N7): bind the run to
+# the tree it tests. The HEAD commit and the dirty counts are
+# printed before anything else, so a gate log — whose hash the
+# batch report records — can be tied to exactly one commit and
+# one clean/dirty state. HT H2 fix batch E8 (audit 3): the counts
+# are TRACKED changes and UNTRACKED files on separate lines —
+# the single lumped figure buried the signal it exists for (the
+# first batch's log recorded 27 before and after, while a
+# tracked file was modified mid-batch and the count did not move
+# at all).
+echo "gate tree: HEAD $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "gate tree: tracked changes: $(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
+echo "gate tree: untracked files: $(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')"
+
 if [ -z "${DATABASE_URL:-}" ]; then
     echo "gate preflight: DATABASE_URL is unset — refusing to run." >&2
     echo "A gate run without a database proves nothing (audit F3)." >&2
@@ -69,6 +83,23 @@ rebuild_db() {
 }
 
 echo "gate preflight: DATABASE_URL set, database reachable."
+
+# HT H2 fix batch E7 (audit 3): isolate the suites' runtime
+# output from the tree under test. Media files and message blobs
+# follow MEDIA_DIR / BLOB_DIR, whose defaults are relative to
+# each test binary's working directory — inside the source tree.
+# That is how runtime PNGs came to be committed under
+# marketplace/tests/security/media/ in the initial import (they
+# are the media suite's sanitizer output, not fixtures: nothing
+# reads them as input), and how gate runs kept dirtying the tree
+# they were measuring. The gate exports both to a fresh scratch
+# directory for the run; a caller's own exports are replaced —
+# the isolation is the gate's, not the caller's.
+GATE_SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/pcm-gate.XXXXXX")
+mkdir -p "$GATE_SCRATCH/media" "$GATE_SCRATCH/blobs"
+export MEDIA_DIR="$GATE_SCRATCH/media"
+export BLOB_DIR="$GATE_SCRATCH/blobs"
+echo "gate: runtime output isolated to $GATE_SCRATCH"
 
 rebuild_db
 cd marketplace

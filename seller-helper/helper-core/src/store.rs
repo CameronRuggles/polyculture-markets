@@ -333,8 +333,10 @@ impl EvidenceStore {
     /// signature that is already held is a no-op. An admit of
     /// DIFFERENT bytes under the same kind is a separate proposal
     /// with its own sequence number: two competing settles can
-    /// both be held, and held order decides which completed one
-    /// the fold reaches first. Every check in
+    /// both be held — and held order decides NOTHING about the
+    /// outcome: two different complete terminals are a conflict
+    /// under the owner's rules (D3; E1/E5), and identical terms
+    /// are one outcome however many statements carry them. Every check in
     /// [`EvidenceStore::admit_statement`] (parse, trade-id,
     /// party, signature) has already run for the presented
     /// signature before this is called; the received-at sidecar
@@ -424,6 +426,11 @@ impl EvidenceStore {
     /// This is how a caller learns the trade's two parties (the
     /// fingerprints admission and load check against). A held
     /// assignment that no longer parses is an error, not an absence.
+    /// Absence itself is precise (re-verification N8): no trade
+    /// directory, or a readable directory holding no assignment
+    /// file, is `Ok(None)`; a directory that exists but cannot be
+    /// READ is an error — never a silent "no assignment held",
+    /// which callers would fold as an empty trade.
     pub fn load_assignment(
         &self,
         trade_id: &str,
@@ -431,18 +438,28 @@ impl EvidenceStore {
         network: Network,
     ) -> Result<Option<ht_statements::AssignmentStatement>, String> {
         let dir = self.trade_dir(trade_id);
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with("-assignment.txt") {
-                    let raw = std::fs::read(entry.path())
-                        .map_err(|e| format!("cannot read {name}: {e}"))?;
-                    let text = String::from_utf8(raw)
-                        .map_err(|_| format!("stored assignment in {name} is not UTF-8"))?;
-                    return ht_statements::parse_assignment_statement(&text, marketplace_id, network)
-                        .map(Some)
-                        .ok_or_else(|| format!("stored assignment in {name} no longer parses"));
-                }
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(format!(
+                    "cannot read the trade directory {}: {e} — an unreadable store is never an absent assignment",
+                    dir.display()
+                ))
+            }
+        };
+        for entry in rd {
+            let entry = entry
+                .map_err(|e| format!("cannot list the trade directory {}: {e}", dir.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with("-assignment.txt") {
+                let raw = std::fs::read(entry.path())
+                    .map_err(|e| format!("cannot read {name}: {e}"))?;
+                let text = String::from_utf8(raw)
+                    .map_err(|_| format!("stored assignment in {name} is not UTF-8"))?;
+                return ht_statements::parse_assignment_statement(&text, marketplace_id, network)
+                    .map(Some)
+                    .ok_or_else(|| format!("stored assignment in {name} no longer parses"));
             }
         }
         Ok(None)
@@ -463,23 +480,74 @@ impl EvidenceStore {
         write_atomic(&path, json.as_bytes())
     }
 
-    /// All trade ids with a store directory, sorted.
-    pub fn trade_ids(&self) -> Vec<String> {
+    /// All trade ids with a store directory, sorted. A trades
+    /// directory that exists but cannot be READ is an error, not
+    /// an empty store (re-verification N8): the F5 rule the pool
+    /// ledger already lives by — unreadable is never empty —
+    /// applies to the directory too, because reading an unreadable
+    /// store as empty is what let seeding lose sight of spent
+    /// destinations. The same rule reaches each ENTRY (audit 3,
+    /// E2): an entry whose type cannot be determined — a dangling
+    /// symlink, an entry removed mid-listing — is an error, never
+    /// a silent skip; only an entry KNOWN to be a non-directory
+    /// is skipped. A MISSING trades directory is a store that
+    /// was never opened: no trades, no error.
+    pub fn trade_ids(&self) -> Result<Vec<String>, String> {
+        let trades_dir = self.root.join("trades");
+        let rd = match std::fs::read_dir(&trades_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(format!(
+                    "cannot read the evidence store's trades directory {}: {e} — an unreadable store is never an empty one",
+                    trades_dir.display()
+                ))
+            }
+        };
         let mut ids = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(self.root.join("trades")) {
-            for entry in rd.flatten() {
-                if entry.path().is_dir() {
-                    ids.push(entry.file_name().to_string_lossy().into_owned());
-                }
+        for entry in rd {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "cannot list the evidence store's trades directory {}: {e}",
+                    trades_dir.display()
+                )
+            })?;
+            // E2: decide from the entry's own type, and resolve a
+            // symlink's target explicitly. `path().is_dir()` would
+            // follow the link and swallow any stat failure as
+            // "not a directory", silently dropping the entry.
+            let file_type = entry.file_type().map_err(|e| {
+                format!(
+                    "cannot determine the type of an entry in the evidence store's trades directory {}: {e} — an unreadable store is never an empty one",
+                    trades_dir.display()
+                )
+            })?;
+            let is_dir = if file_type.is_symlink() {
+                std::fs::metadata(entry.path())
+                    .map_err(|e| {
+                        format!(
+                            "cannot stat {} in the evidence store's trades directory: {e} — an unreadable store is never an empty one",
+                            entry.path().display()
+                        )
+                    })?
+                    .is_dir()
+            } else {
+                file_type.is_dir()
+            };
+            if is_dir {
+                ids.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
         ids.sort();
-        ids
+        Ok(ids)
     }
 
-    /// Whether the store holds any trade directory at all.
-    pub fn has_trades(&self) -> bool {
-        !self.trade_ids().is_empty()
+    /// Whether the store holds any trade directory at all. The
+    /// read failure propagates (N8): a caller deciding "fresh
+    /// start" from this answer must hear about an unreadable
+    /// store, not inherit a silent `false`.
+    pub fn has_trades(&self) -> Result<bool, String> {
+        Ok(!self.trade_ids()?.is_empty())
     }
 
     /// Load a trade's held events in held order, RE-VERIFYING the
@@ -652,7 +720,10 @@ impl EvidenceStore {
     /// `<stem>.sig` written before the joint shape existed —
     /// counted as the evidence of whichever party it verifies
     /// against, so an old one-signature hold loads as exactly
-    /// what it is: a proposal, never a terminal state.
+    /// what it is: a proposal, never a terminal state. A legacy
+    /// file duplicating a per-party signature is checked against
+    /// both parties (already-counted ones included) and accepted
+    /// as the same evidence (close-out delta D2).
     fn joint_signature_state(
         &self,
         dir: &Path,
@@ -693,23 +764,36 @@ impl EvidenceStore {
             any_signature = true;
             let sig = std::fs::read_to_string(&legacy)
                 .map_err(|e| format!("cannot read {}: {e}", legacy.display()))?;
-            let mut counted = false;
+            // Verify against BOTH parties — including a party
+            // whose slot a per-party file already filled. A legacy
+            // file that merely DUPLICATES a per-party signature
+            // (the same signature held under both names, e.g. a
+            // trade spanning the joint-shape rename) is consistent
+            // history, not a forgery. The old loop skipped taken
+            // slots and then reported such a signature as
+            // verifying for NEITHER party, refusing the whole load
+            // (close-out delta D2, the auditor's probe). But the
+            // neither-party refusal itself is unconditional
+            // (audit 3, E4): it follows this function's own doc
+            // rule — a signature file that does not verify is an
+            // error — so a foreign legacy signature refuses the
+            // load even when the per-party files already complete
+            // the statement. An earlier shape seeded the check
+            // with the per-party completeness and waved exactly
+            // that file through.
+            let mut verifies_for_someone = false;
             for (fpr, slot) in [
                 (expected.seller_fpr.as_str(), &mut seller_signed),
                 (expected.buyer_fpr.as_str(), &mut buyer_signed),
             ] {
-                if *slot {
-                    continue;
-                }
                 if let Ok(cert) = self.resolve_cert(fpr, own_cert) {
                     if crate::keys::verify_detached(&cert, text.as_bytes(), sig.as_bytes()) {
                         *slot = true;
-                        counted = true;
-                        break;
+                        verifies_for_someone = true;
                     }
                 }
             }
-            if !counted && !(seller_signed && buyer_signed) {
+            if !verifies_for_someone {
                 return Err(format!(
                     "{name}'s signature does not verify against either party's pinned certificate: the held set is not trusted"
                 ));
@@ -816,7 +900,7 @@ fn collect_assignment_destinations(
     network: Network,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut spent = std::collections::BTreeMap::new();
-    for trade_id in store.trade_ids() {
+    for trade_id in store.trade_ids()? {
         if let Some(assignment) = store.load_assignment(&trade_id, marketplace_id, network)? {
             spent.insert(assignment.destination.to_string(), trade_id);
         }
@@ -850,7 +934,10 @@ impl PoolLedger {
         path: &Path,
         store: &EvidenceStore,
     ) -> Result<PoolLedger, String> {
-        if !path.exists() && store.has_trades() {
+        // has_trades propagates a store read failure (N8): an
+        // unreadable store refuses here too, instead of reading
+        // as "no trades held" and seeding fresh over it.
+        if !path.exists() && store.has_trades()? {
             return Err(format!(
                 "the pool ledger at {} is missing but the evidence store holds trades: the ledger is the only record of which destinations are spent — restore it (the batch file re-seeds safely: seeding never resurrects a spent address) before assigning",
                 path.display()
@@ -1302,6 +1389,151 @@ mod tests {
     }
 
     #[test]
+    fn legacy_sig_duplicating_a_per_party_sig_still_loads() {
+        // Close-out delta D2 — the auditor's probe, made
+        // permanent. A store spanning the joint-shape rename can
+        // hold the seller's settle signature under BOTH names (the
+        // legacy unsuffixed file and the per-party file — the same
+        // signature). The loader must count it once, as the
+        // seller's proposal; the old joint check skipped the taken
+        // seller slot, tried the legacy bytes against the buyer
+        // only, and refused the whole load claiming the signature
+        // verified for neither party.
+        let (_root, store, p, trade_id, own_cert) = store_with_assignment("legacy-dup");
+        let settle = settle_bytes(&trade_id);
+        let seller_sig = sign(&p.seller_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &seller_sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("seller's settle signature is held as a proposal");
+        // Plant the legacy copy of the same signature beside the
+        // per-party file the admit just wrote.
+        let dir = store.trade_dir(&trade_id);
+        let per_party = std::fs::read_dir(&dir)
+            .expect("trade dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.ends_with("-settle.seller.sig"))
+            .expect("per-party settle signature on disk");
+        let stem = per_party.trim_end_matches(".seller.sig");
+        std::fs::copy(dir.join(&per_party), dir.join(format!("{stem}.sig")))
+            .expect("plant the legacy duplicate");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("a legacy duplicate of a held signature must not refuse the load");
+        assert!(
+            !events.iter().any(|t| matches!(t.event, TradeEvent::Settle(_))),
+            "one party's signature — however many files hold it — is a proposal, not a settle"
+        );
+        // The buyer countersigns: the trade settles on the same
+        // held set, with the agreed refund.
+        let buyer_sig = sign(&p.buyer_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("countersignature admits");
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("load completed settle");
+        let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
+        assert_eq!(folded.state, TradeState::Settled);
+        assert_eq!(folded.refund_atomic, Some(1_000));
+    }
+
+    #[test]
+    fn foreign_legacy_sig_beside_a_complete_statement_refuses_the_load() {
+        // E4 (audit 3, probe P5): the neither-party refusal is
+        // unconditional. A complete settle (both per-party files
+        // held) with a THIRD party's signature planted at the
+        // legacy path must refuse the load: a held signature file
+        // that verifies for neither party is an error by the
+        // loader's own doc rule, and per-party completeness is
+        // not a pardon. (The D2 duplicate — the same signature
+        // under both names — still loads; see the test above.)
+        let (_root, store, p, trade_id, own_cert) = store_with_assignment("legacy-foreign");
+        let settle = settle_bytes(&trade_id);
+        let seller_sig = sign(&p.seller_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &seller_sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("seller's settle signature held");
+        let buyer_sig = sign(&p.buyer_sec, &settle);
+        store
+            .admit_statement(&trade_id, "settle", &settle, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
+            .expect("buyer's countersignature completes the settle");
+        // Sanity: without the plant, the complete settle loads
+        // and settles.
+        let events = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect("complete settle loads");
+        let folded = fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold");
+        assert_eq!(folded.state, TradeState::Settled);
+        // Plant a third party's signature over the same bytes at
+        // the legacy path.
+        let (mallory_sec, _mallory_pub) =
+            generate_test_cert("Mallory <mallory@example.com>").expect("third key");
+        let foreign_sig = sign(&mallory_sec, &settle);
+        let dir = store.trade_dir(&trade_id);
+        let per_party = std::fs::read_dir(&dir)
+            .expect("trade dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.ends_with("-settle.seller.sig"))
+            .expect("per-party settle signature on disk");
+        let stem = per_party.trim_end_matches(".seller.sig");
+        std::fs::write(dir.join(format!("{stem}.sig")), foreign_sig)
+            .expect("plant the foreign legacy signature");
+        let err = store
+            .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+            .expect_err("a legacy signature verifying for neither party must refuse the load");
+        assert!(err.contains("does not verify against either party"), "{err}");
+    }
+
+    #[test]
+    fn two_distinct_complete_settles_conflict_whichever_was_admitted_first() {
+        // D3 at the store level — the auditor's probe, made
+        // permanent: the same two complete settles admitted into
+        // two fresh stores in opposite orders used to fold to
+        // Settled(100) one way and Settled(50) the other. Both
+        // stores must now fold to the same Conflicted outcome.
+        let run = |tag: &str, a_first: bool| {
+            let (_root, store, p, trade_id, own_cert) = store_with_assignment(tag);
+            let mk_settle = |refund: u64, return_required: bool| {
+                ht_statements::SettleStatement {
+                    marketplace_id: MKT.into(),
+                    trade_id: trade_id.clone(),
+                    refund_atomic: refund,
+                    return_required,
+                    month: "2026-11".into(),
+                }
+                .to_bytes()
+            };
+            let settle_a = mk_settle(100_000_000_000, false);
+            let settle_b = mk_settle(50_000_000_000, true);
+            let order: [&[u8]; 2] =
+                if a_first { [&settle_a, &settle_b] } else { [&settle_b, &settle_a] };
+            for bytes in order {
+                let seller_sig = sign(&p.seller_sec, bytes);
+                store
+                    .admit_statement(&trade_id, "settle", bytes, &seller_sig, &p.seller_pub, &p.expected, MKT, Network::Stagenet, None)
+                    .expect("seller's signature held");
+                let buyer_sig = sign(&p.buyer_sec, bytes);
+                store
+                    .admit_statement(&trade_id, "settle", bytes, &buyer_sig, &p.buyer_pub, &p.expected, MKT, Network::Stagenet, None)
+                    .expect("buyer's countersignature held");
+            }
+            let events = store
+                .load_events(&trade_id, &p.expected, MKT, Network::Stagenet, Some(&own_cert))
+                .expect("load both settles");
+            fold_trade_timed(&events, "2026-11-15T00:00:00Z").expect("fold")
+        };
+        let ab = run("conflict-ab", true);
+        let ba = run("conflict-ba", false);
+        assert_eq!(ab.state, TradeState::Conflicted);
+        assert_eq!(ba.state, TradeState::Conflicted);
+        assert_eq!(ab, ba, "held order must not change the folded outcome");
+        assert!(ab.terminal);
+        assert_eq!(ab.refund_atomic, None);
+    }
+
+    #[test]
     fn joint_statement_from_a_third_party_is_refused_in_either_slot() {
         let (_root, store, p, trade_id, _own_cert) = store_with_assignment("settle-third");
         let settle = settle_bytes(&trade_id);
@@ -1463,6 +1695,126 @@ mod tests {
         let empty_store = EvidenceStore::open(empty_root.clone()).expect("store");
         PoolLedger::load_for_assign(&empty_root.join("pool.json"), &empty_store)
             .expect("missing ledger over an empty store is fine");
+    }
+
+    #[test]
+    fn trade_ids_match_the_open_store() {
+        // N8: an untouched store enumerates as empty as a FINDING
+        // (from a readable — here not-yet-created — directory),
+        // never as a fallback for a failed read.
+        let empty_root = temp_root("ids-match-empty");
+        let empty_store = EvidenceStore::open(empty_root).expect("store");
+        assert_eq!(empty_store.trade_ids().expect("readable store"), Vec::<String>::new());
+        assert_eq!(empty_store.has_trades().expect("readable store"), false);
+        // An absent assignment on a readable store is Ok(None) —
+        // the absent end of the absent-vs-unreadable distinction.
+        assert!(
+            empty_store
+                .load_assignment("trd_none", MKT, Network::Stagenet)
+                .expect("readable store")
+                .is_none(),
+            "no trade directory means no assignment held"
+        );
+
+        // After a trade is admitted, enumeration names exactly it.
+        let (_root, store, _p, trade_id, _own) = store_with_assignment("ids-match");
+        assert_eq!(store.trade_ids().expect("readable store"), vec![trade_id]);
+        assert_eq!(store.has_trades().expect("readable store"), true);
+    }
+
+    #[test]
+    fn unreadable_trades_directory_fails_loud() {
+        let (root, store, _p, trade_id, _own) = store_with_assignment("unreadable");
+        // Replace the trades directory with a regular file: every
+        // read under it now fails. (A chmod would not stop a
+        // root-running test suite; a file where a directory
+        // belongs fails for every user.)
+        let trades = root.join("trades");
+        std::fs::remove_dir_all(&trades).expect("clear trades");
+        std::fs::write(&trades, b"not a directory").expect("block trades");
+
+        let err = store.trade_ids().expect_err("an unreadable trades directory must error");
+        assert!(err.contains("cannot read"), "{err}");
+        assert!(
+            store.has_trades().is_err(),
+            "has_trades must propagate the read failure, not answer false"
+        );
+
+        // The assignment load distinguishes present-but-unreadable
+        // from absent: this trade's assignment EXISTS on disk, so
+        // an Ok(None) here would silently fold an empty trade.
+        let err = store
+            .load_assignment(&trade_id, MKT, Network::Stagenet)
+            .expect_err("an unreadable trade directory must error, not read as absent");
+        assert!(err.contains("cannot read"), "{err}");
+
+        // Assignment refuses: a missing pool ledger over a store
+        // that cannot even be read is not a fresh start either
+        // (this is the call seller assign makes before seeding).
+        let err = PoolLedger::load_for_assign(&root.join("pool.json"), &store)
+            .expect_err("assign over an unreadable store must refuse");
+        assert!(err.contains("cannot read"), "{err}");
+
+        // Status propagates the store-level error, so the CLI
+        // prints its ERROR row instead of "No trades in the
+        // evidence store" (the call seller/buyer status makes).
+        let err = crate::verify::trade_status(
+            &store,
+            MKT,
+            Network::Stagenet,
+            "2026-11-15T00:00:00Z",
+            None,
+        )
+        .expect_err("status over an unreadable store must error");
+        assert!(err.contains("cannot read"), "{err}");
+    }
+
+    #[test]
+    fn dangling_symlink_trade_entry_fails_loud() {
+        // E2 (audit 3, probes P3/P4): an entry whose type cannot
+        // be determined is an ERROR, never a silent skip. A
+        // dangling symlink is the deterministic shape: the link
+        // itself lists fine, but stat on its target fails for
+        // every user — the failure the pre-fix `path().is_dir()`
+        // swallowed, dropping the entry from the enumeration and
+        // shrinking the store under its readers.
+        let (root, store, _p, _trade_id, _own) = store_with_assignment("dangling");
+        let trades = root.join("trades");
+        std::os::unix::fs::symlink(root.join("no-such-target"), trades.join("trd_dangling"))
+            .expect("plant dangling symlink");
+
+        let err = store
+            .trade_ids()
+            .expect_err("a dangling trade entry must error, not vanish from the enumeration");
+        assert!(err.contains("cannot stat"), "{err}");
+        assert!(store.has_trades().is_err(), "has_trades must propagate the entry failure");
+
+        // Assignment refuses: the ledger load seller assign makes
+        // before seeding hears the enumeration error, so nothing
+        // is seeded over a store that cannot be fully read.
+        let err = PoolLedger::load_for_assign(&root.join("pool.json"), &store)
+            .expect_err("assign over a store with a dangling entry must refuse");
+        assert!(err.contains("cannot stat"), "{err}");
+    }
+
+    #[test]
+    fn symlinked_trade_entries_resolve_by_target() {
+        // E2 companion: a symlink whose target CAN be stat'd is
+        // judged by its target — a link to a trade directory
+        // enumerates as a trade; a link to a regular file is a
+        // KNOWN non-directory and skips, without error.
+        let (root, store, _p, trade_id, _own) = store_with_assignment("links");
+        let trades = root.join("trades");
+        std::os::unix::fs::symlink(trades.join(&trade_id), trades.join("trd_alias"))
+            .expect("link to a trade dir");
+        let plain = root.join("plain.txt");
+        std::fs::write(&plain, b"x").expect("plain file");
+        std::os::unix::fs::symlink(&plain, trades.join("not-a-trade")).expect("link to a file");
+
+        let ids = store.trade_ids().expect("resolvable links enumerate");
+        assert!(ids.contains(&"trd_alias".to_string()), "{ids:?}");
+        assert!(ids.contains(&trade_id), "{ids:?}");
+        assert!(!ids.contains(&"not-a-trade".to_string()), "{ids:?}");
     }
 
     #[test]

@@ -81,6 +81,42 @@ with a database copy defeats the encryption-at-rest layer. Rules:
 2. Mode 0600, owned by the service account, nothing else reads it.
 3. Losing it is not recoverable by design. Test your backup (§3).
 
+### The Hidden Trades id file
+
+The instance carries a second, smaller identity file: the HT
+marketplace id (`HT_ID_FILE_PATH`; the default is a relative
+`marketplace.htid` under the process working directory — set it
+explicitly, like the directories in §3). It holds one line, the
+instance's `mkt_...` id, minted on first boot in the development
+profile and **required to already exist** in every other profile:
+minting a replacement would orphan every pinned terms statement
+and every configured helper, so the app refuses to start without
+it (exit 2). An operator may instead fix the id with
+`HT_MARKETPLACE_ID`; then no id file is used.
+
+**First boot on a fresh instance** therefore includes creating
+the file *before* the first start: the content is `mkt_`
+followed by 32 lowercase hex characters (e.g. `openssl rand
+-hex 16` supplies the hex), one line, mode 0600, owned by the
+service account. The demo runbook (§5) carries the exact
+commands; it creates the key file at the same time, which
+follows the same must-already-exist rule outside the
+development profile (32 bytes as 64 hex chars, mode 0600).
+Generating the id string and setting it as `HT_MARKETPLACE_ID`
+instead is equivalent for a fresh instance. For an *existing*
+instance, none of this applies — restore the recorded id,
+never a new one.
+
+The id is **per-instance and permanent** — it never rotates and
+is never regenerated. It is not a secret, but it is
+irreplaceable: back it up **with the deployment**, alongside the
+env file, and include it in the restore drill (§3) — a restored
+instance points `HT_ID_FILE_PATH` at the restored copy (or sets
+`HT_MARKETPLACE_ID` to the same id) before its first start.
+Losing the file when the id is recorded nowhere else strands the
+instance's whole Hidden Trades history: every statement pinned
+under the old id stops matching.
+
 ## 3. Backup and restore — all four parts
 
 An instance is **four** things, and a backup that misses any one of
@@ -108,6 +144,7 @@ Back up all four. Rolling 30 days (§20).
 ```sh
 pg_dump "$DATABASE_URL" | gzip > backup-db-$(date +%F).sql.gz
 cp "$KEY_FILE_PATH" backup-keyfile-$(date +%F)          # separate medium, §2
+cp "$HT_ID_FILE_PATH" backup-htid-$(date +%F)           # §2: the permanent instance id rides along
 tar czf backup-blobs-$(date +%F).tar.gz -C "$BLOB_DIR" .
 tar czf backup-media-$(date +%F).tar.gz -C "$MEDIA_DIR" .
 ```
@@ -127,6 +164,7 @@ tar xzf backup-media-<date>.tar.gz -C /tmp/restore-test/media
 # blob dir and media dir all from the backup:
 DATABASE_URL=postgres://…/marketplace_restore_test \
 KEY_FILE_PATH=/path/to/backup-keyfile-<date> \
+HT_ID_FILE_PATH=/path/to/backup-htid-<date> \
 BLOB_DIR=/tmp/restore-test/blobs MEDIA_DIR=/tmp/restore-test/media \
 ./marketplace-app
 ```
