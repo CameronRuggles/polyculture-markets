@@ -617,7 +617,7 @@ fn alert_text(code: Option<&str>, n: Option<&str>) -> Option<String> {
         "terms_rejected" => "Terms statement rejected: it must parse, name this listing, carry the next version number, bind the listing's current text, and be signed by your current pinned key.".to_string(),
         "terms_required" => "Publishing requires signed listing terms: build them with the helper and pin them from your seller page first.".to_string(),
         // Order page (msg).
-        "proof_recorded" => "Payment proof recorded. It is carried unverified: the seller and moderators check it in their own wallets.".to_string(),
+        "proof_recorded" => "Payment proof recorded. A proof does not mark the order paid — the seller confirms payment from their own wallet. Your proof is carried unverified and is on file for the moderators if a dispute opens.".to_string(),
         "proof_rejected" => "Proof not accepted.".to_string(),
         "report_recorded" => "Your payment report is recorded on your word alone — weaker protection than a transaction proof.".to_string(),
         "report_rejected" => "Report not accepted.".to_string(),
@@ -2833,12 +2833,29 @@ fn evidence_label(level: &str) -> String {
 }
 
 /// The seller-facing evidence label (owner-directed visibility rule,
-/// 2026-10-18): a proof-driven Paid must be indistinguishable from an
-/// attestation-driven Paid, so the seller sees the same line either
-/// way. The proof's existence is never displayed to the seller.
-fn seller_evidence_label(level: &str) -> String {
+/// 2026-10-18, as amended by the owner ruling of 2026-10-23 —
+/// AUDIT2-H1-OWNER-DECISION-2026-10-23.md). The proof's existence
+/// is never displayed to the seller:
+///
+/// - On an open order (Requested / AwaitingPayment / Disputed /
+///   Cancelled), a proof-submitted order reads exactly like an
+///   order with no evidence at all — same state, same line — so
+///   nothing distinguishes it on any seller surface.
+/// - On a LEGACY order already Paid on a proof before the ruling
+///   (Paid lineage: Paid / Fulfilled / Completed / Resolved), the
+///   neutral "Payment recorded" stands: true, and no confirmation
+///   claim the seller never made. "Seller confirmed payment" is
+///   printed only for SellerAttested — here that string arrives
+///   through evidence_label, never from a proof.
+fn seller_evidence_label(level: &str, state: &str) -> String {
     match level {
-        "BuyerProofSubmitted" => "Seller confirmed payment".into(),
+        "BuyerProofSubmitted" => {
+            if matches!(state, "Paid" | "Fulfilled" | "Completed" | "Resolved") {
+                "Payment recorded".into()
+            } else {
+                "No payment evidence recorded".into()
+            }
+        }
         other => evidence_label(other),
     }
 }
@@ -2909,7 +2926,7 @@ async fn order_page(
             .await
             .unwrap_or(false);
     let evidence = if viewer_is_seller {
-        seller_evidence_label(&o.evidence_level)
+        seller_evidence_label(&o.evidence_level, &o.state)
     } else {
         evidence_label(&o.evidence_level)
     };
@@ -3097,7 +3114,11 @@ async fn pay_page(State(st): State<AppState>, headers: HeaderMap, Path(id): Path
         total_xmr: domain::Atomic(o.total_atomic as u64).format_decimal(),
         payment_uri,
         assignment,
-        is_paid: o.state == "Paid",
+        // The pay page's "Seller confirmed payment." line may
+        // render only for an attested Paid (ruling 2026-10-23): a
+        // legacy order Paid on a buyer proof keeps the state but
+        // never earns the words.
+        is_paid: o.state == "Paid" && o.evidence_level == "SellerAttested",
         closed,
         order: o,
     };
@@ -3817,7 +3838,7 @@ async fn dispute_page(
     // the indistinguishable label and no proof data at all.
     let viewer_is_seller_party = is_participant && o.seller_id == sess.account_id;
     let evidence = if viewer_is_seller_party {
-        seller_evidence_label(&o.evidence_level)
+        seller_evidence_label(&o.evidence_level, &o.state)
     } else {
         evidence_label(&o.evidence_level)
     };
