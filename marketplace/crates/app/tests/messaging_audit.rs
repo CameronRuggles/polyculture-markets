@@ -727,7 +727,7 @@ async fn shop(pool: &PgPool) -> (i64, i64, String) {
     (seller, buyer, listing)
 }
 
-/// A Paid order (buyer proof submitted) opened into a dispute.
+/// An order with a buyer proof on file opened into a dispute.
 /// Returns (order_internal_id, order_public_id, dispute_id).
 async fn disputed_order(pool: &PgPool, seller: i64, buyer: i64, listing: &str) -> (i64, String, i64) {
     let c = cfg();
