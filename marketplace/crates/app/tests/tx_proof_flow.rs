@@ -74,14 +74,6 @@ fn cfg() -> PaymentConfig {
     PaymentConfig::defaults("vespiary-market")
 }
 
-/// Audit 2 item 7 threaded fact production into the expiry sweep;
-/// DB-level tests hand it a throwaway keyfile (fact contents are
-/// not what these suites assert — order state is).
-fn sweep_test_kf() -> app::keyfile::KeyFile {
-    app::keyfile::KeyFile::load_or_generate(&std::env::temp_dir().join("pcm-txproof-sweep.key"))
-        .expect("sweep test keyfile")
-}
-
 fn uniq() -> String {
     app::sessions::new_token()[..16].to_string()
 }
@@ -366,7 +358,7 @@ async fn proof_submission_holds_at_awaiting_payment_survives_sweep_and_opens_dis
     // Age the order well past the 48h expiry and run the sweep: a
     // reported order is never eaten by it.
     backdate(&pool, order.id, 72).await;
-    expire_unpaid_orders(&pool, &c, &sweep_test_kf(), &app::reputation::Stage9Config::defaults()).await.unwrap();
+    expire_unpaid_orders(&pool, &c).await.unwrap();
     let (st, _) = order_state(&pool, order.id).await;
     assert_eq!(
         st, "AwaitingPayment",
@@ -469,7 +461,7 @@ async fn unreported_direct_order_cannot_dispute_and_still_expires() {
     assert_eq!(err, Err(OrderError::TransitionDenied));
 
     backdate(&pool, order.id, 49).await;
-    expire_unpaid_orders(&pool, &c, &sweep_test_kf(), &app::reputation::Stage9Config::defaults()).await.unwrap();
+    expire_unpaid_orders(&pool, &c).await.unwrap();
     let (st, _) = order_state(&pool, order.id).await;
     assert_eq!(st, "Cancelled", "an unreported stale order still expires");
 
@@ -1392,7 +1384,7 @@ async fn manual_report_does_not_block_sweep() {
     submit_manual_report(&pool, &order, buyer).await.unwrap();
 
     backdate(&pool, order.id, 49).await;
-    expire_unpaid_orders(&pool, &c, &sweep_test_kf(), &app::reputation::Stage9Config::defaults()).await.unwrap();
+    expire_unpaid_orders(&pool, &c).await.unwrap();
     let (st, _) = order_state(&pool, order.id).await;
     assert_eq!(st, "Cancelled", "a manual report alone never blocks expiry");
 

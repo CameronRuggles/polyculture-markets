@@ -179,7 +179,7 @@ async fn main() -> anyhow::Result<()> {
             ));
             loop {
                 tick.tick().await;
-                match app::payments::expire_unpaid_orders(&sweep_pool, &sweep_cfg, &sweep_kf, &sweep_rep).await {
+                match app::payments::expire_unpaid_orders_with_facts(&sweep_pool, &sweep_cfg, &sweep_kf, &sweep_rep).await {
                     Ok(n) if n > 0 => println!("payment expiry sweep: cancelled {n} unpaid order(s)"),
                     Ok(_) => {}
                     Err(_) => println!("payment expiry sweep: error"),

@@ -1463,11 +1463,32 @@ pub async fn declaration_dispute_reopenable(
 // Stage 10). Cancels unpaid direct orders WITH an assignment whose
 // created_at is older than the configured expiry; their entries retire.
 
-pub async fn expire_unpaid_orders(
+/// The expiry sweep, without reputation fact production. This
+/// 2-argument entry point is the signature the locked blind suite
+/// (blind_direct_v1) pins; the production binary calls
+/// `expire_unpaid_orders_with_facts` instead. Both share the one
+/// implementation below — the variants differ ONLY in whether a
+/// fact is recorded at each cancellation.
+pub async fn expire_unpaid_orders(pool: &PgPool, cfg: &PaymentConfig) -> Result<u64, PaymentError> {
+    expire_unpaid_orders_impl(pool, cfg, None).await
+}
+
+/// The expiry sweep as production runs it (Audit 2 item 7): each
+/// cancellation is a terminal transition, so its reputation fact
+/// is recorded on the spot.
+pub async fn expire_unpaid_orders_with_facts(
     pool: &PgPool,
     cfg: &PaymentConfig,
     kf: &crate::keyfile::KeyFile,
     rep: &crate::reputation::Stage9Config,
+) -> Result<u64, PaymentError> {
+    expire_unpaid_orders_impl(pool, cfg, Some((kf, rep))).await
+}
+
+async fn expire_unpaid_orders_impl(
+    pool: &PgPool,
+    cfg: &PaymentConfig,
+    facts: Option<(&crate::keyfile::KeyFile, &crate::reputation::Stage9Config)>,
 ) -> Result<u64, PaymentError> {
     let stale: Vec<(i64, String, i64, i64)> = sqlx::query_as(
         "SELECT o.id, o.public_id, o.buyer_id, o.seller_id FROM orders o
@@ -1506,9 +1527,12 @@ pub async fn expire_unpaid_orders(
         }
         tx.commit().await?;
         if cancelled {
-            // Audit 2 item 7 (L3): the fact is produced HERE, on the
-            // terminal transition — never lazily on a profile read.
-            let _ = crate::reputation::record_fact_for_order(pool, kf, rep, order_id).await;
+            // Audit 2 item 7 (L3): in the production variant the
+            // fact is produced HERE, on the terminal transition —
+            // never lazily on a profile read.
+            if let Some((kf, rep)) = facts {
+                let _ = crate::reputation::record_fact_for_order(pool, kf, rep, order_id).await;
+            }
         }
         let _ = crate::orders::notify(pool, buyer_id, "order_expired", &public_id).await;
         let _ = crate::orders::notify(pool, seller_id, "order_expired", &public_id).await;

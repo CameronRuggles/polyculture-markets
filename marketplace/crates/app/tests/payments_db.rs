@@ -555,9 +555,7 @@ async fn expiry_sweep_cancels_and_retires() {
     let a = assignment_for_order(&pool, order.id, &c).await.unwrap().unwrap();
     sqlx::query("UPDATE orders SET created_at = now() - interval '49 hours' WHERE id = $1")
         .bind(order.id).execute(&pool).await.unwrap();
-    let kf = app::keyfile::KeyFile::load_or_generate(&std::env::temp_dir().join("pcm-payments-db-test.key"))
-        .expect("test keyfile");
-    let n = expire_unpaid_orders(&pool, &c, &kf, &app::reputation::Stage9Config::defaults()).await.unwrap();
+    let n = expire_unpaid_orders(&pool, &c).await.unwrap();
     assert!(n >= 1);
     let after = app::orders::order_by_public_id(&pool, &order.public_id).await.unwrap();
     assert_eq!(after.state, "Cancelled");
