@@ -244,20 +244,10 @@ async fn stepup_notice(st: &AppState, account_id: i64, event_type: &str, what: &
 /// Escape a value interpolated into the hand-built shell (template
 /// bodies are already escaped by Askama at the variable level; the
 /// shell's own values — title, site name, username — are not).
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
+/// The implementation is the project's one shared escaper,
+/// `domain::markup::esc` (Audit 2 item 9b removed the duplicate
+/// copy that used to live here).
+use domain::markup::esc;
 
 /// What the header needs. Built per request by `nav_for` (counts are
 /// computed server-side on every request, §15); `Nav::anonymous` is

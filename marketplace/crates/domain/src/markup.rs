@@ -3,7 +3,11 @@
 //! escaped text, so no seller input can ever become a tag, attribute, or
 //! link. URLs render as plain text.
 
-fn esc(s: &str) -> String {
+/// THE shared HTML escaper for the whole project (Code Audit 2
+/// item 9b: the app crate's web.rs carried a byte-identical copy;
+/// it now imports this one). Escapes & < > " ' for interpolation
+/// into HTML text and attribute values.
+pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
