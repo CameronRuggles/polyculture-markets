@@ -542,10 +542,23 @@ impl VerificationHelper for UnwrapHelper {
     }
 }
 
+/// Hard cap on the DECOMPRESSED size of an unwrap paste (Code
+/// Audit 2, M1/R4). The paste itself is size-capped by the caller,
+/// but a compressed-data packet inside it expands during the read:
+/// an ~80 KiB paste can decompress without bound and OOM the
+/// instance (MemoryMax=1G) before any post-read length check runs.
+/// The reader is therefore wrapped in `Read::take` at this cap —
+/// slightly above the 65,536-byte plaintext limit the caller
+/// enforces — and a paste whose decompressed form reaches the cap
+/// is refused outright. The cap is enforced DURING decompression,
+/// so the allocation can never exceed it (plus one probe byte).
+pub const UNWRAP_OUTPUT_CAP: u64 = 70_000;
+
 /// Read a `gpg --unwrap --armor` paste as a (possibly signed) message
 /// against the expected certificate, extracting the plaintext with
 /// Sequoia. Returns None when the paste is not a readable OpenPGP
-/// message at all. `verified` is true only when at least one
+/// message at all, or when its decompressed form exceeds
+/// `UNWRAP_OUTPUT_CAP`. `verified` is true only when at least one
 /// signature was present and every signature result was good.
 pub fn extract_unwrapped_message(cert_bytes: &[u8], pasted: &[u8]) -> Option<UnwrappedMessage> {
     use std::io::Read as _;
@@ -556,7 +569,16 @@ pub fn extract_unwrapped_message(cert_bytes: &[u8], pasted: &[u8]) -> Option<Unw
         .with_policy(&policy, None, UnwrapHelper { cert, good: 0, bad: 0, sig_created: None })
         .ok()?;
     let mut out = Vec::new();
-    verifier.read_to_end(&mut out).ok()?;
+    // take(cap + 1): reading one byte past the cap is how "exactly
+    // at the cap" is told apart from "over the cap".
+    verifier
+        .by_ref()
+        .take(UNWRAP_OUTPUT_CAP + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    if out.len() as u64 > UNWRAP_OUTPUT_CAP {
+        return None;
+    }
     let helper = verifier.into_helper();
     Some(UnwrappedMessage {
         plaintext: String::from_utf8_lossy(&out).into_owned(),
@@ -583,6 +605,26 @@ mod tests {
         assert!(a.warnings.iter().any(|w| w.contains("email")), "{:?}", a.warnings);
         let b = validate_cert(KEY_B).unwrap();
         assert_eq!(b.fingerprint, "3183B78A92ED3504BF1F00F6899089B33BDED014");
+    }
+
+    #[test]
+    fn unwrap_decompression_is_capped() {
+        // Positive control for the M1 cap: a 313-byte gpg-signed,
+        // zlib-compressed paste that expands to 100,000 bytes must
+        // be REFUSED (None) — before the cap it extracted in full.
+        // The small signed+compressed paste (720 bytes of plaintext)
+        // must still extract AND verify, proving the cap refuses
+        // expansion, not compression or signing. Both fixtures were
+        // made with `gpg --sign --compress-algo zlib` under the
+        // throwaway fixture cert (tests/fixtures/unwrap-fixture-cert.asc).
+        const CERT: &[u8] = include_bytes!("../tests/fixtures/unwrap-fixture-cert.asc");
+        const BOMB: &[u8] = include_bytes!("../tests/fixtures/unwrap-bomb.gpg");
+        const SMALL: &[u8] = include_bytes!("../tests/fixtures/unwrap-small.gpg");
+        assert!(extract_unwrapped_message(CERT, BOMB).is_none(), "over-cap decompression refused");
+        let small = extract_unwrapped_message(CERT, SMALL).expect("under-cap paste extracts");
+        assert_eq!(small.plaintext.len(), 720);
+        assert!(small.plaintext.starts_with("hello marketplace"));
+        assert!(small.verified, "the small paste is genuinely signed by the fixture cert");
     }
 
     #[test]
