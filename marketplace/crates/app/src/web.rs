@@ -515,7 +515,7 @@ pub fn router(state: AppState) -> Router {
         .route("/seller/apply", post(seller_apply))
         .route("/seller/listings", post(create_listing))
         .route("/seller/listings/{id}/status", post(listing_status))
-        .route("/seller/listings/{id}/media", post(listing_media))
+        .route("/seller/listings/{id}/media", post(listing_media).layer(DefaultBodyLimit::max(MEDIA_BODY_MAX)))
         .route("/media/{r#ref}", get(media_serve))
         .route("/moderation/sellers", get(moderation_sellers))
         .route("/moderation/sellers/{id}", post(moderation_decide))
@@ -534,7 +534,7 @@ pub fn router(state: AppState) -> Router {
         .route("/orders/{id}/pay/qr.png", get(pay_qr))
         .route("/orders/{id}/{action}", post(order_action))
         .route("/seller/payment-identity", post(payment_identity_post))
-        .route("/seller/payment-batches", post(payment_batch_post))
+        .route("/seller/payment-batches", post(payment_batch_post).layer(DefaultBodyLimit::max(BATCH_BODY_MAX)))
         .route("/inbox", get(inbox_page))
         .route("/inbox/read-all", post(inbox_read_all))
         .route("/conversations", get(conversations_page))
@@ -1313,7 +1313,7 @@ async fn recover(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<R
 // -- Stage 2: catalogue, listings, seller admission, media -------------------
 
 use crate::listings as lst;
-use axum::extract::{Multipart, Path, Query};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use std::collections::HashMap;
 
 pub struct ListingView {
@@ -1671,6 +1671,28 @@ async fn payment_identity_post(
     }
 }
 
+/// Code Audit 2 item 6 (L2): explicit body limits for the two
+/// multipart routes the audit named. Axum's 2 MB DefaultBodyLimit
+/// does NOT apply to the `Multipart` extractor, so before this fix
+/// both handlers buffered request bodies with no bound at all and
+/// only their downstream checks ever said no.
+///
+/// Batch route, grounded in the format envelope: a batch is a
+/// ~350-byte header plus at most `PAYMENTS_MAX_BATCH` entries
+/// (default 100), each ≈500 bytes of JSON (95-byte subaddress,
+/// ~270-byte canonical message, ~91-byte signature, keys and
+/// punctuation) — the largest legitimate default-config batch is
+/// ≈51 KiB. `BATCH_TEXT_MAX` (256 KiB) is 5× that and still covers
+/// the entry cap raised to ~500; the route limit adds 16 KiB for
+/// the step-up fields and multipart framing.
+const BATCH_TEXT_MAX: usize = 256 * 1024;
+const BATCH_BODY_MAX: usize = BATCH_TEXT_MAX + 16 * 1024;
+/// Media route: the sanitiser's own ceiling is 5 MiB
+/// (`media::sanitize`); the route limit is that plus 64 KiB of
+/// multipart framing, so an oversized upload is refused at the
+/// door instead of after a full unbounded read.
+const MEDIA_BODY_MAX: usize = 5 * 1024 * 1024 + 64 * 1024;
+
 async fn payment_batch_post(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1738,6 +1760,12 @@ async fn payment_batch_post(
     let Some(text) = file_text.or(pasted) else {
         return Redirect::to("/seller?pmsg=batch_missing").into_response();
     };
+    // Audit 2 item 6: the field-length cap runs BEFORE the JSON
+    // parse inside upload_batch — an over-envelope text is a
+    // rejected batch, never a parse attempt.
+    if text.len() > BATCH_TEXT_MAX {
+        return Redirect::to("/seller?pmsg=batch_rejected").into_response();
+    }
     match crate::payments::upload_batch(&st.pool, sess.account_id, &text, &st.payments).await {
         Ok(n) => {
             stepup_notice(&st, sess.account_id, "stepup_payment_batch", "a signed subaddress batch was uploaded to your pool").await;
