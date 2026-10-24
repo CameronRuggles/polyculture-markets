@@ -66,15 +66,31 @@ impl AppState {
         if self.dev_cookies { "device" } else { "__Host-device" }
     }
     /// The device cookie set on a successful login (verification-fix
-    /// V1): `{public_id}.{mac}` — see `KeyFile::device_cookie_mac`
-    /// and `device_cookie_exempt`. One year, so a browser the owner
-    /// actually uses stays exempt from the stranger budget across
-    /// the failure window many times over.
-    fn set_device_cookie(&self, account_id: i64, public_id: &str) -> String {
+    /// V1): `{public_id}.{epoch}.{mac}` — see
+    /// `KeyFile::device_cookie_mac` and `device_cookie_exempt`.
+    /// Ninety days (Code Audit 2 item 5 shortened it from a year):
+    /// still far longer than any failure-budget window the
+    /// exemption exists to span, and the epoch binding means a
+    /// captured value is revocable server-side instead of living
+    /// out its full age no matter what.
+    fn set_device_cookie(&self, account_id: i64, public_id: &str, epoch: i64) -> String {
         let secure = if self.dev_cookies { "" } else { "; Secure" };
-        let mac = hex::encode(self.keyfile.device_cookie_mac(account_id));
+        let mac = hex::encode(self.keyfile.device_cookie_mac(account_id, epoch));
         format!(
-            "{}={public_id}.{mac}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000{secure}",
+            "{}={public_id}.{epoch}.{mac}; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000{secure}",
+            self.device_cookie_name()
+        )
+    }
+
+    /// Clear this browser's device cookie (Audit 2 item 5): logout
+    /// ends the session AND drops the budget exemption this browser
+    /// carried, instead of leaving a live exemption behind on a
+    /// shared machine. The account's epoch is NOT bumped here, so
+    /// the owner's other browsers keep theirs.
+    fn clear_device_cookie(&self) -> String {
+        let secure = if self.dev_cookies { "" } else { "; Secure" };
+        format!(
+            "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}",
             self.device_cookie_name()
         )
     }
@@ -979,20 +995,34 @@ struct LoginForm {
 /// compared in constant time. (Tor Browser drops cookies on close,
 /// so the exemption mainly protects non-Tor and persistent-profile
 /// browsers; it never weakens the passphrase/TOTP checks.)
-fn device_cookie_exempt(st: &AppState, headers: &HeaderMap, account_id: i64, public_id: &str) -> bool {
+///
+/// Code Audit 2 item 5: the cookie carries the account's device
+/// epoch and verifies only AT THE CURRENT EPOCH — a passphrase
+/// change or recovery bumps the epoch and every previously issued
+/// cookie stops exempting, wherever it was captured.
+fn device_cookie_exempt(
+    st: &AppState,
+    headers: &HeaderMap,
+    account_id: i64,
+    public_id: &str,
+    epoch: i64,
+) -> bool {
     let Some(raw) = cookie_value(headers, st.device_cookie_name()) else {
         return false;
     };
-    let Some((pid, mac_hex)) = raw.split_once('.') else {
+    let Some((pid, rest)) = raw.split_once('.') else {
         return false;
     };
-    if pid != public_id {
+    let Some((epoch_s, mac_hex)) = rest.split_once('.') else {
+        return false;
+    };
+    if pid != public_id || epoch_s.parse::<i64>() != Ok(epoch) {
         return false;
     }
     let Ok(mac) = hex::decode(mac_hex) else {
         return false;
     };
-    let expected = st.keyfile.device_cookie_mac(account_id);
+    let expected = st.keyfile.device_cookie_mac(account_id, epoch);
     if mac.len() != expected.len() {
         return false;
     }
@@ -1023,7 +1053,8 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
         return page(&st, &headers, "Log in", generic_tpl(&f.csrf).render().unwrap()).await;
     };
     let public_id = db::public_id_of(&st.pool, id).await.ok().flatten().unwrap_or_default();
-    let exempt = device_cookie_exempt(&st, &headers, id, &public_id);
+    let epoch = db::device_epoch(&st.pool, id).await.unwrap_or(0);
+    let exempt = device_cookie_exempt(&st, &headers, id, &public_id, epoch);
     // AM1 + verification-fix V1: the budget's AUTHORITATIVE check
     // happens under the per-username hash lock, and a failure is
     // recorded before the lock is released. (The pre-lock check that
@@ -1118,7 +1149,7 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
     if let Ok(v) = HeaderValue::from_str(&st.set_cookie(&token)) {
         hm.append(header::SET_COOKIE, v);
     }
-    if let Ok(v) = HeaderValue::from_str(&st.set_device_cookie(id, &public_id)) {
+    if let Ok(v) = HeaderValue::from_str(&st.set_device_cookie(id, &public_id, epoch)) {
         hm.append(header::SET_COOKIE, v);
     }
     (hm, Redirect::to("/account")).into_response()
@@ -1141,11 +1172,17 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Lo
     }
     let _ = db::revoke_all_sessions(&st.pool, sess.account_id).await;
     let _ = token;
-    (
-        [(header::SET_COOKIE, st.set_cookie(""))],
-        Redirect::to("/"),
-    )
-        .into_response()
+    // Audit 2 item 5: the device cookie is cleared too — logout
+    // must not leave a live budget exemption behind on this
+    // browser. (The epoch is unchanged; other browsers keep theirs.)
+    let mut hm = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&st.set_cookie("")) {
+        hm.append(header::SET_COOKIE, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&st.clear_device_cookie()) {
+        hm.append(header::SET_COOKIE, v);
+    }
+    (hm, Redirect::to("/")).into_response()
 }
 
 async fn account_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
@@ -4563,7 +4600,9 @@ async fn passphrase_change(
         Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
     };
-    if sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+    // The epoch bump rides the passphrase change (Audit 2 item 5):
+    // device cookies issued under the old passphrase stop exempting.
+    if sqlx::query("UPDATE accounts SET password_hash = $2, device_epoch = device_epoch + 1 WHERE id = $1")
         .bind(sess.account_id)
         .bind(&hash)
         .execute(&st.pool)

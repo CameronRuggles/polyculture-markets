@@ -82,20 +82,29 @@ impl KeyFile {
         hmac(&self.master, label.as_bytes())
     }
 
-    /// Device-cookie MAC for one account (verification-fix V1,
-    /// OWASP's device-cookie pattern): a successful login sets a
-    /// long-lived cookie carrying HMAC-SHA256 (key-file subkey) over
-    /// the account id. A later login presenting a cookie whose MAC
-    /// verifies for the account is a browser that has logged in
+    /// Device-cookie MAC for one account at one device epoch
+    /// (verification-fix V1, OWASP's device-cookie pattern; epoch
+    /// binding added by Code Audit 2 item 5, finding L1): a
+    /// successful login sets a cookie carrying HMAC-SHA256
+    /// (key-file subkey) over (account id, epoch). A later login
+    /// presenting a cookie whose MAC verifies for the account AT
+    /// THE ACCOUNT'S CURRENT EPOCH is a browser that has logged in
     /// before — the per-username failure budget, which exists to
     /// stop strangers guessing, does not apply to it, so an attacker
     /// who spends the budget cannot lock the owner out of a browser
-    /// they already use. The MAC is unforgeable without the key
-    /// file, and it authorizes nothing by itself: the passphrase
-    /// (and TOTP, when enrolled) is still verified in full.
-    pub fn device_cookie_mac(&self, account_id: i64) -> [u8; 32] {
-        let key = self.subkey("device-cookie-v1");
-        hmac(&key, &account_id.to_be_bytes())
+    /// they already use. The epoch is per-account server state
+    /// (`accounts.device_epoch`, migration 0018): incrementing it
+    /// revokes every outstanding device cookie at once, which
+    /// happens on passphrase change and recovery. The MAC is
+    /// unforgeable without the key file, and it authorizes nothing
+    /// by itself: the passphrase (and TOTP, when enrolled) is still
+    /// verified in full.
+    pub fn device_cookie_mac(&self, account_id: i64, epoch: i64) -> [u8; 32] {
+        let key = self.subkey("device-cookie-v2");
+        let mut data = Vec::with_capacity(16);
+        data.extend_from_slice(&account_id.to_be_bytes());
+        data.extend_from_slice(&epoch.to_be_bytes());
+        hmac(&key, &data)
     }
 
     /// Buyer token for one (seller, buyer) pair: HMAC-SHA256 keyed by
@@ -197,9 +206,14 @@ mod tests {
     #[test]
     fn device_cookie_mac_is_account_specific() {
         let k = kf();
-        assert_eq!(k.device_cookie_mac(7), k.device_cookie_mac(7), "deterministic per account");
-        assert_ne!(k.device_cookie_mac(7), k.device_cookie_mac(8), "bound to the account");
-        assert_ne!(k.device_cookie_mac(7), k.buyer_token(7, 7), "separate subkey from buyer tokens");
+        assert_eq!(k.device_cookie_mac(7, 0), k.device_cookie_mac(7, 0), "deterministic per account+epoch");
+        assert_ne!(k.device_cookie_mac(7, 0), k.device_cookie_mac(8, 0), "bound to the account");
+        assert_ne!(
+            k.device_cookie_mac(7, 0),
+            k.device_cookie_mac(7, 1),
+            "an epoch bump changes the MAC — old cookies stop verifying (Audit 2 item 5)"
+        );
+        assert_ne!(k.device_cookie_mac(7, 0), k.buyer_token(7, 7), "separate subkey from buyer tokens");
     }
 
     #[test]
