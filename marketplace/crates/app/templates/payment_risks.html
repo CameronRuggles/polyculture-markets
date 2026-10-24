@@ -3,7 +3,8 @@
 <h2>There is no escrow</h2>
 <p>You pay the seller directly, from your wallet to theirs. This marketplace never holds your money — which means it also <strong>cannot refund you, reverse a payment, or recover funds</strong> sent to a wrong address. No administrator can do these things, whatever anyone in a message claims.</p>
 <h2>"Seller confirmed payment" means the seller said so</h2>
-<p>This instance runs no wallet and checks nothing on-chain. When an order says <em>seller confirmed payment</em>, the seller marked it paid after seeing funds in their own wallet. That is an attestation, not a verification — the order page uses those words precisely, and you should read them precisely.</p>
+<p>This instance runs no wallet and checks nothing on-chain. An order reads <em>paid</em> only when the seller marked it paid after seeing funds in their own wallet — and when it says <em>seller confirmed payment</em>, that is exactly what happened. That is an attestation, not a verification — the order page uses those words precisely, and you should read them precisely.</p>
+<p>After paying, you can attach your transaction proof from the order page. A proof never marks an order paid, and the seller cannot see it: it sits on file, unverified, for the moderators to check if a dispute opens. Submitting one does stop an unpaid order from expiring while the seller has not yet confirmed, and the seller cannot close the order over it.</p>
 <h2>Verify the address before you pay</h2>
 <ul>
 <li>Every order gets a <strong>one-time subaddress</strong> drawn from a batch the seller signed with their own wallet in advance.</li>
