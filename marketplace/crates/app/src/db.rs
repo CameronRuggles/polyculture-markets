@@ -167,6 +167,20 @@ pub async fn replace_recovery_code(pool: &PgPool, account_id: i64, code: &str) -
     Ok(())
 }
 
+/// The account's current device-cookie epoch (migration 0018,
+/// Code Audit 2 item 5). The device cookie's MAC covers this
+/// value; incrementing it revokes every outstanding device cookie
+/// for the account. A missing row reads as epoch 0 (the column
+/// default) — the login path treats the account as nonexistent
+/// before it ever gets here.
+pub async fn device_epoch(pool: &PgPool, account_id: i64) -> Result<i64, sqlx::Error> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT device_epoch FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(e,)| e).unwrap_or(0))
+}
+
 pub async fn store_recovery_code(pool: &PgPool, account_id: i64, code: &str) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO recovery_codes (account_id, code_hash) VALUES ($1, $2)")
         .bind(account_id)
@@ -200,7 +214,10 @@ pub async fn consume_recovery_code(
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE accounts SET recovered_at = now() WHERE id = $1")
+    // Recovery is a compromise path: outstanding device cookies
+    // lose their budget exemption too (device_epoch bump, Audit 2
+    // item 5).
+    sqlx::query("UPDATE accounts SET recovered_at = now(), device_epoch = device_epoch + 1 WHERE id = $1")
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
@@ -246,7 +263,7 @@ pub async fn complete_recovery(
     .bind(account_id)
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+    sqlx::query("UPDATE accounts SET password_hash = $2, device_epoch = device_epoch + 1 WHERE id = $1")
         .bind(account_id)
         .bind(new_password_hash)
         .execute(&mut *tx)

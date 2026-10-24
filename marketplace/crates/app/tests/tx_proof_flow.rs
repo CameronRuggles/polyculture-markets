@@ -6,14 +6,18 @@
 //! it UNVERIFIED (it never checks proofs, never labels them
 //! "verified"); the submission is the timestamped payment report the
 //! dispute gate, the expiry sweep, and the seller-cancel guard key
-//! on, and it marks the order Paid through the core.
+//! on. AMENDED 2026-10-23 (owner ruling, Code Audit 2 H1 —
+//! AUDIT2-H1-OWNER-DECISION-2026-10-23.md): the submission no longer
+//! marks the order Paid; the order holds at AwaitingPayment and only
+//! the seller's attestation makes it Paid.
 //!
-//! VISIBILITY (owner-directed): the proof, the txid, and the source
-//! of a Paid state are visible ONLY to the submitting buyer and to
+//! VISIBILITY (owner-directed): the proof, the txid, and its
+//! existence are visible ONLY to the submitting buyer and to
 //! moderators inside the dispute view. The seller sees only the
-//! order state — a proof-driven Paid is indistinguishable from an
-//! attestation-driven Paid on every seller-facing surface, including
-//! notifications.
+//! order state — and since the ruling the state does not move on a
+//! proof either, so a proof-submitted order is identical to any
+//! other AwaitingPayment order on every seller-facing surface,
+//! including notifications.
 //!
 //! DB tests require DATABASE_URL (skipped silently when unset, the
 //! pattern of the neighbouring suites).
@@ -173,6 +177,8 @@ async fn cleanup(pool: &PgPool, accounts: &[i64]) {
             "DELETE FROM disclosures WHERE dispute_id IN (SELECT d.id FROM disputes d JOIN orders o ON o.id = d.order_id WHERE o.buyer_id = $1 OR o.seller_id = $1)",
             "DELETE FROM disputes WHERE order_id IN (SELECT id FROM orders WHERE buyer_id = $1 OR seller_id = $1)",
             "DELETE FROM payment_attestations WHERE order_id IN (SELECT id FROM orders WHERE buyer_id = $1 OR seller_id = $1)",
+            "DELETE FROM reputation_facts WHERE order_id IN (SELECT id FROM orders WHERE buyer_id = $1 OR seller_id = $1)",
+            "DELETE FROM reputation_summaries WHERE seller_id = $1",
             "DELETE FROM payment_pool_entries WHERE seller_id = $1",
             "DELETE FROM payment_batches WHERE seller_id = $1",
             "DELETE FROM payment_identities WHERE seller_id = $1",
@@ -274,9 +280,12 @@ async fn backdate(pool: &PgPool, order_id: i64, hours: i64) {
 // Task 1 (expanded): the acceptance flow. Buyer pays, submits
 // report+proof, seller stays silent, the sweep runs: the order is NOT
 // cancelled and the buyer's dispute opens.
+// AMENDED 2026-10-23 (Audit 2 H1 owner ruling): the proof holds the
+// order at AwaitingPayment instead of marking it Paid, and no
+// order_paid notification is produced by a submission.
 
 #[tokio::test]
-async fn proof_submission_marks_paid_survives_sweep_and_opens_dispute() {
+async fn proof_submission_holds_at_awaiting_payment_survives_sweep_and_opens_dispute() {
     let Some(pool) = pool().await else { return };
     let _guard = fixture_lock().lock().await;
     purge_fixture_addresses(&pool).await;
@@ -300,13 +309,15 @@ async fn proof_submission_marks_paid_survives_sweep_and_opens_dispute() {
     let err = apply_action(&pool, &order, "dispute", buyer).await;
     assert_eq!(err, Err(OrderError::TransitionDenied));
 
-    // Buyer pays off-server and submits the proof.
+    // Buyer pays off-server and submits the proof. The order holds
+    // at AwaitingPayment (ruling 2026-10-23): only the seller's
+    // attestation can make it Paid.
     let state = submit_payment_proof(&pool, &order, buyer, TXID_A, PROOF_A, &c)
         .await
         .unwrap();
-    assert_eq!(format!("{state:?}"), "Paid");
+    assert_eq!(format!("{state:?}"), "AwaitingPayment");
     let (st, ev) = order_state(&pool, order.id).await;
-    assert_eq!(st, "Paid");
+    assert_eq!(st, "AwaitingPayment");
     assert_eq!(ev, "BuyerProofSubmitted");
     assert!(has_payment_report(&pool, order.id).await.unwrap());
     let stored = payment_proof_for_order(&pool, order.id)
@@ -317,8 +328,9 @@ async fn proof_submission_marks_paid_survives_sweep_and_opens_dispute() {
     assert_eq!(stored.proof, PROOF_A);
     assert_eq!(stored.submitted_by, buyer);
 
-    // Notification parity: the buyer sees the same order_paid event an
-    // attestation produces; the seller receives nothing that reveals
+    // Notification truth (ruling 2026-10-23): a proof produces NO
+    // order_paid event — that event belongs to the seller's
+    // attestation alone. The seller receives nothing that reveals
     // a proof (in fact nothing about the payment at all).
     let buyer_notes: Vec<(String,)> =
         sqlx::query_as("SELECT event_type FROM notifications WHERE account_id = $1")
@@ -327,8 +339,8 @@ async fn proof_submission_marks_paid_survives_sweep_and_opens_dispute() {
             .await
             .unwrap();
     assert!(
-        buyer_notes.iter().any(|(t,)| t == "order_paid"),
-        "buyer must see the same order_paid event as an attestation produces: {buyer_notes:?}"
+        buyer_notes.iter().all(|(t,)| t != "order_paid"),
+        "a proof submission must not produce an order_paid event: {buyer_notes:?}"
     );
     let seller_notes: Vec<(String,)> =
         sqlx::query_as("SELECT event_type FROM notifications WHERE account_id = $1")
@@ -348,7 +360,10 @@ async fn proof_submission_marks_paid_survives_sweep_and_opens_dispute() {
     backdate(&pool, order.id, 72).await;
     expire_unpaid_orders(&pool, &c).await.unwrap();
     let (st, _) = order_state(&pool, order.id).await;
-    assert_eq!(st, "Paid", "the sweep must skip proof-submitted orders");
+    assert_eq!(
+        st, "AwaitingPayment",
+        "the sweep must skip proof-submitted orders"
+    );
 
     // The buyer's dispute opens.
     let order = order_by_public_id(&pool, &order.public_id).await.unwrap();
@@ -365,11 +380,14 @@ async fn proof_submission_marks_paid_survives_sweep_and_opens_dispute() {
 
 // ---------------------------------------------------------------------------
 // Submission from Requested (buyer paid before the seller accepted):
-// the core advances the order to Paid; the seller can then neither
-// cancel nor decline it — their remedy is a dispute or shipping.
+// the core moves the order to AwaitingPayment and no further
+// (AMENDED 2026-10-23, Audit 2 H1 owner ruling — it used to advance
+// to Paid); the seller can still neither cancel nor decline it —
+// their remedy is confirming from their wallet, a dispute, or
+// shipping.
 
 #[tokio::test]
-async fn proof_from_requested_advances_and_seller_cannot_cancel_or_decline() {
+async fn proof_from_requested_holds_at_awaiting_payment_and_seller_cannot_cancel_or_decline() {
     let Some(pool) = pool().await else { return };
     let _guard = fixture_lock().lock().await;
     purge_fixture_addresses(&pool).await;
@@ -386,7 +404,7 @@ async fn proof_from_requested_advances_and_seller_cannot_cancel_or_decline() {
         .await
         .unwrap();
     let (st, _) = order_state(&pool, order.id).await;
-    assert_eq!(st, "Paid");
+    assert_eq!(st, "AwaitingPayment");
 
     let order = order_by_public_id(&pool, &order.public_id).await.unwrap();
     let err = apply_action(&pool, &order, "cancel", seller_id).await;
@@ -739,7 +757,7 @@ fn csrf_from(html: &str) -> String {
 }
 
 #[tokio::test]
-async fn buyer_submits_proof_over_http_and_order_turns_paid() {
+async fn buyer_submits_proof_over_http_and_order_holds_awaiting_payment() {
     let Some(pool) = pool().await else { return };
     let _guard = fixture_lock().lock().await;
     purge_fixture_addresses(&pool).await;
@@ -786,7 +804,10 @@ async fn buyer_submits_proof_over_http_and_order_turns_paid() {
     .await;
     assert_eq!(status, 303, "submission redirects back to the order");
     let (st, ev) = order_state(&pool, order.id).await;
-    assert_eq!(st, "Paid");
+    assert_eq!(
+        st, "AwaitingPayment",
+        "a proof never marks the order paid (ruling 2026-10-23)"
+    );
     assert_eq!(ev, "BuyerProofSubmitted");
 
     srv.handle.abort();
@@ -944,7 +965,9 @@ async fn proof_visibility_seller_blind_buyer_and_moderator_see() {
     let (buyer, _) = make_account(&pool, "buyer").await;
     let (moderator, _) = make_account(&pool, "moderator").await;
 
-    // A proof-paid order, driven through the real submission path.
+    // A proof-submitted order, driven through the real submission
+    // path (AMENDED 2026-10-23, Audit 2 H1 ruling): it holds at
+    // AwaitingPayment — the dispute opens later, below.
     let (order, _) =
         create_order_with_config(&pool, "vespiary-market", buyer, &listing, 1, &uniq(), &c)
             .await
@@ -957,13 +980,10 @@ async fn proof_visibility_seller_blind_buyer_and_moderator_see() {
         .await
         .unwrap();
     let order = order_by_public_id(&pool, &order.public_id).await.unwrap();
-    apply_action(&pool, &order, "dispute", buyer).await.unwrap();
-    let dispute = app::disputes::dispute_for_order(&pool, order.id)
-        .await
-        .unwrap()
-        .unwrap();
+    assert_eq!(order.state, "AwaitingPayment");
 
-    // An attestation-paid order as the indistinguishability control.
+    // A plain AwaitingPayment order (accepted, no report of any
+    // kind) as the invisibility control.
     let (order2, _) =
         create_order_with_config(&pool, "vespiary-market", buyer, &listing, 1, &uniq(), &c)
             .await
@@ -972,16 +992,130 @@ async fn proof_visibility_seller_blind_buyer_and_moderator_see() {
         .await
         .unwrap();
     let order2 = order_by_public_id(&pool, &order2.public_id).await.unwrap();
-    mark_paid(&pool, &order2, seller_id, &c).await.unwrap();
+
+    // An attestation-paid order as the confirmation-wording
+    // control: only its seller surfaces may carry the words
+    // "Seller confirmed payment".
+    let (order3, _) =
+        create_order_with_config(&pool, "vespiary-market", buyer, &listing, 1, &uniq(), &c)
+            .await
+            .unwrap();
+    apply_action(&pool, &order3, "accept", seller_id)
+        .await
+        .unwrap();
+    let order3 = order_by_public_id(&pool, &order3.public_id).await.unwrap();
+    mark_paid(&pool, &order3, seller_id, &c).await.unwrap();
 
     let srv = test_server(&pool).await;
     let seller_cookie = session_for(&pool, seller_id).await;
     let buyer_cookie = session_for(&pool, buyer).await;
     let mod_cookie = session_for(&pool, moderator).await;
 
-    // Seller's order page for the proof-paid order: state only. No
-    // txid, no proof, no source marker — and the same payment-evidence
-    // line as the attestation-paid order.
+    // The invisibility invariant (ruling 2026-10-23): the seller's
+    // order page for the proof-submitted order is identical in
+    // state and evidence wording to the plain order's — a proof
+    // leaves no seller-visible trace.
+    let (status, seller_open) = http(
+        srv.addr,
+        "GET",
+        &format!("/orders/{}", order.public_id),
+        Some(&seller_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, seller_plain) = http(
+        srv.addr,
+        "GET",
+        &format!("/orders/{}", order2.public_id),
+        Some(&seller_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let line_of = |html: &str, marker: &str| -> String {
+        let start = html.find(marker).expect("line marker present");
+        let end = html[start..].find("</p>").expect("line ends") + start;
+        html[start..end].to_string()
+    };
+    assert_eq!(
+        line_of(&seller_open, "<p>State:"),
+        line_of(&seller_plain, "<p>State:"),
+        "the state line must not distinguish a proof-submitted order"
+    );
+    assert_eq!(
+        line_of(&seller_open, "<p>Payment evidence:"),
+        line_of(&seller_plain, "<p>Payment evidence:"),
+        "the evidence line must not distinguish a proof-submitted order"
+    );
+    for forbidden in [
+        TXID_A,
+        PROOF_A,
+        "BuyerProofSubmitted",
+        "payment proof",
+        "Seller confirmed payment",
+        "Payment recorded",
+    ] {
+        assert!(
+            !seller_open.contains(forbidden),
+            "seller order page must not contain {forbidden:?}"
+        );
+    }
+
+    // "Seller confirmed payment" appears only with SellerAttested:
+    // present on the attested order's page and pay page, absent
+    // from the proof order's pay page.
+    let (status, seller_attested) = http(
+        srv.addr,
+        "GET",
+        &format!("/orders/{}", order3.public_id),
+        Some(&seller_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        seller_attested.contains("Seller confirmed payment"),
+        "an attested order carries the confirmation line"
+    );
+    let (status, pay_proof) = http(
+        srv.addr,
+        "GET",
+        &format!("/orders/{}/pay", order.public_id),
+        Some(&seller_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        !pay_proof.contains("Seller confirmed payment."),
+        "the pay page must not claim confirmation for a proof order"
+    );
+    let (status, pay_attested) = http(
+        srv.addr,
+        "GET",
+        &format!("/orders/{}/pay", order3.public_id),
+        Some(&seller_cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        pay_attested.contains("Seller confirmed payment."),
+        "the pay page claims confirmation only for an attested order"
+    );
+
+    // The buyer's dispute opens on the proof (the moderators work
+    // it on the dispute surface below).
+    apply_action(&pool, &order, "dispute", buyer).await.unwrap();
+    let dispute = app::disputes::dispute_for_order(&pool, order.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Seller's order page for the disputed proof order: state
+    // only. No txid, no proof, no source marker, no confirmation
+    // claim.
     let (status, seller_view) = http(
         srv.addr,
         "GET",
@@ -995,26 +1129,18 @@ async fn proof_visibility_seller_blind_buyer_and_moderator_see() {
         seller_view.contains("Disputed"),
         "seller sees the order state (here: disputed)"
     );
-    for forbidden in [TXID_A, PROOF_A, "BuyerProofSubmitted", "payment proof"] {
+    for forbidden in [
+        TXID_A,
+        PROOF_A,
+        "BuyerProofSubmitted",
+        "payment proof",
+        "Seller confirmed payment",
+    ] {
         assert!(
             !seller_view.contains(forbidden),
             "seller order page must not contain {forbidden:?}"
         );
     }
-    let (status, seller_view2) = http(
-        srv.addr,
-        "GET",
-        &format!("/orders/{}", order2.public_id),
-        Some(&seller_cookie),
-        None,
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert!(
-        seller_view.contains("Seller confirmed payment")
-            && seller_view2.contains("Seller confirmed payment"),
-        "proof-paid and attestation-paid must read identically to the seller"
-    );
 
     // The buyer sees their own proof on their order page.
     let (status, buyer_view) = http(
@@ -1068,7 +1194,13 @@ async fn proof_visibility_seller_blind_buyer_and_moderator_see() {
     )
     .await;
     assert_eq!(status, 200);
-    for forbidden in [TXID_A, PROOF_A, "BuyerProofSubmitted"] {
+    for forbidden in [
+        TXID_A,
+        PROOF_A,
+        "BuyerProofSubmitted",
+        "payment proof",
+        "Seller confirmed payment",
+    ] {
         assert!(
             !seller_dispute.contains(forbidden),
             "seller dispute view must not contain {forbidden:?}"
@@ -1301,9 +1433,24 @@ async fn flag_raised_on_proof_and_cleared_on_confirmation() {
         "the flag is in the moderators' open queue"
     );
 
-    // The seller confirms this order (per-order confirmation on an
-    // already-Paid order): the attestation lands, the evidence level
-    // records the seller's own confirmation, and the flag clears.
+    // No order_paid event yet (ruling 2026-10-23): the proof alone
+    // does not produce one — it belongs to the attestation.
+    let buyer_notes: Vec<(String,)> =
+        sqlx::query_as("SELECT event_type FROM notifications WHERE account_id = $1")
+            .bind(buyer)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        buyer_notes.iter().all(|(t,)| t != "order_paid"),
+        "no order_paid event before the attestation: {buyer_notes:?}"
+    );
+
+    // The seller confirms this order from AwaitingPayment (the
+    // per-order attestation): the order becomes Paid, the evidence
+    // level records the seller's own confirmation, and the flag
+    // clears. (Comment AMENDED 2026-10-23: confirmation used to be
+    // exercised on an already-Paid order.)
     let order = order_by_public_id(&pool, &order.public_id).await.unwrap();
     let state = confirm_payment(&pool, &order, seller_id, &c).await.unwrap();
     assert_eq!(format!("{state:?}"), "Paid");
@@ -1321,6 +1468,16 @@ async fn flag_raised_on_proof_and_cleared_on_confirmation() {
     assert!(
         att.is_some(),
         "confirmation writes the per-order attestation"
+    );
+    let buyer_notes: Vec<(String,)> =
+        sqlx::query_as("SELECT event_type FROM notifications WHERE account_id = $1")
+            .bind(buyer)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        buyer_notes.iter().any(|(t,)| t == "order_paid"),
+        "the attestation produces the order_paid event: {buyer_notes:?}"
     );
     let flags = payment_flags_for_order(&pool, order.id).await.unwrap();
     assert_eq!(flags.len(), 1, "the flag row is retained as a record");
@@ -1501,7 +1658,8 @@ async fn declaration_with_manual_report_closes_and_buyer_can_dispute() {
 
 // Flag (3b) + declaration (4) with a proof on file: the declaration
 // is recorded, the contradiction flag goes up immediately, and the
-// order does NOT close on the declaration alone.
+// order does NOT close on the declaration alone. (The order sits at
+// AwaitingPayment under the 2026-10-23 ruling, not Paid — AMENDED.)
 
 #[tokio::test]
 async fn declaration_with_proof_flags_contradiction_and_does_not_close() {
@@ -1531,11 +1689,11 @@ async fn declaration_with_proof_flags_contradiction_and_does_not_close() {
         .unwrap();
     assert_eq!(
         format!("{state:?}"),
-        "Paid",
+        "AwaitingPayment",
         "a proof-backed order never closes on a declaration"
     );
     let (st, _) = order_state(&pool, order.id).await;
-    assert_eq!(st, "Paid");
+    assert_eq!(st, "AwaitingPayment");
     let flags = payment_flags_for_order(&pool, order.id).await.unwrap();
     assert!(
         flags

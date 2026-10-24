@@ -66,15 +66,31 @@ impl AppState {
         if self.dev_cookies { "device" } else { "__Host-device" }
     }
     /// The device cookie set on a successful login (verification-fix
-    /// V1): `{public_id}.{mac}` — see `KeyFile::device_cookie_mac`
-    /// and `device_cookie_exempt`. One year, so a browser the owner
-    /// actually uses stays exempt from the stranger budget across
-    /// the failure window many times over.
-    fn set_device_cookie(&self, account_id: i64, public_id: &str) -> String {
+    /// V1): `{public_id}.{epoch}.{mac}` — see
+    /// `KeyFile::device_cookie_mac` and `device_cookie_exempt`.
+    /// Ninety days (Code Audit 2 item 5 shortened it from a year):
+    /// still far longer than any failure-budget window the
+    /// exemption exists to span, and the epoch binding means a
+    /// captured value is revocable server-side instead of living
+    /// out its full age no matter what.
+    fn set_device_cookie(&self, account_id: i64, public_id: &str, epoch: i64) -> String {
         let secure = if self.dev_cookies { "" } else { "; Secure" };
-        let mac = hex::encode(self.keyfile.device_cookie_mac(account_id));
+        let mac = hex::encode(self.keyfile.device_cookie_mac(account_id, epoch));
         format!(
-            "{}={public_id}.{mac}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000{secure}",
+            "{}={public_id}.{epoch}.{mac}; Path=/; HttpOnly; SameSite=Strict; Max-Age=7776000{secure}",
+            self.device_cookie_name()
+        )
+    }
+
+    /// Clear this browser's device cookie (Audit 2 item 5): logout
+    /// ends the session AND drops the budget exemption this browser
+    /// carried, instead of leaving a live exemption behind on a
+    /// shared machine. The account's epoch is NOT bumped here, so
+    /// the owner's other browsers keep theirs.
+    fn clear_device_cookie(&self) -> String {
+        let secure = if self.dev_cookies { "" } else { "; Secure" };
+        format!(
+            "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}",
             self.device_cookie_name()
         )
     }
@@ -228,20 +244,10 @@ async fn stepup_notice(st: &AppState, account_id: i64, event_type: &str, what: &
 /// Escape a value interpolated into the hand-built shell (template
 /// bodies are already escaped by Askama at the variable level; the
 /// shell's own values — title, site name, username — are not).
-fn esc(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
+/// The implementation is the project's one shared escaper,
+/// `domain::markup::esc` (Audit 2 item 9b removed the duplicate
+/// copy that used to live here).
+use domain::markup::esc;
 
 /// What the header needs. Built per request by `nav_for` (counts are
 /// computed server-side on every request, §15); `Nav::anonymous` is
@@ -400,32 +406,53 @@ pub fn shell(nav: &Nav, title: &str, body: &str) -> String {
     )
 }
 
-/// Compute the §15 attention counts into a nav for account `me`.
+/// Fill a nav's identity and §15 attention counts for account `me`.
+///
+/// Code Audit 2 item 8 (A3): this used to be five round trips per
+/// authenticated page — username, role, and three separate COUNTs —
+/// on a pool capped at 8 connections. It is now two queries: one
+/// accounts row (username + role) and one SELECT carrying the three
+/// counts as scalar subqueries. Fallbacks mirror the old helpers
+/// exactly: a missing/failed identity row yields username "?" (the
+/// old `username_of_id` fallback) and the Buyer role (the old
+/// `session_role` default); a failed counts query leaves the
+/// counts at their anonymous defaults of 0.
 async fn fill_counts(st: &AppState, nav: &mut Nav, me: i64) {
-    nav.inbox_unread = sqlx::query_scalar(
-        "SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL",
+    let ident: Option<(String, String)> =
+        sqlx::query_as("SELECT username, role FROM accounts WHERE id = $1")
+            .bind(me)
+            .fetch_optional(&st.pool)
+            .await
+            .ok()
+            .flatten();
+    match ident {
+        Some((username, role)) => {
+            nav.username = Some(username);
+            nav.role = Some(role_from_str(&role));
+        }
+        None => {
+            nav.username = Some("?".into());
+            nav.role = Some(Role::Buyer);
+        }
+    }
+    let counts: Option<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL), \
+           (SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL \
+             AND event_type = 'message_received'), \
+           (SELECT count(*) FROM orders WHERE \
+             (seller_id = $1 AND state IN ('Requested', 'Paid')) \
+             OR (buyer_id = $1 AND state = 'Fulfilled'))",
     )
     .bind(me)
     .fetch_one(&st.pool)
     .await
-    .unwrap_or(0);
-    nav.messages_unread = sqlx::query_scalar(
-        "SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL \
-         AND event_type = 'message_received'",
-    )
-    .bind(me)
-    .fetch_one(&st.pool)
-    .await
-    .unwrap_or(0);
-    nav.orders_attention = sqlx::query_scalar(
-        "SELECT count(*) FROM orders WHERE \
-         (seller_id = $1 AND state IN ('Requested', 'Paid')) \
-         OR (buyer_id = $1 AND state = 'Fulfilled')",
-    )
-    .bind(me)
-    .fetch_one(&st.pool)
-    .await
-    .unwrap_or(0);
+    .ok();
+    if let Some((inbox, messages, orders)) = counts {
+        nav.inbox_unread = inbox;
+        nav.messages_unread = messages;
+        nav.orders_attention = orders;
+    }
 }
 
 /// Build the nav for the current request: resolves the session and,
@@ -433,8 +460,6 @@ async fn fill_counts(st: &AppState, nav: &mut Nav, me: i64) {
 async fn nav_for(st: &AppState, headers: &HeaderMap) -> Nav {
     let mut nav = Nav::anonymous(&st.instance);
     if let Some((_token, sess, csrf)) = current_session(st, headers).await {
-        nav.username = Some(db::username_of_id(&st.pool, sess.account_id).await);
-        nav.role = Some(session_role(st, sess.account_id).await);
         nav.csrf = Some(csrf);
         fill_counts(st, &mut nav, sess.account_id).await;
     }
@@ -456,8 +481,6 @@ async fn session_role(st: &AppState, account_id: i64) -> Role {
 /// helpers below the handler layer).
 async fn nav_for_session(st: &AppState, sess: &sessions::Session, csrf: &str) -> Nav {
     let mut nav = Nav::anonymous(&st.instance);
-    nav.username = Some(db::username_of_id(&st.pool, sess.account_id).await);
-    nav.role = Some(session_role(st, sess.account_id).await);
     nav.csrf = Some(csrf.to_string());
     fill_counts(st, &mut nav, sess.account_id).await;
     nav
@@ -499,7 +522,7 @@ pub fn router(state: AppState) -> Router {
         .route("/seller/apply", post(seller_apply))
         .route("/seller/listings", post(create_listing))
         .route("/seller/listings/{id}/status", post(listing_status))
-        .route("/seller/listings/{id}/media", post(listing_media))
+        .route("/seller/listings/{id}/media", post(listing_media).layer(DefaultBodyLimit::max(MEDIA_BODY_MAX)))
         .route("/media/{r#ref}", get(media_serve))
         .route("/moderation/sellers", get(moderation_sellers))
         .route("/moderation/sellers/{id}", post(moderation_decide))
@@ -518,7 +541,7 @@ pub fn router(state: AppState) -> Router {
         .route("/orders/{id}/pay/qr.png", get(pay_qr))
         .route("/orders/{id}/{action}", post(order_action))
         .route("/seller/payment-identity", post(payment_identity_post))
-        .route("/seller/payment-batches", post(payment_batch_post))
+        .route("/seller/payment-batches", post(payment_batch_post).layer(DefaultBodyLimit::max(BATCH_BODY_MAX)))
         .route("/inbox", get(inbox_page))
         .route("/inbox/read-all", post(inbox_read_all))
         .route("/conversations", get(conversations_page))
@@ -617,7 +640,7 @@ fn alert_text(code: Option<&str>, n: Option<&str>) -> Option<String> {
         "terms_rejected" => "Terms statement rejected: it must parse, name this listing, carry the next version number, bind the listing's current text, and be signed by your current pinned key.".to_string(),
         "terms_required" => "Publishing requires signed listing terms: build them with the helper and pin them from your seller page first.".to_string(),
         // Order page (msg).
-        "proof_recorded" => "Payment proof recorded. It is carried unverified: the seller and moderators check it in their own wallets.".to_string(),
+        "proof_recorded" => "Payment proof recorded. A proof does not mark the order paid — the seller confirms payment from their own wallet. Your proof is carried unverified and is on file for the moderators if a dispute opens.".to_string(),
         "proof_rejected" => "Proof not accepted.".to_string(),
         "report_recorded" => "Your payment report is recorded on your word alone — weaker protection than a transaction proof.".to_string(),
         "report_rejected" => "Report not accepted.".to_string(),
@@ -979,20 +1002,34 @@ struct LoginForm {
 /// compared in constant time. (Tor Browser drops cookies on close,
 /// so the exemption mainly protects non-Tor and persistent-profile
 /// browsers; it never weakens the passphrase/TOTP checks.)
-fn device_cookie_exempt(st: &AppState, headers: &HeaderMap, account_id: i64, public_id: &str) -> bool {
+///
+/// Code Audit 2 item 5: the cookie carries the account's device
+/// epoch and verifies only AT THE CURRENT EPOCH — a passphrase
+/// change or recovery bumps the epoch and every previously issued
+/// cookie stops exempting, wherever it was captured.
+fn device_cookie_exempt(
+    st: &AppState,
+    headers: &HeaderMap,
+    account_id: i64,
+    public_id: &str,
+    epoch: i64,
+) -> bool {
     let Some(raw) = cookie_value(headers, st.device_cookie_name()) else {
         return false;
     };
-    let Some((pid, mac_hex)) = raw.split_once('.') else {
+    let Some((pid, rest)) = raw.split_once('.') else {
         return false;
     };
-    if pid != public_id {
+    let Some((epoch_s, mac_hex)) = rest.split_once('.') else {
+        return false;
+    };
+    if pid != public_id || epoch_s.parse::<i64>() != Ok(epoch) {
         return false;
     }
     let Ok(mac) = hex::decode(mac_hex) else {
         return false;
     };
-    let expected = st.keyfile.device_cookie_mac(account_id);
+    let expected = st.keyfile.device_cookie_mac(account_id, epoch);
     if mac.len() != expected.len() {
         return false;
     }
@@ -1023,7 +1060,8 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
         return page(&st, &headers, "Log in", generic_tpl(&f.csrf).render().unwrap()).await;
     };
     let public_id = db::public_id_of(&st.pool, id).await.ok().flatten().unwrap_or_default();
-    let exempt = device_cookie_exempt(&st, &headers, id, &public_id);
+    let epoch = db::device_epoch(&st.pool, id).await.unwrap_or(0);
+    let exempt = device_cookie_exempt(&st, &headers, id, &public_id, epoch);
     // AM1 + verification-fix V1: the budget's AUTHORITATIVE check
     // happens under the per-username hash lock, and a failure is
     // recorded before the lock is released. (The pre-lock check that
@@ -1118,7 +1156,7 @@ async fn login(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Log
     if let Ok(v) = HeaderValue::from_str(&st.set_cookie(&token)) {
         hm.append(header::SET_COOKIE, v);
     }
-    if let Ok(v) = HeaderValue::from_str(&st.set_device_cookie(id, &public_id)) {
+    if let Ok(v) = HeaderValue::from_str(&st.set_device_cookie(id, &public_id, epoch)) {
         hm.append(header::SET_COOKIE, v);
     }
     (hm, Redirect::to("/account")).into_response()
@@ -1141,11 +1179,17 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<Lo
     }
     let _ = db::revoke_all_sessions(&st.pool, sess.account_id).await;
     let _ = token;
-    (
-        [(header::SET_COOKIE, st.set_cookie(""))],
-        Redirect::to("/"),
-    )
-        .into_response()
+    // Audit 2 item 5: the device cookie is cleared too — logout
+    // must not leave a live budget exemption behind on this
+    // browser. (The epoch is unchanged; other browsers keep theirs.)
+    let mut hm = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&st.set_cookie("")) {
+        hm.append(header::SET_COOKIE, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&st.clear_device_cookie()) {
+        hm.append(header::SET_COOKIE, v);
+    }
+    (hm, Redirect::to("/")).into_response()
 }
 
 async fn account_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
@@ -1276,7 +1320,7 @@ async fn recover(State(st): State<AppState>, headers: HeaderMap, Form(f): Form<R
 // -- Stage 2: catalogue, listings, seller admission, media -------------------
 
 use crate::listings as lst;
-use axum::extract::{Multipart, Path, Query};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use std::collections::HashMap;
 
 pub struct ListingView {
@@ -1634,6 +1678,28 @@ async fn payment_identity_post(
     }
 }
 
+/// Code Audit 2 item 6 (L2): explicit body limits for the two
+/// multipart routes the audit named. Axum's 2 MB DefaultBodyLimit
+/// does NOT apply to the `Multipart` extractor, so before this fix
+/// both handlers buffered request bodies with no bound at all and
+/// only their downstream checks ever said no.
+///
+/// Batch route, grounded in the format envelope: a batch is a
+/// ~350-byte header plus at most `PAYMENTS_MAX_BATCH` entries
+/// (default 100), each ≈500 bytes of JSON (95-byte subaddress,
+/// ~270-byte canonical message, ~91-byte signature, keys and
+/// punctuation) — the largest legitimate default-config batch is
+/// ≈51 KiB. `BATCH_TEXT_MAX` (256 KiB) is 5× that and still covers
+/// the entry cap raised to ~500; the route limit adds 16 KiB for
+/// the step-up fields and multipart framing.
+const BATCH_TEXT_MAX: usize = 256 * 1024;
+const BATCH_BODY_MAX: usize = BATCH_TEXT_MAX + 16 * 1024;
+/// Media route: the sanitiser's own ceiling is 5 MiB
+/// (`media::sanitize`); the route limit is that plus 64 KiB of
+/// multipart framing, so an oversized upload is refused at the
+/// door instead of after a full unbounded read.
+const MEDIA_BODY_MAX: usize = 5 * 1024 * 1024 + 64 * 1024;
+
 async fn payment_batch_post(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1701,6 +1767,12 @@ async fn payment_batch_post(
     let Some(text) = file_text.or(pasted) else {
         return Redirect::to("/seller?pmsg=batch_missing").into_response();
     };
+    // Audit 2 item 6: the field-length cap runs BEFORE the JSON
+    // parse inside upload_batch — an over-envelope text is a
+    // rejected batch, never a parse attempt.
+    if text.len() > BATCH_TEXT_MAX {
+        return Redirect::to("/seller?pmsg=batch_rejected").into_response();
+    }
     match crate::payments::upload_batch(&st.pool, sess.account_id, &text, &st.payments).await {
         Ok(n) => {
             stepup_notice(&st, sess.account_id, "stepup_payment_batch", "a signed subaddress batch was uploaded to your pool").await;
@@ -2592,10 +2664,13 @@ async fn seller_profile(State(st): State<AppState>, headers: HeaderMap, Path(id)
         .await
         .ok()
         .flatten();
-    // Stage 9: sync this seller's facts (any terminal order gets its
-    // fact whichever path terminated it), then read the stored summary
-    // and the core raw-facts panel.
-    let _ = crate::reputation::sync_facts_for_seller(&st.pool, &st.keyfile, &st.stage9, account_id).await;
+    // Stage 9: read the STORED summary and the core raw-facts panel
+    // only. Code Audit 2 item 7 (L3): this public GET used to call
+    // sync_facts_for_seller here — writes on an unauthenticated read
+    // path. Facts are now produced on the orders' terminal
+    // transitions (orders actions, dispute resolution, the payment
+    // expiry sweep); pre-existing data is covered by the startup
+    // backfill. Nothing on this path writes.
     let summary = crate::reputation::summary_row(&st.pool, account_id).await.ok().flatten();
     let rawf = crate::reputation::raw_facts(&st.pool, account_id).await.unwrap_or_default();
     let reviews = crate::reviews::reviews_for_seller(&st.pool, &st.stage9, account_id)
@@ -2833,12 +2908,29 @@ fn evidence_label(level: &str) -> String {
 }
 
 /// The seller-facing evidence label (owner-directed visibility rule,
-/// 2026-10-18): a proof-driven Paid must be indistinguishable from an
-/// attestation-driven Paid, so the seller sees the same line either
-/// way. The proof's existence is never displayed to the seller.
-fn seller_evidence_label(level: &str) -> String {
+/// 2026-10-18, as amended by the owner ruling of 2026-10-23 —
+/// AUDIT2-H1-OWNER-DECISION-2026-10-23.md). The proof's existence
+/// is never displayed to the seller:
+///
+/// - On an open order (Requested / AwaitingPayment / Disputed /
+///   Cancelled), a proof-submitted order reads exactly like an
+///   order with no evidence at all — same state, same line — so
+///   nothing distinguishes it on any seller surface.
+/// - On a LEGACY order already Paid on a proof before the ruling
+///   (Paid lineage: Paid / Fulfilled / Completed / Resolved), the
+///   neutral "Payment recorded" stands: true, and no confirmation
+///   claim the seller never made. "Seller confirmed payment" is
+///   printed only for SellerAttested — here that string arrives
+///   through evidence_label, never from a proof.
+fn seller_evidence_label(level: &str, state: &str) -> String {
     match level {
-        "BuyerProofSubmitted" => "Seller confirmed payment".into(),
+        "BuyerProofSubmitted" => {
+            if matches!(state, "Paid" | "Fulfilled" | "Completed" | "Resolved") {
+                "Payment recorded".into()
+            } else {
+                "No payment evidence recorded".into()
+            }
+        }
         other => evidence_label(other),
     }
 }
@@ -2909,7 +3001,7 @@ async fn order_page(
             .await
             .unwrap_or(false);
     let evidence = if viewer_is_seller {
-        seller_evidence_label(&o.evidence_level)
+        seller_evidence_label(&o.evidence_level, &o.state)
     } else {
         evidence_label(&o.evidence_level)
     };
@@ -3020,7 +3112,13 @@ async fn order_action(
         // confirmation wording is identical whether or not a proof
         // is on file — the seller learns nothing from it.
         return match crate::payments::declare_not_received(&st.pool, &o, sess.account_id, &st.payments).await {
-            Ok(_) => Redirect::to(&format!("/orders/{id}?msg=declaration_recorded")).into_response(),
+            Ok(_) => {
+                // Audit 2 item 7: a declaration that cancelled the
+                // order is a terminal transition — produce its fact
+                // here (record_fact_for_order no-ops otherwise).
+                let _ = crate::reputation::record_fact_for_order(&st.pool, &st.keyfile, &st.stage9, o.id).await;
+                Redirect::to(&format!("/orders/{id}?msg=declaration_recorded")).into_response()
+            }
             Err(_) => Redirect::to(&format!("/orders/{id}?msg=declaration_refused")).into_response(),
         };
     }
@@ -3034,7 +3132,14 @@ async fn order_action(
         };
     }
     match ord::apply_action(&st.pool, &o, &action, sess.account_id).await {
-        Ok(_) => Redirect::to(&format!("/orders/{id}")).into_response(),
+        Ok(_) => {
+            // Audit 2 item 7: facts are produced on the terminal
+            // transition, in the write path — record_fact_for_order
+            // no-ops for non-terminal outcomes, so this is safe after
+            // every successful action.
+            let _ = crate::reputation::record_fact_for_order(&st.pool, &st.keyfile, &st.stage9, o.id).await;
+            Redirect::to(&format!("/orders/{id}")).into_response()
+        }
         Err(ord::OrderError::InvoiceRequired) => Redirect::to(&format!(
             "/orders/{id}?msg=invoice_required"
         ))
@@ -3097,7 +3202,11 @@ async fn pay_page(State(st): State<AppState>, headers: HeaderMap, Path(id): Path
         total_xmr: domain::Atomic(o.total_atomic as u64).format_decimal(),
         payment_uri,
         assignment,
-        is_paid: o.state == "Paid",
+        // The pay page's "Seller confirmed payment." line may
+        // render only for an attested Paid (ruling 2026-10-23): a
+        // legacy order Paid on a buyer proof keeps the state but
+        // never earns the words.
+        is_paid: o.state == "Paid" && o.evidence_level == "SellerAttested",
         closed,
         order: o,
     };
@@ -3817,7 +3926,7 @@ async fn dispute_page(
     // the indistinguishable label and no proof data at all.
     let viewer_is_seller_party = is_participant && o.seller_id == sess.account_id;
     let evidence = if viewer_is_seller_party {
-        seller_evidence_label(&o.evidence_level)
+        seller_evidence_label(&o.evidence_level, &o.state)
     } else {
         evidence_label(&o.evidence_level)
     };
@@ -4542,7 +4651,9 @@ async fn passphrase_change(
         Err(HashError::Busy) => return (StatusCode::SERVICE_UNAVAILABLE, "Busy, retry shortly").into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
     };
-    if sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+    // The epoch bump rides the passphrase change (Audit 2 item 5):
+    // device cookies issued under the old passphrase stop exempting.
+    if sqlx::query("UPDATE accounts SET password_hash = $2, device_epoch = device_epoch + 1 WHERE id = $1")
         .bind(sess.account_id)
         .bind(&hash)
         .execute(&st.pool)

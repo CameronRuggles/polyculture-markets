@@ -797,6 +797,14 @@ pub async fn mark_paid(
     .bind(actor_id)
     .execute(&mut *tx)
     .await?;
+    // An attestation settles any outstanding proof-unconfirmed
+    // flag (design update #2.3a). The clearing used to happen in
+    // confirm_payment's already-Paid branch, because a proof made
+    // the order Paid before the seller confirmed; since the
+    // 2026-10-23 ruling the seller normally confirms from
+    // AwaitingPayment through this function, so it happens here.
+    // A no-op for orders with no proof on file.
+    clear_unconfirmed_flags(&mut tx, order.id).await?;
     tx.commit().await?;
     let _ = crate::orders::notify(pool, order.buyer_id, "order_paid", &order.public_id).await;
     Ok(OrderState::Paid)
@@ -808,12 +816,15 @@ pub async fn mark_paid(
 // tx-proof flow; audit fix-brief task 1 expanded + design updates #1
 // and #2; migration 0010).
 //
-// VISIBILITY (owner-directed): a proof, its txid, and the source of a
-// Paid state are visible ONLY to the submitting buyer and to
-// moderators (dispute view + flag page). Nothing in this section ever
-// notifies the seller about a submission; the one notification it
-// sends is the buyer's own `order_paid`, identical to the event an
-// attestation produces.
+// VISIBILITY (owner-directed): a proof, its txid, and its existence
+// are visible ONLY to the submitting buyer and to moderators
+// (dispute view + flag page). Nothing in this section ever notifies
+// the seller about a submission, and a submission sends no
+// notification to anyone: since the owner ruling of 2026-10-23
+// (Audit 2 H1) a proof does not move the order at all, so there is
+// no event to announce. The buyer's own `order_paid` notification
+// is sent by the seller's attestation (mark_paid), never by a
+// proof.
 
 /// A stored buyer-submitted tx proof (migration 0010). Carried
 /// unverified; the server never checks it.
@@ -1014,12 +1025,22 @@ async fn clear_unconfirmed_flags(
 /// Buyer submits a transaction proof for a direct order (the "I've
 /// paid" report with evidence attached). The proof is stored
 /// byte-exact apart from outer-whitespace trimming and txid case
-/// normalisation, and is NEVER verified here. From Requested /
-/// AwaitingPayment the core advances the order to Paid on the
-/// BuyerProofSubmitted evidence level; in Paid / Fulfilled the proof
-/// is recorded alongside and the state is left exactly as it was
-/// (late submission is part of the design: protection status is
-/// never observable in advance, and evidence never downgrades).
+/// normalisation, and is NEVER verified here.
+///
+/// OWNER RULING 2026-10-23 (Code Audit 2, finding H1; amendment
+/// record AUDIT2-H1-OWNER-DECISION-2026-10-23.md): a proof no
+/// longer advances the order to Paid. The order HOLDS at
+/// AwaitingPayment — from Requested it moves to AwaitingPayment,
+/// exactly as a normal order does, and no further. Only the
+/// seller's own attestation (mark_paid) makes an order Paid. The
+/// submission still records the proof + report, raises the
+/// evidence level to BuyerProofSubmitted on an open order (the
+/// dispute gate and the sweep exemption key on them), and raises
+/// the proof-unconfirmed moderator flag when no attestation
+/// exists. In Paid / Fulfilled the proof is recorded alongside and
+/// the state is left exactly as it was (late submission is part
+/// of the design: protection status is never observable in
+/// advance, and evidence never downgrades).
 pub async fn submit_payment_proof(
     pool: &PgPool,
     order: &crate::orders::Order,
@@ -1043,32 +1064,22 @@ pub async fn submit_payment_proof(
         .await?
         .ok_or(PaymentError::NoAssignment)?;
     let from = stored_state(&order.state);
-    let advancing = matches!(from, OrderState::Requested | OrderState::AwaitingPayment);
-    if !advancing && !matches!(from, OrderState::Paid | OrderState::Fulfilled) {
+    let open = matches!(from, OrderState::Requested | OrderState::AwaitingPayment);
+    if !open && !matches!(from, OrderState::Paid | OrderState::Fulfilled) {
         // Disputed and terminal orders take no new submissions (a
         // disputed order's proof is already on file — submission is
         // what opened the path here).
         return Err(PaymentError::OrderClosed);
     }
-    if advancing {
-        if from == OrderState::Requested
-            && !order_can_transition(
-                OrderState::Requested,
-                OrderState::AwaitingPayment,
-                Actor::Core,
-                EvidenceLevel::BuyerProofSubmitted,
-            )
-        {
-            return Err(PaymentError::TransitionDenied);
-        }
-        if !order_can_transition(
+    if from == OrderState::Requested
+        && !order_can_transition(
+            OrderState::Requested,
             OrderState::AwaitingPayment,
-            OrderState::Paid,
             Actor::Core,
             EvidenceLevel::BuyerProofSubmitted,
-        ) {
-            return Err(PaymentError::TransitionDenied);
-        }
+        )
+    {
+        return Err(PaymentError::TransitionDenied);
     }
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -1092,7 +1103,7 @@ pub async fn submit_payment_proof(
     .bind(actor_id)
     .execute(&mut *tx)
     .await?;
-    if advancing {
+    if open {
         if from == OrderState::Requested {
             let r = sqlx::query(
                 "UPDATE orders SET state = 'AwaitingPayment' WHERE id = $1 AND state = 'Requested'",
@@ -1105,18 +1116,22 @@ pub async fn submit_payment_proof(
                 return Err(PaymentError::TransitionDenied);
             }
         }
-        let r = sqlx::query(
-            "UPDATE orders SET state = 'Paid', evidence_level = 'BuyerProofSubmitted'
-              WHERE id = $1 AND state = 'AwaitingPayment'
-                AND evidence_level IN ('None', 'BuyerReported')",
+        // The evidence level rises on the open order (the dispute
+        // gate reads it, and the buyer sees the truthful unverified
+        // label). The guard mirrors the manual-report rule — never
+        // over an existing level — and an open order carries no
+        // attestation to protect. The seller-facing label maps this
+        // level to the same line as no evidence at all (visibility
+        // rule), so the rise is invisible to the seller. The state
+        // itself does not move: Paid is the seller's word, never
+        // the proof's (ruling 2026-10-23).
+        sqlx::query(
+            "UPDATE orders SET evidence_level = 'BuyerProofSubmitted'
+              WHERE id = $1 AND evidence_level IN ('None', 'BuyerReported')",
         )
         .bind(order.id)
         .execute(&mut *tx)
         .await?;
-        if r.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(PaymentError::TransitionDenied);
-        }
     }
     // Design update #2.3a: a proof with no seller confirmation yet is
     // flagged for review the moment it lands. If the seller already
@@ -1131,13 +1146,16 @@ pub async fn submit_payment_proof(
         raise_flag(&mut tx, order.id, "proof-unconfirmed").await?;
     }
     tx.commit().await?;
-    if advancing {
-        // The buyer sees the same event an attestation produces.
-        // The seller is told nothing (visibility rule).
-        let _ = crate::orders::notify(pool, order.buyer_id, "order_paid", &order.public_id).await;
-        return Ok(OrderState::Paid);
+    // No notification to anyone: a proof changes nothing either
+    // party must act on (ruling 2026-10-23). The seller's prompt
+    // is the standing Confirm-payment form every unpaid order
+    // carries; the buyer's `order_paid` event is produced by the
+    // seller's attestation alone.
+    if from == OrderState::Requested {
+        Ok(OrderState::AwaitingPayment)
+    } else {
+        Ok(from)
     }
-    Ok(from)
 }
 
 /// Buyer fallback (design update #2.2): a manual "I paid" confirm for
@@ -1187,12 +1205,12 @@ pub async fn submit_manual_report(
 
 /// Seller confirmation (design update #2.1): per-order, bound to the
 /// order's assigned subaddress. From AwaitingPayment this IS
-/// mark_paid (the v1 attestation). On an order already Paid on a
-/// buyer-submitted proof it records the seller's own attestation
-/// alongside, raises the evidence level to SellerAttested, and clears
-/// the proof-unconfirmed flag — the seller confirms against the same
-/// order + subaddress either way, and from the seller's side the two
-/// Paid paths are indistinguishable.
+/// mark_paid (the v1 attestation). On a LEGACY order already Paid
+/// on a buyer-submitted proof (the pre-2026-10-23 behaviour; since
+/// the Audit 2 H1 ruling a proof no longer makes an order Paid) it
+/// records the seller's own attestation alongside, raises the
+/// evidence level to SellerAttested, and clears the
+/// proof-unconfirmed flag.
 pub async fn confirm_payment(
     pool: &PgPool,
     order: &crate::orders::Order,
@@ -1255,7 +1273,11 @@ pub async fn confirm_payment(
 /// declaration only records the statement and raises the
 /// proof-contradiction flag — the order does NOT close. Without a
 /// proof it closes the order as unpaid, the same end state the expiry
-/// sweep produces (entry retired, buyer notified).
+/// sweep produces (entry retired, buyer notified). Since the
+/// 2026-10-23 ruling, a proof-backed order sits at AwaitingPayment
+/// (it is no longer Paid on the proof), so the with-proof branch
+/// covers AwaitingPayment as well as Paid — the #2.4 intent follows
+/// the proof, not the old state name.
 pub async fn declare_not_received(
     pool: &PgPool,
     order: &crate::orders::Order,
@@ -1295,7 +1317,7 @@ pub async fn declare_not_received(
             .await?;
     let from = stored_state(&order.state);
     if has_proof {
-        if from != OrderState::Paid {
+        if !matches!(from, OrderState::Paid | OrderState::AwaitingPayment) {
             // Post-shipment or terminal states: a declaration is
             // incoherent there; the dispute path is the remedy.
             return Err(PaymentError::OrderClosed);
@@ -1312,7 +1334,7 @@ pub async fn declare_not_received(
         .await?;
         raise_flag(&mut tx, order.id, "proof-contradiction").await?;
         tx.commit().await?;
-        return Ok(OrderState::Paid);
+        return Ok(from);
     }
     if !matches!(from, OrderState::Requested | OrderState::AwaitingPayment) {
         return Err(PaymentError::OrderClosed);
@@ -1441,7 +1463,33 @@ pub async fn declaration_dispute_reopenable(
 // Stage 10). Cancels unpaid direct orders WITH an assignment whose
 // created_at is older than the configured expiry; their entries retire.
 
+/// The expiry sweep, without reputation fact production. This
+/// 2-argument entry point is the signature the locked blind suite
+/// (blind_direct_v1) pins; the production binary calls
+/// `expire_unpaid_orders_with_facts` instead. Both share the one
+/// implementation below — the variants differ ONLY in whether a
+/// fact is recorded at each cancellation.
 pub async fn expire_unpaid_orders(pool: &PgPool, cfg: &PaymentConfig) -> Result<u64, PaymentError> {
+    expire_unpaid_orders_impl(pool, cfg, None).await
+}
+
+/// The expiry sweep as production runs it (Audit 2 item 7): each
+/// cancellation is a terminal transition, so its reputation fact
+/// is recorded on the spot.
+pub async fn expire_unpaid_orders_with_facts(
+    pool: &PgPool,
+    cfg: &PaymentConfig,
+    kf: &crate::keyfile::KeyFile,
+    rep: &crate::reputation::Stage9Config,
+) -> Result<u64, PaymentError> {
+    expire_unpaid_orders_impl(pool, cfg, Some((kf, rep))).await
+}
+
+async fn expire_unpaid_orders_impl(
+    pool: &PgPool,
+    cfg: &PaymentConfig,
+    facts: Option<(&crate::keyfile::KeyFile, &crate::reputation::Stage9Config)>,
+) -> Result<u64, PaymentError> {
     let stale: Vec<(i64, String, i64, i64)> = sqlx::query_as(
         "SELECT o.id, o.public_id, o.buyer_id, o.seller_id FROM orders o
           WHERE o.settlement = 'direct'
@@ -1466,7 +1514,8 @@ pub async fn expire_unpaid_orders(pool: &PgPool, cfg: &PaymentConfig) -> Result<
         .bind(order_id)
         .execute(&mut *tx)
         .await?;
-        if r.rows_affected() == 1 {
+        let cancelled = r.rows_affected() == 1;
+        if cancelled {
             sqlx::query(
                 "UPDATE payment_pool_entries SET state = 'retired', retired_at = now()
                   WHERE order_id = $1 AND state = 'assigned'",
@@ -1477,6 +1526,14 @@ pub async fn expire_unpaid_orders(pool: &PgPool, cfg: &PaymentConfig) -> Result<
             count += 1;
         }
         tx.commit().await?;
+        if cancelled {
+            // Audit 2 item 7 (L3): in the production variant the
+            // fact is produced HERE, on the terminal transition —
+            // never lazily on a profile read.
+            if let Some((kf, rep)) = facts {
+                let _ = crate::reputation::record_fact_for_order(pool, kf, rep, order_id).await;
+            }
+        }
         let _ = crate::orders::notify(pool, buyer_id, "order_expired", &public_id).await;
         let _ = crate::orders::notify(pool, seller_id, "order_expired", &public_id).await;
     }

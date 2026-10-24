@@ -1,0 +1,13 @@
+AUDIT2-H1 locked-file manifest — POST owner-decision amendment (2026-10-23)
+Branch audit2-h1-proof-hold, head b32a6a57902f9e0107f93de6b85c8303246bf416. Companion to AUDIT2-H1-LOCKED-MANIFEST-PRE-2026-10-23.txt.
+Every delta below is an amendment sanctioned by AUDIT2-H1-OWNER-DECISION-2026-10-23.md and itemised in AUDIT2-H1-FIX-REPORT-2026-10-23.md.
+
+f3c10e39031e89312706ef1b03ca8974b8787a87aa0f9a45ff161741de41ee00  marketplace/crates/app/tests/tx_proof_flow.rs
+b7d1da1b770464214598a1997a1df5c644f8645d5eaab6e9b305d304a090e2a3  marketplace/crates/app/src/payments.rs
+b4ac8f5b556e5f3188641c6fe179eeeb2ffebf63176408f1f98322f4af23b01c  marketplace/crates/app/src/web.rs
+cc0d3056f10364c71da0d4de481b1fd4422dbb06f01bc8e2cbc516a91fb12cfb  marketplace/crates/app/templates/order.html
+83a78a822bbb8efa713f2ba92985cdf889e3e3f07f9caf694ee0e589be2c3ce7  marketplace/crates/app/templates/pay.html
+a4e8264647e47543c02eebd0dd700946327268aff32cef5edc2e07ae2598e172  marketplace/crates/app/templates/payment_risks.html
+7122cfaaae25ff26aa634ebc0b28caa0f71d3b17cb4bfee6188b7b7ae64c8e2a  marketplace/crates/app/templates/limitations.html
+fe8169ed8f10b9b5d57fe7fa03dfbfac08bb722542d8fa05389ba0c6bc069236  marketplace/crates/app/tests/messaging_audit.rs
+5735b2e1d012bf1c14b34893f06289cd536723010d5cdf6dd8417fa8de951992  marketplace/crates/domain/src/lib.rs

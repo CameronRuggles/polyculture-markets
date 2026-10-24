@@ -1,0 +1,16 @@
+-- 0018: Code Audit 2 item 5 (finding L1): the device cookie's MAC
+-- was HMAC(account_id) under a fixed subkey -- deterministic,
+-- never rotating, never revocable, and the cookie lived for a
+-- year and survived logout. A captured cookie therefore granted a
+-- year of exemption from the per-username login-failure budget.
+--
+-- The MAC now covers (account_id, device_epoch) and the epoch
+-- travels inside the cookie value; this column is the server side
+-- of that binding. Incrementing it revokes every outstanding
+-- device cookie for the account in one update. It is bumped where
+-- credentials change or compromise is handled: passphrase change
+-- (web handler + recovery completion) and recovery-code
+-- consumption. Logout clears this browser's cookie client-side
+-- (Max-Age=0); it does not bump the epoch, so the owner's other
+-- browsers keep their exemption until their next bump event.
+ALTER TABLE accounts ADD COLUMN device_epoch BIGINT NOT NULL DEFAULT 0;

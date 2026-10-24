@@ -297,10 +297,13 @@ pub async fn record_fact_for_order(
 }
 
 /// Bring one seller's facts up to date (every terminal order has its
-/// fact) and ensure a stored summary exists. Called on profile render
-/// and after Stage 9 writes, so facts exist whichever code path
-/// terminated the order (core actions, the payments expiry sweep, or
-/// dispute resolution) — order-module signatures stay untouched.
+/// fact) and ensure a stored summary exists. Since Code Audit 2
+/// item 7 (L3), production happens on the terminal transitions
+/// themselves (core order actions, dispute resolution, the payments
+/// expiry sweep, the seller not-received declaration); this sync
+/// remains ONLY as the backfill mechanism for pre-existing data
+/// (startup `backfill_all`) — it is deliberately no longer called
+/// from any read path: the public profile renders stored data only.
 pub async fn sync_facts_for_seller(
     pool: &PgPool,
     kf: &KeyFile,
