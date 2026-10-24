@@ -2657,10 +2657,13 @@ async fn seller_profile(State(st): State<AppState>, headers: HeaderMap, Path(id)
         .await
         .ok()
         .flatten();
-    // Stage 9: sync this seller's facts (any terminal order gets its
-    // fact whichever path terminated it), then read the stored summary
-    // and the core raw-facts panel.
-    let _ = crate::reputation::sync_facts_for_seller(&st.pool, &st.keyfile, &st.stage9, account_id).await;
+    // Stage 9: read the STORED summary and the core raw-facts panel
+    // only. Code Audit 2 item 7 (L3): this public GET used to call
+    // sync_facts_for_seller here — writes on an unauthenticated read
+    // path. Facts are now produced on the orders' terminal
+    // transitions (orders actions, dispute resolution, the payment
+    // expiry sweep); pre-existing data is covered by the startup
+    // backfill. Nothing on this path writes.
     let summary = crate::reputation::summary_row(&st.pool, account_id).await.ok().flatten();
     let rawf = crate::reputation::raw_facts(&st.pool, account_id).await.unwrap_or_default();
     let reviews = crate::reviews::reviews_for_seller(&st.pool, &st.stage9, account_id)
@@ -3102,7 +3105,13 @@ async fn order_action(
         // confirmation wording is identical whether or not a proof
         // is on file — the seller learns nothing from it.
         return match crate::payments::declare_not_received(&st.pool, &o, sess.account_id, &st.payments).await {
-            Ok(_) => Redirect::to(&format!("/orders/{id}?msg=declaration_recorded")).into_response(),
+            Ok(_) => {
+                // Audit 2 item 7: a declaration that cancelled the
+                // order is a terminal transition — produce its fact
+                // here (record_fact_for_order no-ops otherwise).
+                let _ = crate::reputation::record_fact_for_order(&st.pool, &st.keyfile, &st.stage9, o.id).await;
+                Redirect::to(&format!("/orders/{id}?msg=declaration_recorded")).into_response()
+            }
             Err(_) => Redirect::to(&format!("/orders/{id}?msg=declaration_refused")).into_response(),
         };
     }
@@ -3116,7 +3125,14 @@ async fn order_action(
         };
     }
     match ord::apply_action(&st.pool, &o, &action, sess.account_id).await {
-        Ok(_) => Redirect::to(&format!("/orders/{id}")).into_response(),
+        Ok(_) => {
+            // Audit 2 item 7: facts are produced on the terminal
+            // transition, in the write path — record_fact_for_order
+            // no-ops for non-terminal outcomes, so this is safe after
+            // every successful action.
+            let _ = crate::reputation::record_fact_for_order(&st.pool, &st.keyfile, &st.stage9, o.id).await;
+            Redirect::to(&format!("/orders/{id}")).into_response()
+        }
         Err(ord::OrderError::InvoiceRequired) => Redirect::to(&format!(
             "/orders/{id}?msg=invoice_required"
         ))

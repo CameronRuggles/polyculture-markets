@@ -1463,7 +1463,12 @@ pub async fn declaration_dispute_reopenable(
 // Stage 10). Cancels unpaid direct orders WITH an assignment whose
 // created_at is older than the configured expiry; their entries retire.
 
-pub async fn expire_unpaid_orders(pool: &PgPool, cfg: &PaymentConfig) -> Result<u64, PaymentError> {
+pub async fn expire_unpaid_orders(
+    pool: &PgPool,
+    cfg: &PaymentConfig,
+    kf: &crate::keyfile::KeyFile,
+    rep: &crate::reputation::Stage9Config,
+) -> Result<u64, PaymentError> {
     let stale: Vec<(i64, String, i64, i64)> = sqlx::query_as(
         "SELECT o.id, o.public_id, o.buyer_id, o.seller_id FROM orders o
           WHERE o.settlement = 'direct'
@@ -1488,7 +1493,8 @@ pub async fn expire_unpaid_orders(pool: &PgPool, cfg: &PaymentConfig) -> Result<
         .bind(order_id)
         .execute(&mut *tx)
         .await?;
-        if r.rows_affected() == 1 {
+        let cancelled = r.rows_affected() == 1;
+        if cancelled {
             sqlx::query(
                 "UPDATE payment_pool_entries SET state = 'retired', retired_at = now()
                   WHERE order_id = $1 AND state = 'assigned'",
@@ -1499,6 +1505,11 @@ pub async fn expire_unpaid_orders(pool: &PgPool, cfg: &PaymentConfig) -> Result<
             count += 1;
         }
         tx.commit().await?;
+        if cancelled {
+            // Audit 2 item 7 (L3): the fact is produced HERE, on the
+            // terminal transition — never lazily on a profile read.
+            let _ = crate::reputation::record_fact_for_order(pool, kf, rep, order_id).await;
+        }
         let _ = crate::orders::notify(pool, buyer_id, "order_expired", &public_id).await;
         let _ = crate::orders::notify(pool, seller_id, "order_expired", &public_id).await;
     }

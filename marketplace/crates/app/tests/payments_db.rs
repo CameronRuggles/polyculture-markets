@@ -240,6 +240,8 @@ async fn cleanup(pool: &PgPool, accounts: &[i64]) {
     for id in accounts {
         for q in [
             "DELETE FROM payment_attestations WHERE order_id IN (SELECT id FROM orders WHERE buyer_id = $1 OR seller_id = $1)",
+            "DELETE FROM reputation_facts WHERE order_id IN (SELECT id FROM orders WHERE buyer_id = $1 OR seller_id = $1)",
+            "DELETE FROM reputation_summaries WHERE seller_id = $1",
             "DELETE FROM payment_pool_entries WHERE seller_id = $1",
             "DELETE FROM payment_batches WHERE seller_id = $1",
             "DELETE FROM payment_identities WHERE seller_id = $1",
@@ -553,7 +555,9 @@ async fn expiry_sweep_cancels_and_retires() {
     let a = assignment_for_order(&pool, order.id, &c).await.unwrap().unwrap();
     sqlx::query("UPDATE orders SET created_at = now() - interval '49 hours' WHERE id = $1")
         .bind(order.id).execute(&pool).await.unwrap();
-    let n = expire_unpaid_orders(&pool, &c).await.unwrap();
+    let kf = app::keyfile::KeyFile::load_or_generate(&std::env::temp_dir().join("pcm-payments-db-test.key"))
+        .expect("test keyfile");
+    let n = expire_unpaid_orders(&pool, &c, &kf, &app::reputation::Stage9Config::defaults()).await.unwrap();
     assert!(n >= 1);
     let after = app::orders::order_by_public_id(&pool, &order.public_id).await.unwrap();
     assert_eq!(after.state, "Cancelled");

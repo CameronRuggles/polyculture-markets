@@ -171,13 +171,15 @@ async fn main() -> anyhow::Result<()> {
     {
         let sweep_pool = pool.clone();
         let sweep_cfg = payments.clone();
+        let sweep_kf = state.keyfile.clone();
+        let sweep_rep = state.stage9.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(
                 sweep_cfg.sweep_interval_secs.max(60),
             ));
             loop {
                 tick.tick().await;
-                match app::payments::expire_unpaid_orders(&sweep_pool, &sweep_cfg).await {
+                match app::payments::expire_unpaid_orders(&sweep_pool, &sweep_cfg, &sweep_kf, &sweep_rep).await {
                     Ok(n) if n > 0 => println!("payment expiry sweep: cancelled {n} unpaid order(s)"),
                     Ok(_) => {}
                     Err(_) => println!("payment expiry sweep: error"),
