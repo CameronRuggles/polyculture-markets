@@ -17,12 +17,17 @@
 //!   order record and stays). This is the deletion job Stage 9
 //!   disclosed to users in advance ("kept until 180 days after this
 //!   dispute is resolved, then deleted").
+//! - message payloads past their per-row `expires_at` (written at
+//!   insert as received + 90 days, §20) are deleted together with
+//!   their blob files, and blob files no live row references are
+//!   reconciled away (Code Audit 2, M2/C1). This is the 90-day
+//!   message window ONLY.
 //!
 //! NOT automated here, deliberately: order/invoice/terms purge at
-//! terminal + 180 days with tombstones, message-payload windows,
-//! and report windows. Those interact with reputation facts and
-//! counterparty records; they are recorded as not-yet-built in
-//! docs/unverified.md rather than shipped unreviewed.
+//! terminal + 180 days with tombstones, and report windows. Those
+//! interact with reputation facts and counterparty records; they
+//! are recorded as not-yet-built in docs/unverified.md rather than
+//! shipped unreviewed.
 //!
 //! One non-deletion category rides the same scheduler (CL2): a
 //! dispute whose moderator-proposed refund outcome has waited
@@ -97,6 +102,12 @@ pub struct RetentionOutcome {
     pub sessions: u64,
     pub security_events: u64,
     pub disclosures: u64,
+    /// Message rows deleted past their `expires_at`, with their
+    /// blob files unlinked (Code Audit 2, M2/C1).
+    pub messages: u64,
+    /// Orphan blob FILES unlinked by the reconciliation sweep
+    /// (files, not rows — kept out of `total()`).
+    pub orphan_blobs: u64,
     /// CL2: refund proposals that waited past the confirmation
     /// deadline and were returned to the moderator queue (state
     /// change, not a deletion — kept out of `total()`).
@@ -105,9 +116,18 @@ pub struct RetentionOutcome {
 
 impl RetentionOutcome {
     pub fn total(&self) -> u64 {
-        self.notifications + self.sessions + self.security_events + self.disclosures
+        self.notifications + self.sessions + self.security_events + self.disclosures + self.messages
     }
 }
+
+/// Grace period for the orphan-blob reconciliation (Code Audit 2,
+/// M2/C1). A send writes its blob file BEFORE inserting the row, so
+/// a file with no referencing row may belong to an insert still in
+/// flight; only files older than this are treated as orphans. One
+/// hour is far beyond any real write→insert gap while still
+/// reclaiming leaked files (failed inserts, failed unlinks from
+/// the expiry sweep above) on the next pass but one.
+pub const ORPHAN_BLOB_GRACE_SECS: u64 = 3600;
 
 /// Run one retention pass. Each deletion category is a single
 /// DELETE with the cutoff computed by the database
@@ -163,6 +183,24 @@ pub async fn run_retention(
     .await?;
     out.disclosures = r.rows_affected();
 
+    // Message payloads past their expires_at (Code Audit 2, M2/C1).
+    // The DELETE … RETURNING captures exactly the refs of the rows
+    // this pass removed, so the unlink set can never name a blob a
+    // live row still references. Unlinks are best-effort: a file
+    // that cannot be removed is picked up by the orphan
+    // reconciliation below (or the next pass) once it ages past the
+    // grace period.
+    let expired: Vec<(String,)> =
+        sqlx::query_as("DELETE FROM encrypted_messages WHERE expires_at < now() RETURNING blob_ref")
+            .fetch_all(pool)
+            .await?;
+    out.messages = expired.len() as u64;
+    let blob_dir = crate::messages::blob_dir();
+    for (blob_ref,) in &expired {
+        unlink_blob(&blob_dir, blob_ref);
+    }
+    out.orphan_blobs = reconcile_orphan_blobs(pool, &blob_dir).await?;
+
     // CL2: refund proposals that outlived the buyer's confirmation
     // deadline go back to the moderator. The dispute reopens (the
     // order itself stays Disputed — it never resolved), the
@@ -203,6 +241,75 @@ pub async fn run_retention(
     Ok(out)
 }
 
+/// True for a genuine blob stem: blob refs are session tokens
+/// (non-empty ASCII hex), the same guard `messages::message_blob`
+/// applies before it builds a path from a stored ref. A name that
+/// fails this can never be turned into a path by the sweep, so a
+/// corrupt or hostile ref cannot escape the blob directory.
+fn is_blob_stem(stem: &str) -> bool {
+    !stem.is_empty() && stem.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Unlink `<dir>/<blob_ref>.asc`, best-effort. Only hex refs are
+/// ever turned into paths (see `is_blob_stem`).
+fn unlink_blob(dir: &std::path::Path, blob_ref: &str) {
+    if is_blob_stem(blob_ref) {
+        let _ = std::fs::remove_file(dir.join(format!("{blob_ref}.asc")));
+    }
+}
+
+/// Reconcile orphan blob files: `<stem>.asc` files in the blob
+/// directory that no live `encrypted_messages` row references.
+/// Orphans arise when a send's INSERT failed after its file write,
+/// or when an expiry unlink failed. Two guards make this safe:
+///
+/// - only well-formed blob names are considered — anything else in
+///   the directory (operator files, foreign names) is left alone;
+/// - a file younger than `ORPHAN_BLOB_GRACE_SECS` is never
+///   unlinked, because a send writes its blob BEFORE inserting the
+///   row: a young unreferenced file may be an insert in flight.
+///
+/// Filesystem trouble is non-fatal (a missing directory simply has
+/// no orphans); the sweep returns how many files it removed.
+async fn reconcile_orphan_blobs(pool: &PgPool, dir: &std::path::Path) -> Result<u64, sqlx::Error> {
+    let live: std::collections::HashSet<String> =
+        sqlx::query_as::<_, (String,)>("SELECT blob_ref FROM encrypted_messages")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|(r,)| r)
+            .collect();
+    let mut removed = 0u64;
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Ok(0),
+    };
+    let now = std::time::SystemTime::now();
+    loop {
+        let entry = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            _ => break,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".asc") else { continue };
+        if !is_blob_stem(stem) || live.contains(stem) {
+            continue;
+        }
+        let Ok(md) = entry.metadata().await else { continue };
+        let Ok(mtime) = md.modified() else { continue };
+        // Skip young files (possible in-flight insert) and any
+        // timestamp the clock reports as in the future.
+        match now.duration_since(mtime) {
+            Ok(age) if age.as_secs() >= ORPHAN_BLOB_GRACE_SECS => {}
+            _ => continue,
+        }
+        if tokio::fs::remove_file(entry.path()).await.is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,7 +326,26 @@ mod tests {
 
     #[test]
     fn outcome_total() {
-        let o = RetentionOutcome { notifications: 1, sessions: 2, security_events: 3, disclosures: 4, refunds_reopened: 0 };
-        assert_eq!(o.total(), 10);
+        let o = RetentionOutcome {
+            notifications: 1,
+            sessions: 2,
+            security_events: 3,
+            disclosures: 4,
+            messages: 5,
+            orphan_blobs: 6,
+            refunds_reopened: 0,
+        };
+        // Rows only: orphan_blobs counts files, refunds_reopened is
+        // a state change — both stay out of the total.
+        assert_eq!(o.total(), 15);
+    }
+
+    #[test]
+    fn blob_stem_guard() {
+        assert!(is_blob_stem("0123456789abcdef"));
+        assert!(!is_blob_stem(""));
+        assert!(!is_blob_stem("../escape"));
+        assert!(!is_blob_stem("not-hex"));
+        assert!(!is_blob_stem("dead beef"));
     }
 }

@@ -107,11 +107,16 @@ pub enum Actor {
 /// Payment evidence strength (spec §9/§12). Only the core raises it.
 /// A buyer's bare report (BuyerReported) can never move an order to
 /// Paid (invariant 11). A buyer-submitted transaction proof
-/// (BuyerProofSubmitted) can — owner decision 2026-10-18: the proof is
-/// evidence attached to the claim, carried by the server UNVERIFIED
-/// (the server runs no wallet and never labels it verified); sellers
-/// and moderators check it in their own wallets. SellerAttested,
-/// ProofVerified, and WalletObserved retain their places above it.
+/// (BuyerProofSubmitted) is evidence attached to the claim, carried
+/// by the server UNVERIFIED (the server runs no wallet and never
+/// labels it verified); sellers and moderators check it in their
+/// own wallets. The transition table below still lists
+/// BuyerProofSubmitted among the levels the core MAY pair with the
+/// Paid transition, but since the owner ruling of 2026-10-23
+/// (Code Audit 2 H1) no production path exercises that leg: a
+/// proof never moves an order — only a seller attestation does.
+/// SellerAttested, ProofVerified, and WalletObserved retain their
+/// places above it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EvidenceLevel {
     None,

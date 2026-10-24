@@ -1,0 +1,24 @@
+# cargo-audit configuration for the fuzz workspace.
+#
+# Code Audit 2 item 9c: this nested workspace previously had no
+# audit disposition at all, so a raw `cargo audit` here flagged
+# RUSTSEC-2023-0071 with no recorded reasoning. This file mirrors
+# the marketplace workspace's disposition (../.cargo/audit.toml)
+# for the identical situation:
+#
+# cargo-audit scans the raw Cargo.lock, which includes optional
+# dependencies that are never compiled. RUSTSEC-2023-0071 (rsa
+# 0.9.10, "Marvin Attack" timing side-channel, severity 5.9 medium,
+# no fixed release available) matches only because sqlx's
+# Cargo.lock entry lists its optional MySQL backend (sqlx-mysql
+# -> rsa), pulled into this lockfile through the app path
+# dependency. The app compiles sqlx with the postgres backend
+# only: `cargo tree` for this workspace contains no rsa, and no
+# rsa artefact is built. The Marvin attack additionally requires
+# RSA private-key decryption operations; neither the app nor the
+# fuzz targets perform any.
+#
+# If the sqlx MySQL backend is ever enabled, this ignore must be
+# removed and the exposure re-assessed.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

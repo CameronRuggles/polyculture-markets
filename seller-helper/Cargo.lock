@@ -66,6 +66,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "174416d4074aa8a817937521f15c35d50f70bf0dcb4662a2795d49f777803265"
 dependencies = [
  "thiserror",
+ "tiny-keccak",
 ]
 
 [[package]]
@@ -566,6 +567,7 @@ name = "helper-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base58-monero",
  "curve25519-dalek",
  "domain",
  "modules-api",

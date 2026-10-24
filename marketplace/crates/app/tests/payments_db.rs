@@ -240,6 +240,8 @@ async fn cleanup(pool: &PgPool, accounts: &[i64]) {
     for id in accounts {
         for q in [
             "DELETE FROM payment_attestations WHERE order_id IN (SELECT id FROM orders WHERE buyer_id = $1 OR seller_id = $1)",
+            "DELETE FROM reputation_facts WHERE order_id IN (SELECT id FROM orders WHERE buyer_id = $1 OR seller_id = $1)",
+            "DELETE FROM reputation_summaries WHERE seller_id = $1",
             "DELETE FROM payment_pool_entries WHERE seller_id = $1",
             "DELETE FROM payment_batches WHERE seller_id = $1",
             "DELETE FROM payment_identities WHERE seller_id = $1",

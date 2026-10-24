@@ -65,69 +65,31 @@ fn random_scalar() -> Scalar {
 // Monero base58 (block form: 8-byte blocks → 11 chars, tail per the
 // size table). The same encoding the reference wallet uses for
 // addresses and proof strings.
-
-const B58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-const B58_ENCODED_SIZES: [usize; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+//
+// This module originally carried a hand-rolled codec that read
+// each block as a LITTLE-endian u64. Monero's encoding is
+// BIG-endian per block, so the old codec byte-swapped every block:
+// `build_out_proof_v2` emitted proof strings no real node would
+// accept, and `parse_out_proof_v2` mis-decoded genuine ones —
+// while round-tripping happily against itself and against the
+// spike's equally hand-rolled checker port, which is very likely
+// why binary acceptance on a real stagenet node was never obtained
+// in the H1 spike (Code Audit 2, M3/R1). The codec is now the
+// `base58-monero` crate — the same implementation the `monero`
+// crate uses — cross-checked in the tests below against a real
+// stagenet subaddress and the `monero` crate's own address parse.
 
 pub fn base58_encode(data: &[u8]) -> String {
-    let mut out = String::new();
-    for chunk in data.chunks(8) {
-        let mut block = [0u8; 8];
-        block[..chunk.len()].copy_from_slice(chunk);
-        // The block is a little-endian u64 in Monero's encoding.
-        let mut n = u64::from_le_bytes(block);
-        let width = B58_ENCODED_SIZES[chunk.len()];
-        let mut enc = vec![b'1'; width];
-        let mut i = width;
-        while n > 0 && i > 0 {
-            i -= 1;
-            enc[i] = B58_ALPHABET[(n % 58) as usize];
-            n /= 58;
-        }
-        out.push_str(std::str::from_utf8(&enc).expect("alphabet is ASCII"));
-    }
-    out
+    // base58-monero's encode is total over byte strings: every
+    // length decomposes into 8-byte blocks plus a tabled tail.
+    base58_monero::encode(data).expect("base58-monero encodes any byte string")
 }
 
 pub fn base58_decode(s: &str) -> Option<Vec<u8>> {
-    if s.is_empty() || !s.bytes().all(|b| B58_ALPHABET.contains(&b)) {
+    if s.is_empty() {
         return None;
     }
-    // The string must decompose as full 11-char blocks plus at most
-    // one legal tail width.
-    let full_blocks = s.len() / 11;
-    let tail = s.len() % 11;
-    if tail != 0 && !B58_ENCODED_SIZES[1..].contains(&tail) {
-        return None;
-    }
-    let mut out = Vec::new();
-    for i in 0..full_blocks {
-        decode_block(&s[i * 11..(i + 1) * 11], 8, &mut out)?;
-    }
-    if tail != 0 {
-        let byte_len = B58_ENCODED_SIZES.iter().position(|&w| w == tail)?;
-        decode_block(&s[full_blocks * 11..], byte_len, &mut out)?;
-    }
-    Some(out)
-}
-
-fn decode_block(block: &str, byte_len: usize, out: &mut Vec<u8>) -> Option<()> {
-    let mut n: u64 = 0;
-    for c in block.bytes() {
-        let digit = B58_ALPHABET.iter().position(|&a| a == c)? as u64;
-        n = n.checked_mul(58)?.checked_add(digit)?;
-    }
-    let bytes = n.to_le_bytes();
-    if byte_len < 8 && bytes[byte_len..].iter().any(|&b| b != 0) {
-        return None; // value overflows the block's byte width
-    }
-    // Canonical form: re-encoding must reproduce the block exactly
-    // (rejects non-minimal encodings with surplus leading '1's).
-    if base58_encode(&bytes[..byte_len]) != block {
-        return None;
-    }
-    out.extend_from_slice(&bytes[..byte_len]);
-    Some(())
+    base58_monero::decode(s).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +303,38 @@ mod tests {
         assert_eq!(base58_decode("1111111111111"), Some(vec![0u8; 9]));
         // 12 chars would need a 1-char tail, which no byte count makes.
         assert_eq!(base58_decode("111111111111"), None);
+    }
+
+    #[test]
+    fn base58_cross_checked_against_monero_crates() {
+        use std::str::FromStr as _;
+        // A real stagenet subaddress (the store suite's SUB_B
+        // fixture). Our codec must decode it to the 69 raw bytes
+        // (prefix ‖ spend ‖ view ‖ checksum) and re-encode it
+        // byte-for-byte — the old little-endian codec did neither.
+        const ADDR: &str =
+            "72GeiPtUwSSSsbBtk7SgYGebrQYiDZZYvGa7Y5Z5AAi2M5Cpp38sCU8DjQtcCVJPTxUjua8ekmSuRhzNSz6gFcfFErM7Jqm";
+        let raw = base58_decode(ADDR).expect("a real address decodes");
+        assert_eq!(raw.len(), 69);
+        assert_eq!(base58_encode(&raw), ADDR, "re-encode is byte-exact");
+        // Cross-check 1: base58-monero's checked decode validates
+        // the 4-byte Keccak checksum and strips it.
+        let payload = base58_monero::decode_check(ADDR).expect("checksum validates");
+        assert_eq!(payload.as_slice(), &raw[..65]);
+        // Cross-check 2: the `monero` crate's own address parser
+        // recovers the same spend/view keys from the same string.
+        let parsed = monero::Address::from_str(ADDR).expect("monero parses it");
+        assert_eq!(parsed.addr_type, monero::AddressType::SubAddress);
+        assert_eq!(&raw[1..33], &parsed.public_spend.as_bytes()[..]);
+        assert_eq!(&raw[33..65], &parsed.public_view.as_bytes()[..]);
+        // Asymmetric blocks must agree with the crate's big-endian
+        // reading (under the old codec [1,0,…] and […,0,1] swapped).
+        let a = [1u8, 0, 0, 0, 0, 0, 0, 0, 9, 8, 7];
+        assert_eq!(base58_encode(&a), base58_monero::encode(&a).unwrap());
+        assert_eq!(
+            base58_decode(&base58_monero::encode(&a).unwrap()).as_deref(),
+            Some(&a[..])
+        );
     }
 
     #[test]
