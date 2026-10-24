@@ -416,32 +416,53 @@ pub fn shell(nav: &Nav, title: &str, body: &str) -> String {
     )
 }
 
-/// Compute the §15 attention counts into a nav for account `me`.
+/// Fill a nav's identity and §15 attention counts for account `me`.
+///
+/// Code Audit 2 item 8 (A3): this used to be five round trips per
+/// authenticated page — username, role, and three separate COUNTs —
+/// on a pool capped at 8 connections. It is now two queries: one
+/// accounts row (username + role) and one SELECT carrying the three
+/// counts as scalar subqueries. Fallbacks mirror the old helpers
+/// exactly: a missing/failed identity row yields username "?" (the
+/// old `username_of_id` fallback) and the Buyer role (the old
+/// `session_role` default); a failed counts query leaves the
+/// counts at their anonymous defaults of 0.
 async fn fill_counts(st: &AppState, nav: &mut Nav, me: i64) {
-    nav.inbox_unread = sqlx::query_scalar(
-        "SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL",
+    let ident: Option<(String, String)> =
+        sqlx::query_as("SELECT username, role FROM accounts WHERE id = $1")
+            .bind(me)
+            .fetch_optional(&st.pool)
+            .await
+            .ok()
+            .flatten();
+    match ident {
+        Some((username, role)) => {
+            nav.username = Some(username);
+            nav.role = Some(role_from_str(&role));
+        }
+        None => {
+            nav.username = Some("?".into());
+            nav.role = Some(Role::Buyer);
+        }
+    }
+    let counts: Option<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL), \
+           (SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL \
+             AND event_type = 'message_received'), \
+           (SELECT count(*) FROM orders WHERE \
+             (seller_id = $1 AND state IN ('Requested', 'Paid')) \
+             OR (buyer_id = $1 AND state = 'Fulfilled'))",
     )
     .bind(me)
     .fetch_one(&st.pool)
     .await
-    .unwrap_or(0);
-    nav.messages_unread = sqlx::query_scalar(
-        "SELECT count(*) FROM notifications WHERE account_id = $1 AND read_at IS NULL \
-         AND event_type = 'message_received'",
-    )
-    .bind(me)
-    .fetch_one(&st.pool)
-    .await
-    .unwrap_or(0);
-    nav.orders_attention = sqlx::query_scalar(
-        "SELECT count(*) FROM orders WHERE \
-         (seller_id = $1 AND state IN ('Requested', 'Paid')) \
-         OR (buyer_id = $1 AND state = 'Fulfilled')",
-    )
-    .bind(me)
-    .fetch_one(&st.pool)
-    .await
-    .unwrap_or(0);
+    .ok();
+    if let Some((inbox, messages, orders)) = counts {
+        nav.inbox_unread = inbox;
+        nav.messages_unread = messages;
+        nav.orders_attention = orders;
+    }
 }
 
 /// Build the nav for the current request: resolves the session and,
@@ -449,8 +470,6 @@ async fn fill_counts(st: &AppState, nav: &mut Nav, me: i64) {
 async fn nav_for(st: &AppState, headers: &HeaderMap) -> Nav {
     let mut nav = Nav::anonymous(&st.instance);
     if let Some((_token, sess, csrf)) = current_session(st, headers).await {
-        nav.username = Some(db::username_of_id(&st.pool, sess.account_id).await);
-        nav.role = Some(session_role(st, sess.account_id).await);
         nav.csrf = Some(csrf);
         fill_counts(st, &mut nav, sess.account_id).await;
     }
@@ -472,8 +491,6 @@ async fn session_role(st: &AppState, account_id: i64) -> Role {
 /// helpers below the handler layer).
 async fn nav_for_session(st: &AppState, sess: &sessions::Session, csrf: &str) -> Nav {
     let mut nav = Nav::anonymous(&st.instance);
-    nav.username = Some(db::username_of_id(&st.pool, sess.account_id).await);
-    nav.role = Some(session_role(st, sess.account_id).await);
     nav.csrf = Some(csrf.to_string());
     fill_counts(st, &mut nav, sess.account_id).await;
     nav
