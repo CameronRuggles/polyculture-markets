@@ -314,9 +314,12 @@ fn status_over_an_unreadable_store_prints_the_error_row_and_fails() {
     // the CLI since N8, but the command exited 0 — a script
     // checking the exit code was told the status succeeded while
     // looking at a broken store. A store-level error row now
-    // comes with a non-zero exit; per-trade F10 rows keep exit 0
-    // (the healthy statuses here and in the end-to-end test pin
-    // the success side).
+    // comes with a non-zero exit (1: no status was produced).
+    // Per-trade F10 rows were originally pinned to exit 0 here;
+    // the owner's 2026-10-24 E11 ruling superseded that — they
+    // exit 2, pinned by the exit-code tests at the end of this
+    // file. The healthy statuses here and in the end-to-end test
+    // pin the success side (exit 0).
     let fx = fixture("status-error");
     let _trade_id = seller_side_trade(&fx);
     // Control: the healthy store's status succeeds.
@@ -346,4 +349,181 @@ fn status_over_an_unreadable_store_prints_the_error_row_and_fails() {
     // failure belongs to the store, not the mode.
     let out = run(&["buyer", "status", "--core-config", p(&fx.buyer_cfg)]);
     assert!(out.status.success(), "healthy buyer status failed: {}", stderr(&out));
+}
+
+// -- E11 exit codes (owner ruling 2026-10-24) ----------------------
+//
+// The three-code allocation: 0 = the run completed and every row
+// is clean; 2 = a status run completed but at least one per-trade
+// row is an ERROR; 1 = the run itself failed. Before the ruling,
+// per-trade ERROR rows exited 0 and usage errors exited 2.
+
+const LISTING2: &str = "lst_00000000000000000000000000000002";
+const SUB2: &str =
+    "72GeiPtUwSSSsbBtk7SgYGebrQYiDZZYvGa7Y5Z5AAi2M5Cpp38sCU8DjQtcCVJPTxUjua8ekmSuRhzNSz6gFcfFErM7Jqm";
+
+/// A second seller-side trade in the same store (second listing,
+/// second pool address); returns its trade id.
+fn seller_second_trade(fx: &Fixture, first_trade: &str) -> String {
+    let out = run(&[
+        "seller",
+        "terms",
+        "--core-config",
+        p(&fx.seller_cfg),
+        "--listing",
+        LISTING2,
+        "--title",
+        "One careful widget",
+        "--description",
+        "A widget, carefully kept.",
+        "--delivery-terms",
+        "Ships within two days, tracked.",
+        "--refund-terms",
+        "Full refund if it arrives broken.",
+        "--price",
+        "0.25",
+        "--transit-risk",
+        "seller",
+        "--remedy-cap-pct",
+        "25",
+        "--payment-timing",
+        "prepay",
+    ]);
+    assert!(out.status.success(), "second seller terms failed: {}", stderr(&out));
+    let batch = fx.dir.join("batch2.json");
+    std::fs::write(&batch, format!("{{\"entries\":[{{\"subaddress\":\"{SUB2}\"}}]}}")).unwrap();
+    let out = run(&[
+        "seller",
+        "assign",
+        "--core-config",
+        p(&fx.seller_cfg),
+        "--listing",
+        LISTING2,
+        "--buyer",
+        &fx.buyer_fpr,
+        "--batch",
+        p(&batch),
+    ]);
+    assert!(out.status.success(), "second seller assign failed: {}", stderr(&out));
+    let store = helper_core::store::EvidenceStore::open(fx.seller_store.clone()).unwrap();
+    let ids = store.trade_ids().expect("readable store lists its trades");
+    assert_eq!(ids.len(), 2, "exactly two trades in the seller store: {ids:?}");
+    ids.into_iter().find(|t| t != first_trade).expect("the second trade id")
+}
+
+#[test]
+fn status_with_an_error_row_among_clean_trades_exits_2() {
+    let fx = fixture("exit-mixed");
+    let t1 = seller_side_trade(&fx);
+    let t2 = seller_second_trade(&fx, &t1);
+
+    // Control: every row clean — the exit code is exactly 0.
+    let out = run(&["seller", "status", "--core-config", p(&fx.seller_cfg)]);
+    assert_eq!(out.status.code(), Some(0), "clean status: {}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains(&t1) && text.contains("state=Assigned"), "{text}");
+    assert!(text.contains(&t2) && text.contains("state=Assigned"), "{text}");
+
+    // Break ONE trade's held set: a signature by the right key
+    // over the wrong bytes, so the held assignment no longer
+    // verifies at load and the trade becomes an ERROR row. The
+    // other trade is untouched.
+    let store = helper_core::store::EvidenceStore::open(fx.seller_store.clone()).unwrap();
+    let seller_sec = std::fs::read(fx.dir.join("seller.key")).unwrap();
+    let bad_sig =
+        helper_core::keys::sign_detached(&seller_sec, None, b"not the assignment").unwrap();
+    std::fs::write(store.trade_dir(&t2).join("00-assignment.sig"), bad_sig).unwrap();
+
+    let out = run(&["seller", "status", "--core-config", p(&fx.seller_cfg)]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "one ERROR row among clean rows must exit 2: {}",
+        stdout(&out)
+    );
+    let text = stdout(&out);
+    // The clean trade still folds and prints as a state row…
+    assert!(text.contains(&t1) && text.contains("state=Assigned"), "{text}");
+    // …and the broken trade prints as an ERROR row, not a state.
+    assert!(text.contains(&t2) && text.contains("ERROR:"), "{text}");
+    assert!(text.contains("does not verify"), "{text}");
+}
+
+#[test]
+fn status_with_a_foreign_signed_assignment_exits_2() {
+    // The E4 shape: the held assignment's signature was made by a
+    // key that is NEITHER party's — a foreign signature. That is
+    // tamper evidence; the run must not exit 0 (and must not exit
+    // 1 either: the status was produced, one trade is tainted).
+    let fx = fixture("exit-foreign");
+    let trade_id = seller_side_trade(&fx);
+
+    let out = run(&["buyer", "pin", p(&fx.seller_cert), "--core-config", p(&fx.buyer_cfg)]);
+    assert!(out.status.success(), "buyer pin failed: {}", stderr(&out));
+    let out = run(&[
+        "buyer",
+        "verify",
+        "--core-config",
+        p(&fx.buyer_cfg),
+        "--assignment",
+        p(&fx.dir.join("assignment.txt")),
+        "--terms",
+        p(&fx.dir.join("terms-statement.txt")),
+        "--terms-text",
+        p(&fx.dir.join("terms-text.txt")),
+    ]);
+    assert!(out.status.success(), "buyer verify failed: {}", stderr(&out));
+
+    // Control: the buyer's held trade folds clean at exactly 0.
+    let out = run(&["buyer", "status", "--core-config", p(&fx.buyer_cfg)]);
+    assert_eq!(out.status.code(), Some(0), "clean buyer status: {}", stdout(&out));
+    assert!(stdout(&out).contains("state=Assigned"), "{}", stdout(&out));
+
+    // Plant the foreign signature over the held assignment bytes.
+    let (mallory_sec, _mallory_pub) =
+        helper_core::keys::generate_test_cert("Mallory <mallory@example.com>").unwrap();
+    let store = helper_core::store::EvidenceStore::open(fx.buyer_store.clone()).unwrap();
+    let tdir = store.trade_dir(&trade_id);
+    let assignment = std::fs::read(tdir.join("00-assignment.txt")).unwrap();
+    let foreign_sig = helper_core::keys::sign_detached(&mallory_sec, None, &assignment).unwrap();
+    std::fs::write(tdir.join("00-assignment.sig"), foreign_sig).unwrap();
+
+    let out = run(&["buyer", "status", "--core-config", p(&fx.buyer_cfg)]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a foreign-signed held assignment must exit 2: {}",
+        stdout(&out)
+    );
+    let text = stdout(&out);
+    assert!(text.contains(&trade_id) && text.contains("ERROR:"), "{text}");
+    assert!(text.contains("does not verify"), "{text}");
+}
+
+#[test]
+fn run_level_failures_exit_1() {
+    let fx = fixture("exit-runfail");
+
+    // An unreadable input file: the run could not process at all.
+    let out = run(&[
+        "buyer",
+        "verify",
+        "--core-config",
+        p(&fx.buyer_cfg),
+        "--assignment",
+        p(&fx.dir.join("no-such-assignment.txt")),
+        "--terms",
+        p(&fx.dir.join("no-such-terms.txt")),
+        "--terms-text",
+        p(&fx.dir.join("no-such-text.txt")),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "missing input must exit 1: {}", stderr(&out));
+    assert!(stderr(&out).contains("cannot read"), "{}", stderr(&out));
+
+    // Usage errors are run-level failures too: they exited 2
+    // before the E11 normalisation made 2 unambiguous.
+    let out = run(&["bogus-mode"]);
+    assert_eq!(out.status.code(), Some(1), "unknown mode must exit 1");
+    let out = run(&[]);
+    assert_eq!(out.status.code(), Some(1), "no arguments must exit 1");
 }
