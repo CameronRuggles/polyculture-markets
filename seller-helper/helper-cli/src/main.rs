@@ -51,11 +51,29 @@ USAGE:
 Core commands take --core-config PATH (default
 ~/.config/xmr-direct-helper/helper.json). The key passphrase is read
 from PCM_HELPER_PASSPHRASE or prompted for — never a flag.
+
+EXIT CODES:
+  0  the command succeeded. For the status commands, every trade
+     in the evidence store folded clean.
+  1  the command itself failed: bad arguments, an unreadable file
+     or config, an unreadable evidence store, a refused verify.
+  2  status commands only: the status WAS produced, but at least
+     one trade's row is an ERROR (for example a held statement
+     whose signature does not verify against its signer's pinned
+     certificate). The run completed; one or more trades did not.
 ";
+
+/// Exit code for a run that failed as a run (owner ruling
+/// 2026-10-24, E11): every run-level failure — usage errors
+/// included — is 1, so that 2 means exactly one thing.
+const EXIT_RUN_FAILED: u8 = 1;
+/// Exit code for a status run that completed with at least one
+/// per-trade ERROR row (owner ruling 2026-10-24, E11).
+const EXIT_ROWS_WITH_ERRORS: u8 = 2;
 
 fn fail(e: String) -> ExitCode {
     eprintln!("error: {e}");
-    ExitCode::from(1)
+    ExitCode::from(EXIT_RUN_FAILED)
 }
 
 fn core_config(args: &legacy::Args) -> Result<CoreConfig, String> {
@@ -268,7 +286,10 @@ fn cmd_seller_assign(args: &legacy::Args) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_status(args: &legacy::Args) -> Result<(), String> {
+/// Run a status command. Returns `Ok(true)` when the status was
+/// produced but at least one per-trade row is an ERROR, so the
+/// caller can exit with [`EXIT_ROWS_WITH_ERRORS`].
+fn cmd_status(args: &legacy::Args) -> Result<bool, String> {
     let cfg = core_config(args)?;
     let network = cfg.network_enum().ok_or("helper config network is not a statement network name")?;
     let store = EvidenceStore::open(cfg.store_dir.clone())?;
@@ -290,17 +311,25 @@ fn cmd_status(args: &legacy::Args) -> Result<(), String> {
             // command — the row printed but the process exited 0,
             // so a script checking the exit code was told the
             // status succeeded while looking at a broken store.
-            // Per-trade ERROR rows (F10) in the loop below keep
-            // exit 0: that trade is reported and the rest of the
-            // status is real. When the store itself cannot be
-            // read there is no status to succeed at.
+            // When the store itself cannot be read there is no
+            // status to succeed at, so this stays a run failure
+            // (exit 1) under the owner ruling below.
             return Err("the evidence store could not be read; no status was produced".into());
         }
     };
     if rows.is_empty() {
         println!("No trades in the evidence store.");
-        return Ok(());
+        return Ok(false);
     }
+    // E11 (owner ruling 2026-10-24): a per-trade ERROR row (F10)
+    // makes the run exit 2. The earlier shape kept exit 0 for
+    // these rows on the reasoning that the trade is reported and
+    // the rest of the status is real; the owner reversed that —
+    // an ERROR row is tamper evidence (a held statement whose
+    // signature does not verify is the sharp case) and a script
+    // driving the helper must not see success on a tainted run.
+    // The status still prints in full; only the code changes.
+    let mut saw_error_row = false;
     for (trade_id, row) in rows {
         match row {
             Ok(Some(f)) => {
@@ -327,10 +356,11 @@ fn cmd_status(args: &legacy::Args) -> Result<(), String> {
                 // An unreadable trade is printed as an error, never
                 // silently skipped (audit F10).
                 println!("{trade_id}  ERROR: {e}");
+                saw_error_row = true;
             }
         }
     }
-    Ok(())
+    Ok(saw_error_row)
 }
 
 // -- buyer commands ------------------------------------------------------------
@@ -476,13 +506,16 @@ fn cmd_buyer_verify(args: &legacy::Args) -> Result<(), String> {
 
 // -- dispatch ------------------------------------------------------------------
 
-fn run_core(mode: &str, cmd: &str, args: &legacy::Args) -> Result<(), String> {
+/// Dispatch a core command. The `bool` is the status commands'
+/// "at least one per-trade ERROR row" signal (E11); every other
+/// command reports `false`.
+fn run_core(mode: &str, cmd: &str, args: &legacy::Args) -> Result<bool, String> {
     match (mode, cmd) {
-        ("seller", "terms") => cmd_seller_terms(args),
-        ("seller", "assign") => cmd_seller_assign(args),
+        ("seller", "terms") => cmd_seller_terms(args).map(|()| false),
+        ("seller", "assign") => cmd_seller_assign(args).map(|()| false),
         ("seller", "status") => cmd_status(args),
-        ("buyer", "pin") => cmd_buyer_pin(args),
-        ("buyer", "verify") => cmd_buyer_verify(args),
+        ("buyer", "pin") => cmd_buyer_pin(args).map(|()| false),
+        ("buyer", "verify") => cmd_buyer_verify(args).map(|()| false),
         ("buyer", "status") => cmd_status(args),
         _ => Err(format!("unknown command: {mode} {cmd}")),
     }
@@ -539,6 +572,10 @@ fn cmd_init_core(args: &legacy::Args) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Exit-code allocation (owner ruling 2026-10-24, E11; see
+    // EXIT CODES in the usage text): usage errors are run-level
+    // failures and exit 1 — they used to exit 2, which is now
+    // reserved for status runs with per-trade ERROR rows.
     if argv.first().map(String::as_str) == Some("init") {
         return match legacy::parse_args(&argv[1..]) {
             Ok(a) => match cmd_init_core(&a) {
@@ -547,7 +584,7 @@ fn main() -> ExitCode {
             },
             Err(e) => {
                 eprintln!("error: {e}\n\n{USAGE}");
-                ExitCode::from(2)
+                ExitCode::from(EXIT_RUN_FAILED)
             }
         };
     }
@@ -555,7 +592,7 @@ fn main() -> ExitCode {
         Some((m, r)) => (m.as_str(), r),
         None => {
             eprint!("{USAGE}");
-            return ExitCode::from(2);
+            return ExitCode::from(EXIT_RUN_FAILED);
         }
     };
     if mode == "--help" || mode == "-h" || mode == "help" {
@@ -564,20 +601,20 @@ fn main() -> ExitCode {
     }
     if mode != "seller" && mode != "buyer" {
         eprintln!("error: unknown mode {mode:?} (want seller or buyer)\n\n{USAGE}");
-        return ExitCode::from(2);
+        return ExitCode::from(EXIT_RUN_FAILED);
     }
     let (cmd, rest) = match rest.split_first() {
         Some((c, r)) => (c.as_str(), r),
         None => {
             eprint!("{USAGE}");
-            return ExitCode::from(2);
+            return ExitCode::from(EXIT_RUN_FAILED);
         }
     };
     let args = match legacy::parse_args(rest) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}\n\n{USAGE}");
-            return ExitCode::from(2);
+            return ExitCode::from(EXIT_RUN_FAILED);
         }
     };
     // Legacy v1 seller commands first.
@@ -605,7 +642,8 @@ fn main() -> ExitCode {
         }
     }
     match run_core(mode, cmd, &args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::from(EXIT_ROWS_WITH_ERRORS),
         Err(e) => fail(e),
     }
 }
