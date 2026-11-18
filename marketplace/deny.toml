@@ -25,7 +25,7 @@
 # Leaving the advisory armed here means that if the MySQL backend is
 # ever enabled, deny fails loudly. `cargo audit`, which scans the raw
 # lockfile, carries the ignore instead — see .cargo/audit.toml.
-ignore = []
+ignore = ["RUSTSEC-2026-0543"]
 # RUSTSEC-2026-0374 (basic-toml 0.1.10, "unmaintained") is NO LONGER
 # ignored — since Code Audit 2 item 9a (2026-10-24) basic-toml is not
 # in the graph at all, so there is nothing to ignore and the advisory
@@ -43,6 +43,23 @@ ignore = []
 # with `cargo tree -i basic-toml` (no match) on 2026-10-24. If the
 # `config` feature is ever re-enabled, basic-toml returns and this
 # advisory fires again — that is deliberate.
+# RUSTSEC-2026-0543 (chrono 0.4.45, "unmaintained") IS ignored here
+# (the entry in the ignore list above): an unmaintained notice, not
+# a vulnerability, with no fixed release — the advisory's own
+# solution field says no safe upgrade is available and recommends
+# migrating to jiff or time. chrono is NOT a direct dependency of
+# any workspace crate; it enters only transitively through
+# sequoia-openpgp 2.4.1 (app / envelope / helper-core), and this
+# project cannot remove it without Sequoia changing its own
+# dependency. Sequoia is the spec-mandated OpenPGP stack, so the
+# notice is accepted until then. cargo audit treats this advisory
+# as an allowed warning and needs no entry. Accepted 2026-11-17:
+# it failed `cargo deny check` as soon as the audit step was
+# restored — the cargo-audit failure of 2026-11-16 had masked it,
+# because CI never reached the deny step. Removal condition: drop
+# this ignore when sequoia-openpgp no longer depends on chrono,
+# or if chrono maintenance resumes and the advisory is withdrawn;
+# re-check with `cargo tree -i chrono`.
 # Yanked crates are errors by default in cargo-deny; keep that.
 
 [licenses]

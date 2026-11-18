@@ -6,7 +6,12 @@
 # DETERMINISTIC-TOOLS-REPORT-2026-10-17.md.
 
 [advisories]
-ignore = []
+# RUSTSEC-2026-0543 (chrono, "unmaintained") ignored: not a
+# vulnerability and not a direct dependency — it enters through
+# sequoia-openpgp, the mandated OpenPGP stack, and no fixed
+# release exists. Full reasoning and removal condition in
+# marketplace/deny.toml. Accepted 2026-11-17.
+ignore = ["RUSTSEC-2026-0543"]
 
 [licenses]
 allow = [
